@@ -1,0 +1,6 @@
+{
+  "workflow_type": "new_referral",
+  "tenant_id": "demo-clinic",
+  "source_channel": "email",
+  "raw_text": "Referral from Dr. Silva for Ana Ferreira, adult patient seeking online therapy in Portuguese for anxiety and work stress. Email ana.ferreira@example.com. Phone +351 910 000 111. Insurer: Multicare. Availability: Tuesday mornings or Thursday afternoons."
+}

@@ -1,0 +1,11 @@
+{
+  "workflow_type": "session_completed",
+  "tenant_id": "demo-clinic",
+  "source_channel": "webform",
+  "patient_id": "demo-patient-001",
+  "therapist_id": "demo-therapist-001",
+  "selected_protocol": "CBT anxiety protocol",
+  "protocol_id": "demo-protocol-001",
+  "note_text": "Therapist-approved session note: patient discussed work stress, practiced breathing technique, and agreed to complete a thought record before next session. No acute risk was reported in the note.",
+  "report_request": "Draft a concise session summary for therapist sign-off."
+}

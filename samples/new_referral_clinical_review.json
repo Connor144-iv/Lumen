@@ -1,0 +1,6 @@
+{
+  "workflow_type": "new_referral",
+  "tenant_id": "demo-clinic",
+  "source_channel": "webform",
+  "raw_text": "New referral for Joao, adult patient requesting urgent support after a recent crisis and references to self-harm. Contact joao@example.com. Phone +351 920 000 222. Insurer: AdvanceCare. Prefers English and online sessions."
+}
