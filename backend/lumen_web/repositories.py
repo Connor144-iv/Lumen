@@ -2,26 +2,78 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import csv
+import io
+import json
+import os
+import re
+from datetime import datetime, time, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from .models import (
+    Appointment,
     AuditLog,
+    ClinicalLibraryRecord,
     CommunicationDraft,
+    ConsentRecord,
+    Document,
+    DocumentChunk,
+    DraftFeedback,
     HumanReviewTask,
+    IntakeChecklistItem,
+    IntakeTemplate,
     Patient,
+    QuestionnaireResponse,
     Referral,
+    ReferralImportBatch,
+    ReferralImportError,
+    ReportDraft,
+    ScoreRecord,
+    SessionNote,
     Tenant,
+    TherapistPrepBrief,
     Therapist,
     User,
     WorkflowEvent,
     WorkflowRun,
     new_id,
 )
-from .seed import DEMO_USER_ID
+from .seed import DEMO_THERAPIST_USER_ID, DEMO_USER_ID
+
+
+ROLE_PERMISSIONS: dict[str, list[str]] = {
+    "admin": [
+        "referral:read",
+        "referral:write",
+        "review:admin",
+        "intake:write",
+        "import:write",
+        "audit:read",
+    ],
+    "therapist": [
+        "patient:read_assigned",
+        "session_note:write",
+        "report:edit",
+        "report:sign_off",
+        "feedback:write",
+    ],
+    "clinic_director": [
+        "referral:read",
+        "clinical_review:approve",
+        "report:sign_off",
+        "audit:read",
+        "metrics:read",
+    ],
+    "compliance_owner": [
+        "audit:read",
+        "retention:read",
+        "export:read",
+        "security:read",
+    ],
+}
 
 
 def utc_now() -> datetime:
@@ -294,6 +346,251 @@ def referral_detail(session: Session, referral_id: str) -> dict[str, Any]:
     return detail
 
 
+def import_referral_batch(
+    session: Session,
+    *,
+    tenant_id: str,
+    file_name: str,
+    content_text: str,
+    source_channel: str = "csv_import",
+    storage_uri: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    actor_user_id: str | None = DEMO_USER_ID,
+) -> dict[str, Any]:
+    ensure_tenant(session, tenant_id)
+    clean_channel = source_channel.strip() or "csv_import"
+    document = Document(
+        tenant_id=tenant_id,
+        document_type="referral_import",
+        title=file_name.strip() or "referral-import.csv",
+        storage_uri=storage_uri,
+        metadata_json=json_safe(
+            {
+                "parser": "csv_dict_reader_mvp",
+                "source_channel": clean_channel,
+                **(metadata or {}),
+            }
+        ),
+    )
+    session.add(document)
+    session.flush()
+    batch = ReferralImportBatch(
+        tenant_id=tenant_id,
+        source_channel=clean_channel,
+        file_name=document.title,
+        source_document_id=document.id,
+        metadata_json={"source_document_id": document.id},
+    )
+    session.add(batch)
+    session.flush()
+
+    imported_referrals: list[Referral] = []
+    reader = csv.DictReader(io.StringIO(content_text))
+    if not reader.fieldnames:
+        _record_import_error(session, batch, 1, "CSV header row is required.", {})
+    else:
+        for row_number, row in enumerate(reader, start=2):
+            normalized_row = {str(key or "").strip(): str(value or "").strip() for key, value in row.items()}
+            try:
+                referral = _referral_from_import_row(session, tenant_id, clean_channel, normalized_row)
+            except ValueError as exc:
+                _record_import_error(session, batch, row_number, str(exc), normalized_row)
+                continue
+            imported_referrals.append(referral)
+
+    batch.total_rows = len(imported_referrals) + int(
+        session.scalar(select(func.count(ReferralImportError.id)).where(ReferralImportError.batch_id == batch.id)) or 0
+    )
+    batch.imported_count = len(imported_referrals)
+    batch.error_count = batch.total_rows - batch.imported_count
+    if batch.error_count and batch.imported_count:
+        batch.status = "partial"
+    elif batch.error_count:
+        batch.status = "failed"
+    else:
+        batch.status = "completed"
+    batch.updated_at = utc_now()
+
+    write_audit(
+        session,
+        tenant_id=tenant_id,
+        actor_user_id=actor_user_id if session.get(User, actor_user_id or "") else None,
+        action="import_referral_batch",
+        entity_type="referral_import_batch",
+        entity_id=batch.id,
+        after=referral_import_batch_to_dict(batch),
+    )
+    return {
+        "batch": referral_import_batch_to_dict(batch),
+        "referrals": [referral_summary(referral) for referral in imported_referrals],
+        "errors": list_referral_import_errors(session, tenant_id=tenant_id, batch_id=batch.id),
+    }
+
+
+def create_email_referral(
+    session: Session,
+    *,
+    tenant_id: str,
+    sender: str,
+    subject: str,
+    body: str,
+    actor_user_id: str | None = DEMO_USER_ID,
+) -> dict[str, Any]:
+    ensure_tenant(session, tenant_id)
+    clean_body = body.strip()
+    if not clean_body:
+        raise ValueError("Email body is required.")
+    raw_text = "\n".join(
+        part
+        for part in [
+            f"From: {sender.strip()}" if sender.strip() else "",
+            f"Subject: {subject.strip()}" if subject.strip() else "",
+            clean_body,
+        ]
+        if part
+    )
+    document = Document(
+        tenant_id=tenant_id,
+        document_type="email_referral",
+        title=subject.strip() or f"Email referral {utc_now().date().isoformat()}",
+        metadata_json={"sender": sender.strip(), "subject": subject.strip(), "parser": "email_body_mvp"},
+    )
+    referral = Referral(
+        tenant_id=tenant_id,
+        source_channel="email",
+        raw_text=raw_text,
+        contact_email=sender.strip() if "@" in sender else None,
+        status="new",
+        missing_fields=_deterministic_missing_fields({"raw_text": raw_text}),
+    )
+    session.add_all([document, referral])
+    session.flush()
+    write_audit(
+        session,
+        tenant_id=tenant_id,
+        actor_user_id=actor_user_id if session.get(User, actor_user_id or "") else None,
+        action="ingest_email_referral",
+        entity_type="referral",
+        entity_id=referral.id,
+        after={"referral": referral_summary(referral), "document": document_to_dict(document)},
+    )
+    return {"referral": referral_summary(referral), "document": document_to_dict(document)}
+
+
+def list_referral_import_batches(
+    session: Session,
+    tenant_id: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    query = select(ReferralImportBatch).order_by(ReferralImportBatch.created_at.desc()).limit(max(1, min(limit, 100)))
+    if tenant_id:
+        query = query.where(ReferralImportBatch.tenant_id == tenant_id)
+    return [referral_import_batch_to_dict(batch) for batch in session.scalars(query)]
+
+
+def list_referral_import_errors(
+    session: Session,
+    tenant_id: str | None = None,
+    batch_id: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    query = select(ReferralImportError).order_by(ReferralImportError.created_at.desc()).limit(max(1, min(limit, 100)))
+    if tenant_id:
+        query = query.where(ReferralImportError.tenant_id == tenant_id)
+    if batch_id:
+        query = query.where(ReferralImportError.batch_id == batch_id)
+    return [referral_import_error_to_dict(error) for error in session.scalars(query)]
+
+
+def integration_health(session: Session, tenant_id: str | None = None) -> dict[str, Any]:
+    tenant = tenant_id or "demo-clinic"
+    recent_import = session.scalar(
+        select(ReferralImportBatch)
+        .where(ReferralImportBatch.tenant_id == tenant)
+        .order_by(ReferralImportBatch.created_at.desc())
+        .limit(1)
+    )
+    return {
+        "checks": [
+            {
+                "name": "CSV referral import",
+                "status": "ok",
+                "message": "CSV batch ingestion is available and creates queued referral records.",
+                "last_seen": iso_or_none(recent_import.created_at) if recent_import else None,
+            },
+            {
+                "name": "Email referral capture",
+                "status": "configured" if os.getenv("LUMEN_EMAIL_INGESTION_ENABLED") else "manual",
+                "message": "Manual email capture endpoint is available; provider webhook/polling can feed it.",
+                "last_seen": None,
+            },
+            {
+                "name": "Calendar availability",
+                "status": "manual",
+                "message": "Availability blocks are managed in therapist profiles for this MVP.",
+                "last_seen": None,
+            },
+            {
+                "name": "Outbound email",
+                "status": "configured" if os.getenv("SMTP_HOST") else "not_configured",
+                "message": "Outbound sending remains disabled until SMTP is configured and send approval is recorded.",
+                "last_seen": None,
+            },
+        ]
+    }
+
+
+def security_context(session: Session, user_id: str | None = DEMO_USER_ID) -> dict[str, Any]:
+    user = session.get(User, user_id or "") if user_id else None
+    if user is None:
+        user = session.get(User, DEMO_USER_ID)
+    if user is None:
+        return {"user": None, "permissions": [], "tenant_id": None}
+    return {
+        "user": user_to_dict(user),
+        "permissions": ROLE_PERMISSIONS.get(user.role, []),
+        "tenant_id": user.tenant_id,
+    }
+
+
+def governance_posture(session: Session, tenant_id: str | None = None) -> dict[str, Any]:
+    tenant = tenant_id or "demo-clinic"
+    audit_count = int(session.scalar(select(func.count(AuditLog.id)).where(AuditLog.tenant_id == tenant)) or 0)
+    open_review_count = int(
+        session.scalar(
+            select(func.count(HumanReviewTask.id)).where(
+                HumanReviewTask.tenant_id == tenant,
+                HumanReviewTask.status == "open",
+            )
+        )
+        or 0
+    )
+    signed_reports = int(
+        session.scalar(
+            select(func.count(ReportDraft.id)).where(
+                ReportDraft.tenant_id == tenant,
+                ReportDraft.status == "signed_off",
+            )
+        )
+        or 0
+    )
+    return {
+        "tenant_id": tenant,
+        "audit_events": audit_count,
+        "open_review_tasks": open_review_count,
+        "signed_reports": signed_reports,
+        "retention_policy": {
+            "default_days": int(os.getenv("LUMEN_RETENTION_DAYS", "2555")),
+            "delete_requires_review": True,
+            "audit_log_policy": "append_only_application_policy",
+        },
+        "model_data_policy": {
+            "provider": os.getenv("LUMEN_LLM_PROVIDER", "ollama"),
+            "send_phi_to_external_provider": os.getenv("LUMEN_ALLOW_EXTERNAL_PHI", "false").lower() == "true",
+        },
+    }
+
+
 def list_review_tasks(session: Session, tenant_id: str | None = None, status: str | None = "open") -> list[dict[str, Any]]:
     query = select(HumanReviewTask).order_by(HumanReviewTask.created_at.desc())
     if tenant_id:
@@ -336,6 +633,15 @@ def apply_review_action(
     else:
         raise ValueError("action must be approve, reject, request_changes, or escalate.")
 
+    if task.payload_key == "intake_reminder_draft":
+        draft_id = (task.source_payload or {}).get("id") if isinstance(task.source_payload, dict) else None
+        draft = session.get(CommunicationDraft, draft_id) if draft_id else None
+        if draft:
+            draft.status = "approved_pending_send" if action == "approve" else task.status
+            if action == "approve" and task.final_text:
+                draft.body = task.final_text
+            draft.updated_at = utc_now()
+
     if task.referral_id:
         referral = session.get(Referral, task.referral_id)
         if referral:
@@ -366,6 +672,75 @@ def list_therapists(session: Session, tenant_id: str | None = None) -> list[dict
     return [therapist_to_dict(therapist) for therapist in session.scalars(query)]
 
 
+def get_therapist(session: Session, therapist_id: str) -> dict[str, Any]:
+    therapist = session.get(Therapist, therapist_id)
+    if therapist is None:
+        raise KeyError(f"Unknown therapist: {therapist_id}")
+    return therapist_to_dict(therapist)
+
+
+def create_therapist(session: Session, tenant_id: str, data: dict[str, Any]) -> dict[str, Any]:
+    ensure_tenant(session, tenant_id)
+    therapist = Therapist(
+        tenant_id=tenant_id,
+        name=str(data.get("name") or "").strip(),
+        email=data.get("email"),
+        specialties=_list_value(data.get("specialties")),
+        age_groups=_list_value(data.get("age_groups")),
+        languages=_list_value(data.get("languages")),
+        modalities=_list_value(data.get("modalities")),
+        insurers=_list_value(data.get("insurers")),
+        capacity_per_week=int(data.get("capacity_per_week") or 0),
+        active=bool(data.get("active", True)),
+        availability_blocks=_availability_blocks(data.get("availability_blocks")),
+    )
+    if not therapist.name:
+        raise ValueError("Therapist name is required.")
+    session.add(therapist)
+    session.flush()
+    write_audit(
+        session,
+        tenant_id=tenant_id,
+        action="create",
+        entity_type="therapist",
+        entity_id=therapist.id,
+        after=therapist_to_dict(therapist),
+    )
+    return therapist_to_dict(therapist)
+
+
+def update_therapist(session: Session, therapist_id: str, data: dict[str, Any]) -> dict[str, Any]:
+    therapist = session.get(Therapist, therapist_id)
+    if therapist is None:
+        raise KeyError(f"Unknown therapist: {therapist_id}")
+    before = therapist_to_dict(therapist)
+    for key in ("name", "email"):
+        if key in data:
+            setattr(therapist, key, str(data.get(key) or "").strip() or None)
+    for key in ("specialties", "age_groups", "languages", "modalities", "insurers"):
+        if key in data:
+            setattr(therapist, key, _list_value(data.get(key)))
+    if "capacity_per_week" in data:
+        therapist.capacity_per_week = int(data.get("capacity_per_week") or 0)
+    if "active" in data:
+        therapist.active = bool(data.get("active"))
+    if "availability_blocks" in data:
+        therapist.availability_blocks = _availability_blocks(data.get("availability_blocks"))
+    if not therapist.name:
+        raise ValueError("Therapist name is required.")
+    therapist.updated_at = utc_now()
+    write_audit(
+        session,
+        tenant_id=therapist.tenant_id,
+        action="update",
+        entity_type="therapist",
+        entity_id=therapist.id,
+        before=before,
+        after=therapist_to_dict(therapist),
+    )
+    return therapist_to_dict(therapist)
+
+
 def therapist_facts_for_tenant(session: Session, tenant_id: str) -> list[dict[str, Any]]:
     return [
         {
@@ -383,6 +758,1148 @@ def therapist_facts_for_tenant(session: Session, tenant_id: str) -> list[dict[st
             select(Therapist).where(Therapist.tenant_id == tenant_id, Therapist.active.is_(True)).order_by(Therapist.name)
         )
     ]
+
+
+def deterministic_match_for_referral(session: Session, referral_id: str) -> dict[str, Any]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    therapists = list(
+        session.scalars(
+            select(Therapist).where(Therapist.tenant_id == referral.tenant_id).order_by(Therapist.name)
+        )
+    )
+    included = []
+    excluded = []
+    for therapist in therapists:
+        result = _score_therapist_for_referral(session, referral, therapist)
+        if result["excluded"]:
+            excluded.append(result)
+        else:
+            included.append(result)
+    included.sort(key=lambda item: item["score"], reverse=True)
+    match = {
+        "referral_id": referral.id,
+        "ranked_matches": included,
+        "excluded_therapists": excluded,
+        "hard_constraints_checked": ["active", "capacity", "insurance", "language", "modality", "age_group"],
+        "requires_human_approval": True,
+    }
+    before = referral_summary(referral)
+    referral.match_summary = match
+    referral.status = "match_pending_approval" if included else "needs_admin_review"
+    referral.updated_at = utc_now()
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="deterministic_match",
+        entity_type="referral",
+        entity_id=referral.id,
+        before=before,
+        after=referral_summary(referral),
+    )
+    return match
+
+
+def propose_appointment_slots(
+    session: Session,
+    referral_id: str,
+    therapist_id: str | None = None,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    target_therapist = therapist_id or _top_match_therapist_id(referral)
+    if not target_therapist:
+        match = deterministic_match_for_referral(session, referral_id)
+        target_therapist = (match.get("ranked_matches") or [{}])[0].get("therapist_id")
+    if not target_therapist:
+        raise ValueError("No eligible therapist is available for appointment proposals.")
+
+    therapist = session.get(Therapist, target_therapist)
+    if therapist is None:
+        raise KeyError(f"Unknown therapist: {target_therapist}")
+    if therapist.tenant_id != referral.tenant_id:
+        raise ValueError("Therapist and referral tenants do not match.")
+
+    proposals = []
+    existing = list(
+        session.scalars(
+            select(Appointment).where(
+                Appointment.tenant_id == referral.tenant_id,
+                Appointment.referral_id == referral.id,
+                Appointment.therapist_id == therapist.id,
+                Appointment.status == "proposed",
+            )
+        )
+    )
+    for appointment in existing:
+        proposals.append(appointment_to_dict(appointment))
+        if len(proposals) >= limit:
+            return proposals
+
+    for starts_at, ends_at, block in _generate_slots(therapist.availability_blocks, limit * 4):
+        if len(proposals) >= limit:
+            break
+        if _appointment_conflicts(session, therapist.id, starts_at, ends_at):
+            continue
+        appointment = Appointment(
+            tenant_id=referral.tenant_id,
+            patient_id=referral.patient_id,
+            therapist_id=therapist.id,
+            referral_id=referral.id,
+            starts_at=starts_at,
+            ends_at=ends_at,
+            status="proposed",
+            source=f"availability:{block.get('weekday', 'manual')}",
+        )
+        session.add(appointment)
+        session.flush()
+        proposals.append(appointment_to_dict(appointment))
+        write_audit(
+            session,
+            tenant_id=referral.tenant_id,
+            action="create",
+            entity_type="appointment",
+            entity_id=appointment.id,
+            after=appointment_to_dict(appointment),
+        )
+    return proposals
+
+
+def list_appointments(
+    session: Session,
+    tenant_id: str | None = None,
+    referral_id: str | None = None,
+    therapist_id: str | None = None,
+) -> list[dict[str, Any]]:
+    query = select(Appointment).order_by(Appointment.starts_at.asc())
+    if tenant_id:
+        query = query.where(Appointment.tenant_id == tenant_id)
+    if referral_id:
+        query = query.where(Appointment.referral_id == referral_id)
+    if therapist_id:
+        query = query.where(Appointment.therapist_id == therapist_id)
+    return [appointment_to_dict(item) for item in session.scalars(query)]
+
+
+def confirm_appointment(session: Session, appointment_id: str) -> dict[str, Any]:
+    appointment = session.get(Appointment, appointment_id)
+    if appointment is None:
+        raise KeyError(f"Unknown appointment: {appointment_id}")
+    if not appointment.starts_at or not appointment.ends_at:
+        raise ValueError("Appointment has no proposed time.")
+    if _appointment_conflicts(
+        session,
+        appointment.therapist_id or "",
+        appointment.starts_at,
+        appointment.ends_at,
+        exclude_appointment_id=appointment.id,
+    ):
+        raise ValueError("Appointment conflicts with an existing proposed or confirmed slot.")
+    before = appointment_to_dict(appointment)
+    appointment.status = "confirmed"
+    appointment.updated_at = utc_now()
+    if appointment.referral_id:
+        referral = session.get(Referral, appointment.referral_id)
+        if referral:
+            referral.status = "contacted"
+    write_audit(
+        session,
+        tenant_id=appointment.tenant_id,
+        action="confirm",
+        entity_type="appointment",
+        entity_id=appointment.id,
+        before=before,
+        after=appointment_to_dict(appointment),
+    )
+    return appointment_to_dict(appointment)
+
+
+def list_intake_templates(session: Session, tenant_id: str | None = None) -> list[dict[str, Any]]:
+    query = select(IntakeTemplate).order_by(IntakeTemplate.name)
+    if tenant_id:
+        query = query.where(IntakeTemplate.tenant_id == tenant_id)
+    return [intake_template_to_dict(template) for template in session.scalars(query)]
+
+
+def create_referral_document(
+    session: Session,
+    *,
+    referral_id: str,
+    title: str,
+    document_type: str,
+    storage_uri: str,
+    metadata: dict[str, Any],
+    item_id: str | None = None,
+) -> dict[str, Any]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    patient = _ensure_patient_for_referral(session, referral)
+    document = Document(
+        tenant_id=referral.tenant_id,
+        patient_id=patient.id,
+        document_type=document_type,
+        title=title,
+        storage_uri=storage_uri,
+        metadata_json={
+            **json_safe(metadata),
+            "referral_id": referral.id,
+            "patient_id": patient.id,
+            "linked_intake_item_id": item_id,
+        },
+    )
+    session.add(document)
+    session.flush()
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="create",
+        entity_type="document",
+        entity_id=document.id,
+        after=document_to_dict(document),
+    )
+    extracted_text = str(metadata.get("extracted_text") or "")
+    if extracted_text.strip():
+        _index_text_chunks(
+            session,
+            tenant_id=referral.tenant_id,
+            patient_id=patient.id,
+            document_id=document.id,
+            source_type=document.document_type,
+            source_id=document.id,
+            text=extracted_text,
+            metadata={"title": title, "referral_id": referral.id},
+        )
+
+    if item_id:
+        item = session.get(IntakeChecklistItem, item_id)
+        if item is None:
+            raise KeyError(f"Unknown intake checklist item: {item_id}")
+        if item.tenant_id != referral.tenant_id or item.referral_id != referral.id:
+            raise ValueError("Intake item does not belong to this referral.")
+        before = intake_item_to_dict(item)
+        item.source_document_id = document.id
+        item.status = "completed"
+        item.completed_at = utc_now()
+        item.notes = f"Completed by document upload: {title}"
+        item.updated_at = utc_now()
+        write_audit(
+            session,
+            tenant_id=item.tenant_id,
+            action="complete_by_upload",
+            entity_type="intake_checklist_item",
+            entity_id=item.id,
+            before=before,
+            after=intake_item_to_dict(item),
+        )
+        if item.item_type == "consent":
+            _complete_matching_consent_for_item(session, item, document.id)
+
+    return document_to_dict(document)
+
+
+def start_intake_for_referral(session: Session, referral_id: str, template_id: str | None = None) -> dict[str, Any]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    patient = _ensure_patient_for_referral(session, referral)
+    template = _select_intake_template(session, referral, template_id)
+    if template is None:
+        raise ValueError("No active intake template is configured for this referral.")
+
+    existing_keys = {
+        item.item_key
+        for item in session.scalars(
+            select(IntakeChecklistItem).where(
+                IntakeChecklistItem.tenant_id == referral.tenant_id,
+                IntakeChecklistItem.referral_id == referral.id,
+            )
+        )
+    }
+    for spec in template.required_items or []:
+        key = str(spec.get("key") or spec.get("label") or "").strip()
+        if not key or key in existing_keys:
+            continue
+        item_type = str(spec.get("type") or "form")
+        checklist_item = IntakeChecklistItem(
+            tenant_id=referral.tenant_id,
+            patient_id=patient.id,
+            referral_id=referral.id,
+            template_id=template.id,
+            item_key=key,
+            label=str(spec.get("label") or key.replace("_", " ").title()),
+            item_type=item_type,
+            status="missing",
+            due_at=utc_now() + timedelta(days=int(spec.get("due_days") or 7)),
+        )
+        session.add(checklist_item)
+        if item_type == "consent":
+            scope = str(spec.get("consent_scope") or key)
+            consent = session.scalar(
+                select(ConsentRecord).where(
+                    ConsentRecord.tenant_id == referral.tenant_id,
+                    ConsentRecord.patient_id == patient.id,
+                    ConsentRecord.scope == scope,
+                )
+            )
+            if consent is None:
+                session.add(
+                    ConsentRecord(
+                        tenant_id=referral.tenant_id,
+                        patient_id=patient.id,
+                        scope=scope,
+                        status="missing",
+                    )
+                )
+
+    before = referral_summary(referral)
+    if referral.status in {"ready_to_contact", "contacted", "closed"}:
+        pass
+    else:
+        referral.status = "needs_admin_review"
+    referral.updated_at = utc_now()
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="start_intake",
+        entity_type="referral",
+        entity_id=referral.id,
+        before=before,
+        after=referral_summary(referral),
+    )
+    session.flush()
+    return intake_workspace(session, referral_id)
+
+
+def intake_workspace(session: Session, referral_id: str) -> dict[str, Any]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    template = _select_intake_template(session, referral, None)
+    items = list(
+        session.scalars(
+            select(IntakeChecklistItem)
+            .where(IntakeChecklistItem.tenant_id == referral.tenant_id, IntakeChecklistItem.referral_id == referral.id)
+            .order_by(IntakeChecklistItem.created_at)
+        )
+    )
+    responses = list(
+        session.scalars(
+            select(QuestionnaireResponse)
+            .where(QuestionnaireResponse.tenant_id == referral.tenant_id, QuestionnaireResponse.referral_id == referral.id)
+            .order_by(QuestionnaireResponse.created_at.desc())
+        )
+    )
+    briefs = list(
+        session.scalars(
+            select(TherapistPrepBrief)
+            .where(TherapistPrepBrief.tenant_id == referral.tenant_id, TherapistPrepBrief.referral_id == referral.id)
+            .order_by(TherapistPrepBrief.created_at.desc())
+        )
+    )
+    documents = []
+    drafts = list(
+        session.scalars(
+            select(CommunicationDraft)
+            .where(CommunicationDraft.tenant_id == referral.tenant_id, CommunicationDraft.referral_id == referral.id)
+            .order_by(CommunicationDraft.created_at.desc())
+        )
+    )
+    consents = []
+    if referral.patient_id:
+        consents = list(
+            session.scalars(
+                select(ConsentRecord)
+                .where(ConsentRecord.tenant_id == referral.tenant_id, ConsentRecord.patient_id == referral.patient_id)
+                .order_by(ConsentRecord.scope)
+            )
+        )
+        documents = [
+            document
+            for document in session.scalars(
+                select(Document)
+                .where(Document.tenant_id == referral.tenant_id, Document.patient_id == referral.patient_id)
+                .order_by(Document.created_at.desc())
+            )
+            if (document.metadata_json or {}).get("referral_id") == referral.id
+        ]
+    return {
+        "referral": referral_summary(referral),
+        "template": intake_template_to_dict(template) if template else None,
+        "items": [intake_item_to_dict(item) for item in items],
+        "consents": [consent_record_to_dict(consent) for consent in consents],
+        "questionnaires": [questionnaire_response_to_dict(response) for response in responses],
+        "documents": [document_to_dict(document) for document in documents],
+        "communication_drafts": [communication_draft_to_dict(draft) for draft in drafts],
+        "prep_briefs": [prep_brief_to_dict(brief) for brief in briefs],
+        "status": _intake_status(items, consents),
+    }
+
+
+def generate_missing_intake_reminder(session: Session, referral_id: str) -> dict[str, Any]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    patient = _ensure_patient_for_referral(session, referral)
+    workspace = intake_workspace(session, referral_id)
+    missing_items = [item for item in workspace["items"] if item["status"] != "completed"]
+    missing_consents = [consent for consent in workspace["consents"] if consent["status"] != "completed"]
+    if not missing_items and not missing_consents:
+        raise ValueError("No missing intake items need a reminder.")
+
+    item_lines = []
+    for item in missing_items:
+        due_text = f" (due {item['due_at']})" if item.get("due_at") else ""
+        item_lines.append(f"- {item['label']}{due_text}")
+    consent_lines = [f"- {consent['scope'].replace('_', ' ')} consent" for consent in missing_consents]
+    body = "\n".join(
+        [
+            f"Hello {referral.patient_name or patient.display_name or 'there'},",
+            "",
+            "Before the first appointment, please send the remaining intake items listed below.",
+            "",
+            "Missing documents and forms:",
+            *(item_lines or ["- No checklist documents are missing."]),
+            "",
+            "Missing consent records:",
+            *(consent_lines or ["- No consent records are missing."]),
+            "",
+            "This message is a draft and must be reviewed by clinic staff before it is sent.",
+        ]
+    )
+    draft = CommunicationDraft(
+        tenant_id=referral.tenant_id,
+        referral_id=referral.id,
+        patient_id=patient.id,
+        workflow_run_id=referral.workflow_run_id,
+        channel="email",
+        subject="Reminder: intake items before your first session",
+        body=body,
+        status="draft_pending_review",
+        proposed_slots=[],
+        requires_human_send=True,
+    )
+    session.add(draft)
+    session.flush()
+    referral.communication_draft_id = draft.id
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="create",
+        entity_type="communication_draft",
+        entity_id=draft.id,
+        after=communication_draft_to_dict(draft),
+    )
+    if referral.workflow_run_id:
+        task = HumanReviewTask(
+            tenant_id=referral.tenant_id,
+            workflow_run_id=referral.workflow_run_id,
+            referral_id=referral.id,
+            patient_id=patient.id,
+            task_type="intake_reminder_approval",
+            reason="Patient-facing intake reminder requires staff approval before sending.",
+            payload_key="intake_reminder_draft",
+            source_payload=communication_draft_to_dict(draft),
+            draft_text=draft.body,
+        )
+        session.add(task)
+        session.flush()
+        write_audit(
+            session,
+            tenant_id=referral.tenant_id,
+            action="create",
+            entity_type="human_review_task",
+            entity_id=task.id,
+            after=review_task_to_dict(task),
+        )
+    return communication_draft_to_dict(draft)
+
+
+def complete_intake_item(session: Session, item_id: str, notes: str | None = None) -> dict[str, Any]:
+    item = session.get(IntakeChecklistItem, item_id)
+    if item is None:
+        raise KeyError(f"Unknown intake checklist item: {item_id}")
+    before = intake_item_to_dict(item)
+    item.status = "completed"
+    item.completed_at = utc_now()
+    item.notes = notes
+    item.updated_at = utc_now()
+    write_audit(
+        session,
+        tenant_id=item.tenant_id,
+        action="complete",
+        entity_type="intake_checklist_item",
+        entity_id=item.id,
+        before=before,
+        after=intake_item_to_dict(item),
+    )
+    return intake_item_to_dict(item)
+
+
+def complete_consent_record(session: Session, consent_id: str, expires_at: datetime | None = None) -> dict[str, Any]:
+    consent = session.get(ConsentRecord, consent_id)
+    if consent is None:
+        raise KeyError(f"Unknown consent record: {consent_id}")
+    before = consent_record_to_dict(consent)
+    consent.status = "completed"
+    consent.expires_at = expires_at
+    consent.updated_at = utc_now()
+    for item in session.scalars(
+        select(IntakeChecklistItem).where(
+            IntakeChecklistItem.tenant_id == consent.tenant_id,
+            IntakeChecklistItem.patient_id == consent.patient_id,
+            IntakeChecklistItem.item_type == "consent",
+            IntakeChecklistItem.status != "completed",
+        )
+    ):
+        if item.item_key == consent.scope or item.label.lower().startswith(consent.scope.lower()):
+            item.status = "completed"
+            item.completed_at = utc_now()
+    write_audit(
+        session,
+        tenant_id=consent.tenant_id,
+        action="complete",
+        entity_type="consent_record",
+        entity_id=consent.id,
+        before=before,
+        after=consent_record_to_dict(consent),
+    )
+    return consent_record_to_dict(consent)
+
+
+def save_questionnaire_response(
+    session: Session,
+    referral_id: str,
+    questionnaire_name: str,
+    answers: dict[str, Any],
+) -> dict[str, Any]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    patient = _ensure_patient_for_referral(session, referral)
+    template = _select_intake_template(session, referral, None)
+    response = QuestionnaireResponse(
+        tenant_id=referral.tenant_id,
+        patient_id=patient.id,
+        referral_id=referral.id,
+        template_id=template.id if template else None,
+        questionnaire_name=questionnaire_name,
+        answers=json_safe(answers),
+        score_summary=_score_questionnaire(answers),
+        status="completed",
+    )
+    session.add(response)
+    session.flush()
+    score = ScoreRecord(
+        tenant_id=referral.tenant_id,
+        patient_id=patient.id,
+        referral_id=referral.id,
+        source_response_id=response.id,
+        instrument_name=questionnaire_name,
+        score_summary=response.score_summary,
+    )
+    session.add(score)
+    session.flush()
+    for item in session.scalars(
+        select(IntakeChecklistItem).where(
+            IntakeChecklistItem.tenant_id == referral.tenant_id,
+            IntakeChecklistItem.referral_id == referral.id,
+            IntakeChecklistItem.item_type == "questionnaire",
+            IntakeChecklistItem.status != "completed",
+        )
+    ):
+        item.status = "completed"
+        item.completed_at = utc_now()
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="create",
+        entity_type="questionnaire_response",
+        entity_id=response.id,
+        after=questionnaire_response_to_dict(response),
+    )
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="create",
+        entity_type="score_record",
+        entity_id=score.id,
+        after=score_record_to_dict(score),
+    )
+    return questionnaire_response_to_dict(response)
+
+
+def generate_prep_brief(session: Session, referral_id: str, therapist_id: str | None = None) -> dict[str, Any]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    patient = _ensure_patient_for_referral(session, referral)
+    chosen_therapist_id = therapist_id or _top_match_therapist_id(referral)
+    items = list(
+        session.scalars(select(IntakeChecklistItem).where(IntakeChecklistItem.referral_id == referral.id))
+    )
+    responses = list(
+        session.scalars(select(QuestionnaireResponse).where(QuestionnaireResponse.referral_id == referral.id))
+    )
+    appointments = list(
+        session.scalars(select(Appointment).where(Appointment.referral_id == referral.id).order_by(Appointment.starts_at))
+    )
+    missing_items = [item.label for item in items if item.status != "completed"]
+    completed_items = [item.label for item in items if item.status == "completed"]
+    lines = [
+        f"# Therapist Prep Brief: {referral.patient_name or patient.display_name or 'Referral'}",
+        "",
+        f"- Referral status: {referral.status}",
+        f"- Presenting source: {referral.source_channel}",
+        f"- Contact: {referral.contact_email or 'missing'} / {referral.contact_phone or 'missing'}",
+        f"- Insurance: {referral.insurer or 'missing'}",
+        f"- Language/modality: {referral.language_preference or 'unknown'} / {referral.modality_preference or 'unknown'}",
+        f"- Risk: {referral.risk_category or 'pending'} ({referral.urgency or 'pending'})",
+        f"- Completed intake: {', '.join(completed_items) if completed_items else 'none yet'}",
+        f"- Missing intake: {', '.join(missing_items) if missing_items else 'none recorded'}",
+    ]
+    if responses:
+        score_bits = [
+            f"{response.questionnaire_name}: {response.score_summary.get('total_score', 0)}"
+            for response in responses
+        ]
+        lines.append(f"- Questionnaire scores: {', '.join(score_bits)}")
+    if appointments:
+        slot_bits = [
+            f"{iso_or_none(item.starts_at)} ({item.status})"
+            for item in appointments[:3]
+        ]
+        lines.append(f"- Proposed slots: {', '.join(slot_bits)}")
+    lines.extend(["", "## Source Referral", "", referral.raw_text.strip()])
+    brief = TherapistPrepBrief(
+        tenant_id=referral.tenant_id,
+        patient_id=patient.id,
+        referral_id=referral.id,
+        therapist_id=chosen_therapist_id,
+        title=f"Prep brief for {referral.patient_name or patient.display_name or referral.id[:8]}",
+        body="\n".join(lines).strip(),
+        source_summary={
+            "referral_id": referral.id,
+            "completed_intake_count": len(completed_items),
+            "missing_intake_count": len(missing_items),
+            "questionnaire_count": len(responses),
+            "appointment_count": len(appointments),
+        },
+    )
+    session.add(brief)
+    session.flush()
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="create",
+        entity_type="therapist_prep_brief",
+        entity_id=brief.id,
+        after=prep_brief_to_dict(brief),
+    )
+    return prep_brief_to_dict(brief)
+
+
+def patient_workspace(session: Session, patient_id: str) -> dict[str, Any]:
+    patient = session.get(Patient, patient_id)
+    if patient is None:
+        raise KeyError(f"Unknown patient: {patient_id}")
+    referrals = list(
+        session.scalars(
+            select(Referral)
+            .where(Referral.tenant_id == patient.tenant_id, Referral.patient_id == patient.id)
+            .order_by(Referral.updated_at.desc())
+        )
+    )
+    documents = list(
+        session.scalars(
+            select(Document)
+            .where(Document.tenant_id == patient.tenant_id, Document.patient_id == patient.id)
+            .order_by(Document.created_at.desc())
+        )
+    )
+    notes = list(
+        session.scalars(
+            select(SessionNote)
+            .where(SessionNote.tenant_id == patient.tenant_id, SessionNote.patient_id == patient.id)
+            .order_by(SessionNote.created_at.desc())
+        )
+    )
+    scores = list(
+        session.scalars(
+            select(ScoreRecord)
+            .where(ScoreRecord.tenant_id == patient.tenant_id, ScoreRecord.patient_id == patient.id)
+            .order_by(ScoreRecord.recorded_at.desc())
+        )
+    )
+    reports = list(
+        session.scalars(
+            select(ReportDraft)
+            .where(ReportDraft.tenant_id == patient.tenant_id, ReportDraft.patient_id == patient.id)
+            .order_by(ReportDraft.created_at.desc())
+        )
+    )
+    return {
+        "patient": patient_to_dict(patient),
+        "referrals": [referral_summary(referral) for referral in referrals],
+        "documents": [document_to_dict(document) for document in documents],
+        "session_notes": [session_note_to_dict(note) for note in notes],
+        "scores": [score_record_to_dict(score) for score in scores],
+        "report_drafts": [report_draft_to_dict(report) for report in reports],
+    }
+
+
+def create_session_note(
+    session: Session,
+    *,
+    referral_id: str,
+    therapist_id: str | None,
+    title: str,
+    body: str,
+    status: str = "draft",
+    appointment_id: str | None = None,
+) -> dict[str, Any]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    patient = _ensure_patient_for_referral(session, referral)
+    if therapist_id:
+        therapist = session.get(Therapist, therapist_id)
+        if therapist is None:
+            raise KeyError(f"Unknown therapist: {therapist_id}")
+        if therapist.tenant_id != referral.tenant_id:
+            raise ValueError("Therapist and referral tenants do not match.")
+    note_body = body.strip()
+    if not note_body:
+        raise ValueError("Session note body is required.")
+    note = SessionNote(
+        tenant_id=referral.tenant_id,
+        patient_id=patient.id,
+        referral_id=referral.id,
+        therapist_id=therapist_id or None,
+        appointment_id=appointment_id,
+        title=title.strip() or "Session note",
+        body=note_body,
+        status=status if status in {"draft", "pending_approval", "approved"} else "draft",
+        approved_at=utc_now() if status == "approved" else None,
+    )
+    session.add(note)
+    session.flush()
+    _index_text_chunks(
+        session,
+        tenant_id=note.tenant_id,
+        patient_id=note.patient_id,
+        document_id=None,
+        source_type="session_note",
+        source_id=note.id,
+        text=note.body,
+        metadata={"title": note.title, "referral_id": referral.id, "therapist_id": therapist_id},
+    )
+    write_audit(
+        session,
+        tenant_id=note.tenant_id,
+        action="create",
+        entity_type="session_note",
+        entity_id=note.id,
+        after=session_note_to_dict(note),
+    )
+    return session_note_to_dict(note)
+
+
+def approve_session_note(session: Session, note_id: str) -> dict[str, Any]:
+    note = session.get(SessionNote, note_id)
+    if note is None:
+        raise KeyError(f"Unknown session note: {note_id}")
+    before = session_note_to_dict(note)
+    note.status = "approved"
+    note.approved_at = utc_now()
+    note.updated_at = utc_now()
+    write_audit(
+        session,
+        tenant_id=note.tenant_id,
+        action="approve",
+        entity_type="session_note",
+        entity_id=note.id,
+        before=before,
+        after=session_note_to_dict(note),
+    )
+    return session_note_to_dict(note)
+
+
+def create_clinical_library_record(
+    session: Session,
+    *,
+    tenant_id: str,
+    record_type: str,
+    title: str,
+    body: str,
+    version: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    ensure_tenant(session, tenant_id)
+    clean_type = record_type.strip().lower()
+    if clean_type not in {"protocol", "template", "insurer_rule", "clinical_reference"}:
+        raise ValueError("record_type must be protocol, template, insurer_rule, or clinical_reference.")
+    clean_body = body.strip()
+    if not clean_body:
+        raise ValueError("Clinical library body is required.")
+    record = ClinicalLibraryRecord(
+        tenant_id=tenant_id,
+        record_type=clean_type,
+        title=title.strip() or clean_type.replace("_", " ").title(),
+        version=version or None,
+        body=clean_body,
+        metadata_json=json_safe(metadata or {}),
+    )
+    session.add(record)
+    session.flush()
+    _index_text_chunks(
+        session,
+        tenant_id=tenant_id,
+        patient_id=None,
+        document_id=None,
+        source_type=clean_type,
+        source_id=record.id,
+        text=record.body,
+        metadata={"title": record.title, "version": record.version, "record_type": record.record_type},
+    )
+    write_audit(
+        session,
+        tenant_id=tenant_id,
+        action="create",
+        entity_type="clinical_library_record",
+        entity_id=record.id,
+        after=clinical_library_record_to_dict(record),
+    )
+    return clinical_library_record_to_dict(record)
+
+
+def list_clinical_library_records(
+    session: Session,
+    tenant_id: str | None = None,
+    record_type: str | None = None,
+) -> list[dict[str, Any]]:
+    query = select(ClinicalLibraryRecord).order_by(ClinicalLibraryRecord.updated_at.desc())
+    if tenant_id:
+        query = query.where(ClinicalLibraryRecord.tenant_id == tenant_id)
+    if record_type:
+        query = query.where(ClinicalLibraryRecord.record_type == record_type)
+    return [clinical_library_record_to_dict(record) for record in session.scalars(query)]
+
+
+def search_retrieval_chunks(
+    session: Session,
+    *,
+    tenant_id: str,
+    query_text: str,
+    patient_id: str | None = None,
+    document_types: list[str] | None = None,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    terms = {term for term in _search_terms(query_text) if len(term) >= 3}
+    if not terms:
+        return []
+    query = select(DocumentChunk).where(DocumentChunk.tenant_id == tenant_id)
+    if patient_id:
+        query = query.where((DocumentChunk.patient_id == patient_id) | (DocumentChunk.patient_id.is_(None)))
+    if document_types:
+        query = query.where(DocumentChunk.source_type.in_(document_types))
+    ranked = []
+    for chunk in session.scalars(query):
+        chunk_terms = set(_search_terms(chunk.text))
+        score = len(terms & chunk_terms)
+        if score:
+            ranked.append((score, chunk))
+    ranked.sort(key=lambda item: (item[0], item[1].created_at), reverse=True)
+    return [document_chunk_to_dict(chunk, score=score) for score, chunk in ranked[: max(1, min(limit, 20))]]
+
+
+def generate_report_draft(
+    session: Session,
+    *,
+    referral_id: str,
+    report_type: str,
+    title: str,
+    request_text: str,
+    therapist_id: str | None = None,
+) -> dict[str, Any]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    patient = _ensure_patient_for_referral(session, referral)
+    if therapist_id:
+        therapist = session.get(Therapist, therapist_id)
+        if therapist is None:
+            raise KeyError(f"Unknown therapist: {therapist_id}")
+        if therapist.tenant_id != referral.tenant_id:
+            raise ValueError("Therapist and referral tenants do not match.")
+
+    query_text = " ".join(
+        part
+        for part in [
+            request_text,
+            referral.raw_text,
+            referral.risk_category or "",
+            referral.urgency or "",
+            referral.modality_preference or "",
+        ]
+        if part
+    )
+    chunks = search_retrieval_chunks(
+        session,
+        tenant_id=referral.tenant_id,
+        query_text=query_text,
+        patient_id=patient.id,
+        limit=6,
+    )
+    if not chunks:
+        raise ValueError("Report drafting is blocked because no retrieval evidence was found.")
+    source_types = {chunk["source_type"] for chunk in chunks}
+    if report_type != "session_summary" and not source_types.intersection({"protocol", "template", "insurer_rule"}):
+        raise ValueError("Formal report drafting requires protocol, template, or insurer-rule evidence.")
+
+    report_title = title.strip() or _default_report_title(report_type, referral, patient)
+    claim_map = []
+    evidence_lines = []
+    for index, chunk in enumerate(chunks, start=1):
+        evidence_label = f"E{index}"
+        claim = _first_sentence(chunk["text"])
+        claim_map.append(
+            {
+                "claim": claim,
+                "evidence": [
+                    {
+                        "label": evidence_label,
+                        "source_type": chunk["source_type"],
+                        "source_id": chunk["source_id"],
+                        "chunk_index": chunk["chunk_index"],
+                    }
+                ],
+            }
+        )
+        evidence_lines.append(
+            f"- [{evidence_label}] {chunk['source_type']} {chunk['source_id'][:8]}: {claim}"
+        )
+
+    body_lines = [
+        f"# {report_title}",
+        "",
+        "Draft status: requires therapist review and sign-off.",
+        "",
+        "## Referral Context",
+        f"- Patient: {referral.patient_name or patient.display_name or patient.id}",
+        f"- Source: {referral.source_channel}",
+        f"- Risk status: {referral.risk_category or 'not recorded'} / {referral.urgency or 'not recorded'}",
+        "",
+        "## Evidence-Grounded Summary",
+    ]
+    for item in claim_map:
+        body_lines.append(f"- {item['claim']} [{item['evidence'][0]['label']}]")
+    body_lines.extend(
+        [
+            "",
+            "## Requested Output",
+            request_text.strip() or "Create a concise clinical summary from approved source evidence.",
+            "",
+            "## Evidence References",
+            *evidence_lines,
+        ]
+    )
+
+    draft = ReportDraft(
+        tenant_id=referral.tenant_id,
+        patient_id=patient.id,
+        referral_id=referral.id,
+        therapist_id=therapist_id or None,
+        report_type=report_type.strip().lower() or "session_summary",
+        title=report_title,
+        body="\n".join(body_lines),
+        claim_evidence_map=json_safe(claim_map),
+        unsupported_claims=[],
+        retrieval_summary={
+            "query_text": query_text[:500],
+            "chunk_count": len(chunks),
+            "source_types": sorted(source_types),
+        },
+        status="pending_signoff",
+    )
+    draft.unsupported_claims = _validate_report_body(draft.body, draft.claim_evidence_map)
+    session.add(draft)
+    session.flush()
+    write_audit(
+        session,
+        tenant_id=draft.tenant_id,
+        action="create",
+        entity_type="report_draft",
+        entity_id=draft.id,
+        after=report_draft_to_dict(draft),
+    )
+    return report_draft_to_dict(draft)
+
+
+def update_report_draft(
+    session: Session,
+    report_id: str,
+    *,
+    title: str | None = None,
+    body: str | None = None,
+    claim_evidence_map: list[dict[str, Any]] | None = None,
+    reviewer_id: str | None = DEMO_THERAPIST_USER_ID,
+    usable_for_practice_memory: bool = False,
+) -> dict[str, Any]:
+    report = session.get(ReportDraft, report_id)
+    if report is None:
+        raise KeyError(f"Unknown report draft: {report_id}")
+    if report.status == "signed_off":
+        raise ValueError("Signed-off reports cannot be edited.")
+
+    before = report_draft_to_dict(report)
+    if title is not None:
+        clean_title = title.strip()
+        if clean_title:
+            report.title = clean_title
+    if claim_evidence_map is not None:
+        report.claim_evidence_map = json_safe(claim_evidence_map)
+    if body is not None:
+        clean_body = body.strip()
+        if not clean_body:
+            raise ValueError("Report body cannot be empty.")
+        report.body = clean_body
+
+    report.unsupported_claims = _validate_report_body(report.body, report.claim_evidence_map)
+    report.status = "pending_signoff"
+    report.updated_at = utc_now()
+
+    if body is not None and before["body"] != report.body:
+        _create_draft_feedback(
+            session,
+            report=report,
+            feedback_type="therapist_edit",
+            original_text=before["body"],
+            final_text=report.body,
+            reviewer_id=reviewer_id,
+            usable_for_practice_memory=usable_for_practice_memory,
+        )
+
+    write_audit(
+        session,
+        tenant_id=report.tenant_id,
+        actor_user_id=reviewer_id if session.get(User, reviewer_id or "") else None,
+        action="update",
+        entity_type="report_draft",
+        entity_id=report.id,
+        before=before,
+        after=report_draft_to_dict(report),
+    )
+    return report_draft_to_dict(report)
+
+
+def export_report_draft(session: Session, report_id: str, export_format: str = "markdown") -> dict[str, str]:
+    report = session.get(ReportDraft, report_id)
+    if report is None:
+        raise KeyError(f"Unknown report draft: {report_id}")
+    if report.status != "signed_off":
+        raise ValueError("Reports can only be exported after therapist sign-off.")
+    if export_format not in {"markdown", "md"}:
+        raise ValueError("Only Markdown export is available in this MVP.")
+    safe_title = re.sub(r"[^A-Za-z0-9._-]+", "-", report.title).strip(".-") or report.id
+    write_audit(
+        session,
+        tenant_id=report.tenant_id,
+        action="export",
+        entity_type="report_draft",
+        entity_id=report.id,
+        after={"format": "markdown", "file_name": f"{safe_title}.md"},
+    )
+    return {
+        "file_name": f"{safe_title}.md",
+        "media_type": "text/markdown; charset=utf-8",
+        "content": report.body,
+    }
+
+
+def sign_off_report_draft(
+    session: Session,
+    report_id: str,
+    reviewer_id: str | None = DEMO_THERAPIST_USER_ID,
+) -> dict[str, Any]:
+    report = session.get(ReportDraft, report_id)
+    if report is None:
+        raise KeyError(f"Unknown report draft: {report_id}")
+    report.unsupported_claims = _validate_report_body(report.body, report.claim_evidence_map)
+    if report.unsupported_claims:
+        raise ValueError("Report draft has unsupported claims and cannot be signed off.")
+    before = report_draft_to_dict(report)
+    report.status = "signed_off"
+    report.signed_off_at = utc_now()
+    report.signed_off_by_id = reviewer_id if session.get(User, reviewer_id or "") else None
+    report.updated_at = utc_now()
+    write_audit(
+        session,
+        tenant_id=report.tenant_id,
+        actor_user_id=report.signed_off_by_id,
+        action="sign_off",
+        entity_type="report_draft",
+        entity_id=report.id,
+        before=before,
+        after=report_draft_to_dict(report),
+    )
+    return report_draft_to_dict(report)
+
+
+def record_draft_feedback(
+    session: Session,
+    report_id: str,
+    *,
+    feedback_type: str = "review_outcome",
+    final_text: str | None = None,
+    reviewer_id: str | None = DEMO_THERAPIST_USER_ID,
+    usable_for_practice_memory: bool = False,
+) -> dict[str, Any]:
+    report = session.get(ReportDraft, report_id)
+    if report is None:
+        raise KeyError(f"Unknown report draft: {report_id}")
+    feedback = _create_draft_feedback(
+        session,
+        report=report,
+        feedback_type=feedback_type,
+        original_text=report.body,
+        final_text=final_text or report.body,
+        reviewer_id=reviewer_id,
+        usable_for_practice_memory=usable_for_practice_memory,
+    )
+    write_audit(
+        session,
+        tenant_id=report.tenant_id,
+        actor_user_id=feedback.reviewer_id,
+        action="record_feedback",
+        entity_type="report_draft",
+        entity_id=report.id,
+        after=draft_feedback_to_dict(feedback),
+    )
+    return draft_feedback_to_dict(feedback)
+
+
+def draft_feedback_metrics(session: Session, tenant_id: str | None = None) -> dict[str, Any]:
+    feedback_query = select(DraftFeedback)
+    report_query = select(ReportDraft)
+    if tenant_id:
+        feedback_query = feedback_query.where(DraftFeedback.tenant_id == tenant_id)
+        report_query = report_query.where(ReportDraft.tenant_id == tenant_id)
+    feedback_items = list(session.scalars(feedback_query))
+    reports = list(session.scalars(report_query))
+    by_type: dict[str, int] = {}
+    for item in feedback_items:
+        by_type[item.feedback_type] = by_type.get(item.feedback_type, 0) + 1
+    return {
+        "feedback_count": len(feedback_items),
+        "practice_memory_eligible": len([item for item in feedback_items if item.usable_for_practice_memory]),
+        "feedback_by_type": by_type,
+        "signed_report_count": len([report for report in reports if report.status == "signed_off"]),
+        "drafts_with_unsupported_claims": len([report for report in reports if report.unsupported_claims]),
+    }
 
 
 def update_referral_from_result(session: Session, run: WorkflowRun) -> None:
@@ -609,6 +2126,33 @@ def referral_summary(referral: Referral) -> dict[str, Any]:
     }
 
 
+def patient_to_dict(patient: Patient) -> dict[str, Any]:
+    return {
+        "id": patient.id,
+        "tenant_id": patient.tenant_id,
+        "display_name": patient.display_name,
+        "date_of_birth": patient.date_of_birth,
+        "contact_email": patient.contact_email,
+        "contact_phone": patient.contact_phone,
+        "language": patient.language,
+        "created_at": iso_or_none(patient.created_at),
+        "updated_at": iso_or_none(patient.updated_at),
+    }
+
+
+def user_to_dict(user: User) -> dict[str, Any]:
+    return {
+        "id": user.id,
+        "tenant_id": user.tenant_id,
+        "email": user.email,
+        "display_name": user.display_name,
+        "role": user.role,
+        "active": user.active,
+        "created_at": iso_or_none(user.created_at),
+        "updated_at": iso_or_none(user.updated_at),
+    }
+
+
 def review_task_to_dict(task: HumanReviewTask) -> dict[str, Any]:
     return {
         "id": task.id,
@@ -649,6 +2193,158 @@ def communication_draft_to_dict(draft: CommunicationDraft) -> dict[str, Any]:
     }
 
 
+def document_to_dict(document: Document) -> dict[str, Any]:
+    return {
+        "id": document.id,
+        "tenant_id": document.tenant_id,
+        "patient_id": document.patient_id,
+        "document_type": document.document_type,
+        "title": document.title,
+        "storage_uri": document.storage_uri,
+        "metadata": json_safe(document.metadata_json),
+        "created_at": iso_or_none(document.created_at),
+        "updated_at": iso_or_none(document.updated_at),
+    }
+
+
+def session_note_to_dict(note: SessionNote) -> dict[str, Any]:
+    return {
+        "id": note.id,
+        "tenant_id": note.tenant_id,
+        "patient_id": note.patient_id,
+        "referral_id": note.referral_id,
+        "therapist_id": note.therapist_id,
+        "appointment_id": note.appointment_id,
+        "title": note.title,
+        "body": note.body,
+        "status": note.status,
+        "source_document_id": note.source_document_id,
+        "approved_at": iso_or_none(note.approved_at),
+        "created_at": iso_or_none(note.created_at),
+        "updated_at": iso_or_none(note.updated_at),
+    }
+
+
+def clinical_library_record_to_dict(record: ClinicalLibraryRecord) -> dict[str, Any]:
+    return {
+        "id": record.id,
+        "tenant_id": record.tenant_id,
+        "record_type": record.record_type,
+        "title": record.title,
+        "version": record.version,
+        "body": record.body,
+        "source_document_id": record.source_document_id,
+        "metadata": json_safe(record.metadata_json),
+        "status": record.status,
+        "created_at": iso_or_none(record.created_at),
+        "updated_at": iso_or_none(record.updated_at),
+    }
+
+
+def score_record_to_dict(score: ScoreRecord) -> dict[str, Any]:
+    return {
+        "id": score.id,
+        "tenant_id": score.tenant_id,
+        "patient_id": score.patient_id,
+        "referral_id": score.referral_id,
+        "source_response_id": score.source_response_id,
+        "instrument_name": score.instrument_name,
+        "score_summary": json_safe(score.score_summary),
+        "status": score.status,
+        "recorded_at": iso_or_none(score.recorded_at),
+        "created_at": iso_or_none(score.created_at),
+        "updated_at": iso_or_none(score.updated_at),
+    }
+
+
+def document_chunk_to_dict(chunk: DocumentChunk, score: int | None = None) -> dict[str, Any]:
+    data = {
+        "id": chunk.id,
+        "tenant_id": chunk.tenant_id,
+        "patient_id": chunk.patient_id,
+        "document_id": chunk.document_id,
+        "source_type": chunk.source_type,
+        "source_id": chunk.source_id,
+        "chunk_index": chunk.chunk_index,
+        "text": chunk.text,
+        "metadata": json_safe(chunk.metadata_json),
+        "embedding_model": chunk.embedding_model,
+        "vector_ref": chunk.vector_ref,
+        "created_at": iso_or_none(chunk.created_at),
+    }
+    if score is not None:
+        data["score"] = score
+    return data
+
+
+def report_draft_to_dict(report: ReportDraft) -> dict[str, Any]:
+    return {
+        "id": report.id,
+        "tenant_id": report.tenant_id,
+        "patient_id": report.patient_id,
+        "referral_id": report.referral_id,
+        "therapist_id": report.therapist_id,
+        "report_type": report.report_type,
+        "title": report.title,
+        "body": report.body,
+        "claim_evidence_map": json_safe(report.claim_evidence_map),
+        "unsupported_claims": json_safe(report.unsupported_claims),
+        "retrieval_summary": json_safe(report.retrieval_summary),
+        "status": report.status,
+        "signed_off_at": iso_or_none(report.signed_off_at),
+        "signed_off_by_id": report.signed_off_by_id,
+        "created_at": iso_or_none(report.created_at),
+        "updated_at": iso_or_none(report.updated_at),
+    }
+
+
+def referral_import_batch_to_dict(batch: ReferralImportBatch) -> dict[str, Any]:
+    return {
+        "id": batch.id,
+        "tenant_id": batch.tenant_id,
+        "source_channel": batch.source_channel,
+        "file_name": batch.file_name,
+        "source_document_id": batch.source_document_id,
+        "status": batch.status,
+        "total_rows": batch.total_rows,
+        "imported_count": batch.imported_count,
+        "error_count": batch.error_count,
+        "metadata": json_safe(batch.metadata_json),
+        "created_at": iso_or_none(batch.created_at),
+        "updated_at": iso_or_none(batch.updated_at),
+    }
+
+
+def referral_import_error_to_dict(error: ReferralImportError) -> dict[str, Any]:
+    return {
+        "id": error.id,
+        "tenant_id": error.tenant_id,
+        "batch_id": error.batch_id,
+        "row_number": error.row_number,
+        "message": error.message,
+        "raw_row": json_safe(error.raw_row),
+        "created_at": iso_or_none(error.created_at),
+    }
+
+
+def draft_feedback_to_dict(feedback: DraftFeedback) -> dict[str, Any]:
+    return {
+        "id": feedback.id,
+        "tenant_id": feedback.tenant_id,
+        "patient_id": feedback.patient_id,
+        "referral_id": feedback.referral_id,
+        "report_draft_id": feedback.report_draft_id,
+        "reviewer_id": feedback.reviewer_id,
+        "feedback_type": feedback.feedback_type,
+        "original_text": feedback.original_text,
+        "final_text": feedback.final_text,
+        "edit_summary": json_safe(feedback.edit_summary),
+        "usable_for_practice_memory": feedback.usable_for_practice_memory,
+        "created_at": iso_or_none(feedback.created_at),
+        "updated_at": iso_or_none(feedback.updated_at),
+    }
+
+
 def therapist_to_dict(therapist: Therapist) -> dict[str, Any]:
     return {
         "id": therapist.id,
@@ -665,6 +2361,654 @@ def therapist_to_dict(therapist: Therapist) -> dict[str, Any]:
         "availability_blocks": therapist.availability_blocks,
         "created_at": iso_or_none(therapist.created_at),
         "updated_at": iso_or_none(therapist.updated_at),
+    }
+
+
+def appointment_to_dict(appointment: Appointment) -> dict[str, Any]:
+    return {
+        "id": appointment.id,
+        "tenant_id": appointment.tenant_id,
+        "patient_id": appointment.patient_id,
+        "therapist_id": appointment.therapist_id,
+        "referral_id": appointment.referral_id,
+        "starts_at": iso_or_none(appointment.starts_at),
+        "ends_at": iso_or_none(appointment.ends_at),
+        "status": appointment.status,
+        "source": appointment.source,
+        "created_at": iso_or_none(appointment.created_at),
+        "updated_at": iso_or_none(appointment.updated_at),
+    }
+
+
+def intake_template_to_dict(template: IntakeTemplate) -> dict[str, Any]:
+    return {
+        "id": template.id,
+        "tenant_id": template.tenant_id,
+        "name": template.name,
+        "patient_type": template.patient_type,
+        "insurer": template.insurer,
+        "age_band": template.age_band,
+        "modality": template.modality,
+        "source_channel": template.source_channel,
+        "required_items": json_safe(template.required_items),
+        "questionnaire_schema": json_safe(template.questionnaire_schema),
+        "active": template.active,
+        "created_at": iso_or_none(template.created_at),
+        "updated_at": iso_or_none(template.updated_at),
+    }
+
+
+def intake_item_to_dict(item: IntakeChecklistItem) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "tenant_id": item.tenant_id,
+        "patient_id": item.patient_id,
+        "referral_id": item.referral_id,
+        "template_id": item.template_id,
+        "item_key": item.item_key,
+        "label": item.label,
+        "item_type": item.item_type,
+        "status": item.status,
+        "due_at": iso_or_none(item.due_at),
+        "completed_at": iso_or_none(item.completed_at),
+        "source_document_id": item.source_document_id,
+        "notes": item.notes,
+        "created_at": iso_or_none(item.created_at),
+        "updated_at": iso_or_none(item.updated_at),
+    }
+
+
+def consent_record_to_dict(consent: ConsentRecord) -> dict[str, Any]:
+    return {
+        "id": consent.id,
+        "tenant_id": consent.tenant_id,
+        "patient_id": consent.patient_id,
+        "scope": consent.scope,
+        "status": consent.status,
+        "expires_at": iso_or_none(consent.expires_at),
+        "source_document_id": consent.source_document_id,
+        "created_at": iso_or_none(consent.created_at),
+        "updated_at": iso_or_none(consent.updated_at),
+    }
+
+
+def questionnaire_response_to_dict(response: QuestionnaireResponse) -> dict[str, Any]:
+    return {
+        "id": response.id,
+        "tenant_id": response.tenant_id,
+        "patient_id": response.patient_id,
+        "referral_id": response.referral_id,
+        "template_id": response.template_id,
+        "questionnaire_name": response.questionnaire_name,
+        "answers": json_safe(response.answers),
+        "score_summary": json_safe(response.score_summary),
+        "status": response.status,
+        "created_at": iso_or_none(response.created_at),
+        "updated_at": iso_or_none(response.updated_at),
+    }
+
+
+def prep_brief_to_dict(brief: TherapistPrepBrief) -> dict[str, Any]:
+    return {
+        "id": brief.id,
+        "tenant_id": brief.tenant_id,
+        "patient_id": brief.patient_id,
+        "referral_id": brief.referral_id,
+        "therapist_id": brief.therapist_id,
+        "title": brief.title,
+        "body": brief.body,
+        "source_summary": json_safe(brief.source_summary),
+        "status": brief.status,
+        "created_at": iso_or_none(brief.created_at),
+        "updated_at": iso_or_none(brief.updated_at),
+    }
+
+
+def _record_import_error(
+    session: Session,
+    batch: ReferralImportBatch,
+    row_number: int,
+    message: str,
+    raw_row: dict[str, Any],
+) -> None:
+    session.add(
+        ReferralImportError(
+            tenant_id=batch.tenant_id,
+            batch_id=batch.id,
+            row_number=row_number,
+            message=message,
+            raw_row=json_safe(raw_row),
+        )
+    )
+    session.flush()
+
+
+def _referral_from_import_row(
+    session: Session,
+    tenant_id: str,
+    source_channel: str,
+    row: dict[str, str],
+) -> Referral:
+    direct_text = _row_get(row, "raw_text", "referral_text", "notes", "message")
+    raw_text = direct_text
+    if not raw_text:
+        raw_text = _compose_referral_text(row)
+    if not direct_text and len([line for line in raw_text.splitlines() if line.strip()]) < 2:
+        raise ValueError("Referral text is required.")
+    if len(raw_text.strip()) < 12:
+        raise ValueError("Referral text is required.")
+    referral = Referral(
+        tenant_id=tenant_id,
+        source_channel=_row_get(row, "source_channel") or source_channel,
+        raw_text=raw_text,
+        status="new",
+        patient_name=_row_get(row, "patient_name", "name"),
+        date_of_birth=_row_get(row, "date_of_birth", "dob"),
+        contact_email=_row_get(row, "contact_email", "email"),
+        contact_phone=_row_get(row, "contact_phone", "phone", "telephone"),
+        insurer=_row_get(row, "insurer", "insurance", "payer"),
+        referring_entity=_row_get(row, "referring_entity", "referrer", "source"),
+        language_preference=_row_get(row, "language", "language_preference"),
+        modality_preference=_row_get(row, "modality", "modality_preference"),
+        missing_fields=_deterministic_missing_fields({"raw_text": raw_text}),
+    )
+    session.add(referral)
+    session.flush()
+    write_audit(
+        session,
+        tenant_id=tenant_id,
+        action="create_from_import",
+        entity_type="referral",
+        entity_id=referral.id,
+        after=referral_summary(referral),
+    )
+    return referral
+
+
+def _row_get(row: dict[str, str], *keys: str) -> str | None:
+    normalised = {_normal(key).replace(" ", "_"): value for key, value in row.items()}
+    for key in keys:
+        value = normalised.get(_normal(key).replace(" ", "_"))
+        if value:
+            return value.strip()
+    return None
+
+
+def _compose_referral_text(row: dict[str, str]) -> str:
+    ordered_keys = [
+        "patient_name",
+        "name",
+        "date_of_birth",
+        "dob",
+        "contact_email",
+        "email",
+        "contact_phone",
+        "phone",
+        "insurer",
+        "insurance",
+        "presenting_problem",
+        "reason",
+        "notes",
+    ]
+    lines = []
+    for key in ordered_keys:
+        value = _row_get(row, key)
+        if value:
+            lines.append(f"{key.replace('_', ' ').title()}: {value}")
+    return "\n".join(lines)
+
+
+def _validate_report_body(body: str, claim_evidence_map: list[dict[str, Any]]) -> list[str]:
+    labels = _evidence_labels(claim_evidence_map)
+    unsupported: list[str] = []
+    if not claim_evidence_map:
+        unsupported.append("Report has no claim-to-evidence map.")
+
+    in_summary = False
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if line.startswith("## "):
+            heading = _normal(line.lstrip("# "))
+            in_summary = heading in {
+                "evidence-grounded summary",
+                "clinical summary",
+                "assessment summary",
+                "treatment review",
+                "discharge summary",
+                "insurance evidence",
+            }
+            continue
+        if not in_summary or not line.startswith("- "):
+            continue
+        refs = set(re.findall(r"\[([A-Za-z]\d+)\]", line))
+        if not refs.intersection(labels):
+            unsupported.append(line[2:].strip())
+
+    for item in claim_evidence_map or []:
+        claim = str(item.get("claim") or "").strip()
+        if claim and not item.get("evidence"):
+            unsupported.append(claim)
+
+    deduped = []
+    for claim in unsupported:
+        if claim and claim not in deduped:
+            deduped.append(claim)
+    return deduped
+
+
+def _evidence_labels(claim_evidence_map: list[dict[str, Any]]) -> set[str]:
+    labels = set()
+    for item in claim_evidence_map or []:
+        for evidence in item.get("evidence") or []:
+            label = str(evidence.get("label") or "").strip()
+            if label:
+                labels.add(label)
+    return labels
+
+
+def _create_draft_feedback(
+    session: Session,
+    *,
+    report: ReportDraft,
+    feedback_type: str,
+    original_text: str | None,
+    final_text: str | None,
+    reviewer_id: str | None,
+    usable_for_practice_memory: bool,
+) -> DraftFeedback:
+    feedback = DraftFeedback(
+        tenant_id=report.tenant_id,
+        patient_id=report.patient_id,
+        referral_id=report.referral_id,
+        report_draft_id=report.id,
+        reviewer_id=reviewer_id if session.get(User, reviewer_id or "") else None,
+        feedback_type=feedback_type.strip() or "review_outcome",
+        original_text=original_text,
+        final_text=final_text,
+        edit_summary=_diff_summary(original_text or "", final_text or ""),
+        usable_for_practice_memory=usable_for_practice_memory,
+    )
+    session.add(feedback)
+    session.flush()
+    return feedback
+
+
+def _diff_summary(before: str, after: str) -> dict[str, Any]:
+    before_words = before.split()
+    after_words = after.split()
+    return {
+        "before_chars": len(before),
+        "after_chars": len(after),
+        "before_words": len(before_words),
+        "after_words": len(after_words),
+        "changed": before != after,
+    }
+
+
+def _score_therapist_for_referral(session: Session, referral: Referral, therapist: Therapist) -> dict[str, Any]:
+    reasons = []
+    exclusions = []
+    score = 50
+
+    if not therapist.active:
+        exclusions.append("inactive therapist profile")
+    active_count = _active_appointment_count_this_week(session, therapist.id)
+    if therapist.capacity_per_week and active_count >= therapist.capacity_per_week:
+        exclusions.append("weekly capacity is full")
+
+    insurer = _normal(referral.insurer)
+    if insurer and therapist.insurers:
+        if insurer in {_normal(item) for item in therapist.insurers}:
+            score += 20
+            reasons.append("insurer accepted")
+        else:
+            exclusions.append("insurer mismatch")
+
+    language = _normal(referral.language_preference)
+    if language and therapist.languages:
+        if language in {_normal(item) for item in therapist.languages}:
+            score += 20
+            reasons.append("language match")
+        else:
+            exclusions.append("language mismatch")
+
+    modality = _normal(referral.modality_preference)
+    if modality and modality != "unknown" and therapist.modalities:
+        if modality in {_normal(item) for item in therapist.modalities}:
+            score += 15
+            reasons.append("modality match")
+        else:
+            exclusions.append("modality mismatch")
+
+    raw_text = _normal(referral.raw_text)
+    specialty_hits = [specialty for specialty in therapist.specialties if _normal(specialty) and _normal(specialty) in raw_text]
+    if specialty_hits:
+        score += min(25, 10 * len(specialty_hits))
+        reasons.append(f"specialty match: {', '.join(specialty_hits)}")
+
+    if therapist.availability_blocks:
+        score += 10
+        reasons.append("availability blocks recorded")
+
+    return {
+        "therapist_id": therapist.id,
+        "name": therapist.name,
+        "score": max(0, min(score, 100)),
+        "excluded": bool(exclusions),
+        "reasons": reasons or ["no preference matches beyond baseline availability"],
+        "exclusion_reasons": exclusions,
+        "capacity_used_this_week": active_count,
+        "capacity_per_week": therapist.capacity_per_week,
+        "availability_blocks": therapist.availability_blocks,
+    }
+
+
+def _active_appointment_count_this_week(session: Session, therapist_id: str) -> int:
+    now = utc_now()
+    start = now - timedelta(days=now.weekday())
+    start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=7)
+    return int(
+        session.scalar(
+            select(func.count(Appointment.id)).where(
+                Appointment.therapist_id == therapist_id,
+                Appointment.status.in_(["proposed", "confirmed"]),
+                Appointment.starts_at >= start,
+                Appointment.starts_at < end,
+            )
+        )
+        or 0
+    )
+
+
+def _top_match_therapist_id(referral: Referral) -> str | None:
+    ranked = (referral.match_summary or {}).get("ranked_matches") or []
+    if not ranked:
+        return None
+    return ranked[0].get("therapist_id")
+
+
+def _generate_slots(blocks: list[dict], max_candidates: int) -> list[tuple[datetime, datetime, dict[str, Any]]]:
+    weekday_map = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }
+    now = utc_now()
+    slots = []
+    for day_offset in range(1, 29):
+        candidate_date = (now + timedelta(days=day_offset)).date()
+        for block in blocks or []:
+            weekday = weekday_map.get(str(block.get("weekday") or "").strip().lower())
+            if weekday is None or candidate_date.weekday() != weekday:
+                continue
+            start_time = _parse_time(block.get("start")) or time(9, 0)
+            end_time = _parse_time(block.get("end")) or time(17, 0)
+            starts_at = datetime.combine(candidate_date, start_time, tzinfo=timezone.utc)
+            ends_at = min(
+                datetime.combine(candidate_date, end_time, tzinfo=timezone.utc),
+                starts_at + timedelta(minutes=50),
+            )
+            if ends_at <= starts_at:
+                ends_at = starts_at + timedelta(minutes=50)
+            slots.append((starts_at, ends_at, block))
+            if len(slots) >= max_candidates:
+                return slots
+    return slots
+
+
+def _appointment_conflicts(
+    session: Session,
+    therapist_id: str,
+    starts_at: datetime,
+    ends_at: datetime,
+    exclude_appointment_id: str | None = None,
+) -> bool:
+    if not therapist_id:
+        return False
+    query = select(Appointment).where(
+        Appointment.therapist_id == therapist_id,
+        Appointment.status.in_(["proposed", "confirmed"]),
+        Appointment.starts_at < ends_at,
+        Appointment.ends_at > starts_at,
+    )
+    if exclude_appointment_id:
+        query = query.where(Appointment.id != exclude_appointment_id)
+    return session.scalar(query.limit(1)) is not None
+
+
+def _parse_time(value: Any) -> time | None:
+    if not value:
+        return None
+    try:
+        hour, minute = str(value).split(":", 1)
+        return time(int(hour), int(minute[:2]))
+    except (ValueError, TypeError):
+        return None
+
+
+def _list_value(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value).strip()]
+
+
+def _availability_blocks(value: Any) -> list[dict]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        try:
+            parsed = json_safe(json.loads(value))
+        except Exception:
+            return []
+        return parsed if isinstance(parsed, list) else []
+    if isinstance(value, list):
+        return [dict(item) for item in value if isinstance(item, dict)]
+    return []
+
+
+def _index_text_chunks(
+    session: Session,
+    *,
+    tenant_id: str,
+    patient_id: str | None,
+    document_id: str | None,
+    source_type: str,
+    source_id: str,
+    text: str,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    for chunk in session.scalars(
+        select(DocumentChunk).where(DocumentChunk.source_type == source_type, DocumentChunk.source_id == source_id)
+    ):
+        session.delete(chunk)
+    session.flush()
+    for index, chunk_text in enumerate(_chunk_text(text)):
+        session.add(
+            DocumentChunk(
+                tenant_id=tenant_id,
+                patient_id=patient_id,
+                document_id=document_id,
+                source_type=source_type,
+                source_id=source_id,
+                chunk_index=index,
+                text=chunk_text,
+                metadata_json=json_safe(metadata or {}),
+                embedding_model="keyword-mvp",
+            )
+        )
+
+
+def _chunk_text(text: str, max_chars: int = 1200) -> list[str]:
+    clean = "\n".join(line.strip() for line in text.splitlines() if line.strip())
+    if not clean:
+        return []
+    chunks = []
+    current = ""
+    for paragraph in clean.split("\n"):
+        next_value = f"{current}\n{paragraph}".strip() if current else paragraph
+        if len(next_value) <= max_chars:
+            current = next_value
+            continue
+        if current:
+            chunks.append(current)
+        current = paragraph[:max_chars]
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _search_terms(text: str) -> list[str]:
+    return [part for part in "".join(char.lower() if char.isalnum() else " " for char in text).split() if part]
+
+
+def _first_sentence(text: str) -> str:
+    clean = " ".join(str(text or "").split())
+    if not clean:
+        return "Source evidence recorded."
+    for marker in (". ", "? ", "! "):
+        if marker in clean:
+            return clean.split(marker, 1)[0].strip() + marker.strip()
+    return clean[:220]
+
+
+def _default_report_title(report_type: str, referral: Referral, patient: Patient) -> str:
+    label = str(report_type or "session_summary").replace("_", " ").title()
+    patient_name = referral.patient_name or patient.display_name or "Patient"
+    return f"{label}: {patient_name}"
+
+
+def _complete_matching_consent_for_item(session: Session, item: IntakeChecklistItem, document_id: str) -> None:
+    if not item.patient_id:
+        return
+    item_key = _normal(item.item_key)
+    item_label = _normal(item.label)
+    for consent in session.scalars(
+        select(ConsentRecord).where(
+            ConsentRecord.tenant_id == item.tenant_id,
+            ConsentRecord.patient_id == item.patient_id,
+            ConsentRecord.status != "completed",
+        )
+    ):
+        scope = _normal(consent.scope)
+        if scope and (scope in item_key or scope in item_label or item_key in scope):
+            before = consent_record_to_dict(consent)
+            consent.status = "completed"
+            consent.source_document_id = document_id
+            consent.updated_at = utc_now()
+            write_audit(
+                session,
+                tenant_id=consent.tenant_id,
+                action="complete_by_upload",
+                entity_type="consent_record",
+                entity_id=consent.id,
+                before=before,
+                after=consent_record_to_dict(consent),
+            )
+
+
+def _normal(value: Any) -> str:
+    return str(value or "").strip().lower().replace("_", " ")
+
+
+def _ensure_patient_for_referral(session: Session, referral: Referral) -> Patient:
+    if referral.patient_id:
+        patient = session.get(Patient, referral.patient_id)
+        if patient:
+            return patient
+    patient = Patient(
+        tenant_id=referral.tenant_id,
+        display_name=referral.patient_name or f"Referral {referral.id[:8]}",
+        date_of_birth=referral.date_of_birth,
+        contact_email=referral.contact_email,
+        contact_phone=referral.contact_phone,
+        language=referral.language_preference,
+    )
+    session.add(patient)
+    session.flush()
+    referral.patient_id = patient.id
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="create_from_referral",
+        entity_type="patient",
+        entity_id=patient.id,
+        after={
+            "id": patient.id,
+            "display_name": patient.display_name,
+            "referral_id": referral.id,
+        },
+    )
+    return patient
+
+
+def _select_intake_template(session: Session, referral: Referral, template_id: str | None) -> IntakeTemplate | None:
+    if template_id:
+        template = session.get(IntakeTemplate, template_id)
+        if template is None:
+            raise KeyError(f"Unknown intake template: {template_id}")
+        if template.tenant_id != referral.tenant_id:
+            raise ValueError("Intake template and referral tenants do not match.")
+        return template
+
+    candidates = list(
+        session.scalars(
+            select(IntakeTemplate).where(
+                IntakeTemplate.tenant_id == referral.tenant_id,
+                IntakeTemplate.active.is_(True),
+            )
+        )
+    )
+    if not candidates:
+        return None
+
+    def _score(template: IntakeTemplate) -> int:
+        score = 0
+        if template.insurer and _normal(template.insurer) == _normal(referral.insurer):
+            score += 4
+        if template.modality and _normal(template.modality) == _normal(referral.modality_preference):
+            score += 3
+        if template.source_channel and _normal(template.source_channel) == _normal(referral.source_channel):
+            score += 2
+        if not any([template.insurer, template.modality, template.source_channel, template.age_band]):
+            score += 1
+        return score
+
+    return sorted(candidates, key=_score, reverse=True)[0]
+
+
+def _intake_status(items: list[IntakeChecklistItem], consents: list[ConsentRecord]) -> str:
+    if not items and not consents:
+        return "not_started"
+    missing_items = [item for item in items if item.status != "completed"]
+    missing_consents = [consent for consent in consents if consent.status != "completed"]
+    if not missing_items and not missing_consents:
+        return "complete"
+    if any(item.status == "expired" for item in items) or any(consent.status == "expired" for consent in consents):
+        return "expired_items"
+    return "missing_items"
+
+
+def _score_questionnaire(answers: dict[str, Any]) -> dict[str, Any]:
+    numeric_values = []
+    for value in answers.values():
+        try:
+            numeric_values.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    total = float(sum(numeric_values))
+    return {
+        "total_score": int(total) if total.is_integer() else total,
+        "answered_items": len(answers),
+        "numeric_items": len(numeric_values),
     }
 
 

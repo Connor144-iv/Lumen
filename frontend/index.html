@@ -7,177 +7,453 @@
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
-    <main class="app-shell">
-      <section class="input-panel" aria-labelledby="input-title">
-        <div class="section-heading">
-          <p class="eyebrow">Lumen</p>
-          <h1 id="input-title">Agentic workflow console</h1>
-        </div>
+    <div class="app-shell">
+      <aside class="app-sidebar" aria-label="Primary navigation">
+        <a class="brand" href="/" data-nav>
+          <span class="brand-mark" aria-hidden="true">L</span>
+          <span>
+            <strong>Lumen</strong>
+            <small>Clinical workflow OS</small>
+          </span>
+        </a>
 
-        <form id="workflow-form">
-          <fieldset class="segmented" aria-label="Workflow type">
-            <label>
-              <input type="radio" name="workflow_type" value="new_referral" checked />
-              Referral intake
-            </label>
-            <label>
-              <input type="radio" name="workflow_type" value="session_completed" />
-              Session report
-            </label>
-          </fieldset>
+        <nav class="side-nav">
+          <a href="/" data-nav data-page-link="overview">Overview</a>
+          <a href="/workflows" data-nav data-page-link="workflows">Run workflow</a>
+          <a href="/referrals" data-nav data-page-link="referrals">Referrals</a>
+          <a href="/review" data-nav data-page-link="review">Review inbox</a>
+          <a href="/therapists" data-nav data-page-link="therapists">Therapists</a>
+          <a href="/intake" data-nav data-page-link="intake">Intake</a>
+          <a href="/clinical" data-nav data-page-link="clinical">Clinical</a>
+          <a href="/integrations" data-nav data-page-link="integrations">Integrations</a>
+          <a href="/system" data-nav data-page-link="system">System</a>
+        </nav>
 
-          <div class="example-strip" aria-label="Example payloads">
-            <span>Examples</span>
-            <div id="example-buttons" class="example-buttons"></div>
-          </div>
-
-          <div class="form-grid">
-            <label>
-              Source channel
-              <select name="source_channel">
-                <option value="webform">Web form</option>
-                <option value="email">Email</option>
-                <option value="whatsapp">WhatsApp</option>
-                <option value="voicemail">Voicemail</option>
-                <option value="doctoralia">Doctoralia</option>
-                <option value="excel">Excel</option>
-              </select>
-            </label>
-            <label>
-              Tenant ID
-              <input name="tenant_id" type="text" placeholder="Auto-generated if blank" />
-            </label>
-            <label>
-              Patient ID
-              <input name="patient_id" type="text" placeholder="Optional" />
-            </label>
-          </div>
-
-          <div data-workflow-section="new_referral">
-            <label>
-              Referral text
-              <textarea
-                name="raw_text"
-                rows="9"
-                placeholder="Paste the referral email, webform, voicemail transcript, or intake message."
-              ></textarea>
-            </label>
-          </div>
-
-          <div data-workflow-section="session_completed" hidden>
-            <label>
-              Session note
-              <textarea name="note_text" rows="7" placeholder="Paste the therapist-approved session note."></textarea>
-            </label>
-            <label>
-              Report request
-              <textarea
-                name="report_request"
-                rows="4"
-                placeholder="Describe the report, insurer evidence pack, treatment review, or discharge summary needed."
-              ></textarea>
-            </label>
-            <div class="form-grid">
-              <label>
-                Selected protocol
-                <input name="selected_protocol" type="text" placeholder="Optional protocol name" />
-              </label>
-              <label>
-                Therapist ID
-                <input name="therapist_id" type="text" placeholder="Optional" />
-              </label>
-              <label>
-                Protocol ID
-                <input name="protocol_id" type="text" placeholder="Optional" />
-              </label>
+        <div class="sidebar-footer">
+          <div class="status-strip" id="status-strip" data-status="idle">
+            <span class="status-dot" aria-hidden="true"></span>
+            <div>
+              <p class="eyebrow">Live run</p>
+              <h2 id="monitor-title">Idle</h2>
             </div>
-          </div>
-
-          <label>
-            Upload text file
-            <input name="file" type="file" accept=".txt,.md,.csv,.json" />
-          </label>
-
-          <div class="actions">
-            <button id="run-button" type="submit">Run workflow</button>
-            <button id="reset-button" type="button" class="secondary">Reset</button>
-          </div>
-        </form>
-      </section>
-
-      <section class="monitor-panel" aria-labelledby="monitor-title">
-        <div class="status-strip" id="status-strip">
-          <span class="status-dot" aria-hidden="true"></span>
-          <div>
-            <p class="eyebrow">Status</p>
-            <h2 id="monitor-title">Idle</h2>
           </div>
         </div>
+      </aside>
 
-        <section class="model-health-panel" aria-labelledby="model-health-title">
-          <div class="panel-header">
-            <h3 id="model-health-title">Model health</h3>
-            <button id="refresh-health-button" type="button" class="secondary compact">Refresh</button>
+      <div class="app-frame">
+        <header class="topbar">
+          <div class="page-heading">
+            <p class="eyebrow" id="section-label">Clinic operations</p>
+            <h1 id="page-title">Overview</h1>
           </div>
-          <div id="model-health-list" class="record-list compact-list"></div>
-        </section>
+          <div class="topbar-actions">
+            <a class="button-link primary-action" href="/workflows" data-nav>New workflow</a>
+            <button id="refresh-product-button" type="button" class="secondary compact">Refresh data</button>
+          </div>
+        </header>
 
-        <div class="workspace">
-          <section class="timeline-panel" aria-labelledby="timeline-title">
-            <div class="panel-header">
-              <h3 id="timeline-title">Workflow visualization</h3>
-              <span id="job-id-label">No job</span>
+        <main class="content">
+          <section class="page is-active" data-page="overview" aria-labelledby="overview-title">
+            <h2 id="overview-title" class="sr-only">Operations overview</h2>
+
+            <section class="metric-grid" aria-label="Operational metrics">
+              <article class="metric-card">
+                <span>Referrals</span>
+                <strong id="metric-referrals">-</strong>
+                <small>Current intake queue</small>
+              </article>
+              <article class="metric-card">
+                <span>Review tasks</span>
+                <strong id="metric-reviews">-</strong>
+                <small>Open human gates</small>
+              </article>
+              <article class="metric-card">
+                <span>Therapists</span>
+                <strong id="metric-therapists">-</strong>
+                <small>Active profiles</small>
+              </article>
+              <article class="metric-card">
+                <span>Models</span>
+                <strong id="metric-models">-</strong>
+                <small>Configured checks</small>
+              </article>
+            </section>
+
+            <div class="overview-grid">
+              <section class="panel" aria-labelledby="recent-workflows-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Automation</p>
+                    <h3 id="recent-workflows-title">Recent workflows</h3>
+                  </div>
+                  <span class="panel-stat" id="metric-workflows">-</span>
+                </div>
+                <div id="recent-workflow-list" class="record-list"></div>
+              </section>
+
+              <section class="panel" aria-labelledby="overview-referrals-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Intake</p>
+                    <h3 id="overview-referrals-title">Referral focus</h3>
+                  </div>
+                  <a class="text-link" href="/referrals" data-nav>Open queue</a>
+                </div>
+                <div id="overview-referral-list" class="record-list"></div>
+              </section>
+
+              <section class="panel" aria-labelledby="overview-review-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Governance</p>
+                    <h3 id="overview-review-title">Review focus</h3>
+                  </div>
+                  <a class="text-link" href="/review" data-nav>Open inbox</a>
+                </div>
+                <div id="overview-review-list" class="record-list"></div>
+              </section>
             </div>
-            <ol id="timeline" class="timeline"></ol>
           </section>
 
-          <section class="detail-panel" aria-labelledby="detail-title">
-            <div class="panel-header">
-              <h3 id="detail-title">Data handoffs</h3>
-              <button id="export-button" type="button" class="secondary" disabled>Export JSON</button>
-            </div>
-            <div id="handoffs" class="handoffs"></div>
-            <div id="final-output" class="final-output" hidden>
-              <h3>Final output</h3>
-              <pre id="result-json"></pre>
-            </div>
-          </section>
-        </div>
+          <section class="page" data-page="workflows" aria-labelledby="workflow-title">
+            <div class="workflow-layout">
+              <section class="panel form-panel" aria-labelledby="workflow-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Command</p>
+                    <h2 id="workflow-title">Run workflow</h2>
+                  </div>
+                </div>
 
-        <section class="product-workspace" aria-label="Product workspace">
-          <section class="product-panel" aria-labelledby="referral-queue-title">
-            <div class="panel-header">
-              <h3 id="referral-queue-title">Referral queue</h3>
-              <button id="refresh-product-button" type="button" class="secondary compact">Refresh</button>
+                <form id="workflow-form">
+                  <fieldset class="segmented" aria-label="Workflow type">
+                    <label>
+                      <input type="radio" name="workflow_type" value="new_referral" checked />
+                      Referral intake
+                    </label>
+                    <label>
+                      <input type="radio" name="workflow_type" value="session_completed" />
+                      Session report
+                    </label>
+                  </fieldset>
+
+                  <div class="example-strip" aria-label="Example payloads">
+                    <span>Examples</span>
+                    <div id="example-buttons" class="example-buttons"></div>
+                  </div>
+
+                  <div class="form-grid">
+                    <label>
+                      Source channel
+                      <select name="source_channel">
+                        <option value="webform">Web form</option>
+                        <option value="email">Email</option>
+                        <option value="whatsapp">WhatsApp</option>
+                        <option value="voicemail">Voicemail</option>
+                        <option value="doctoralia">Doctoralia</option>
+                        <option value="excel">Excel</option>
+                      </select>
+                    </label>
+                    <label>
+                      Tenant ID
+                      <input name="tenant_id" type="text" placeholder="Auto-generated if blank" />
+                    </label>
+                    <label>
+                      Patient ID
+                      <input name="patient_id" type="text" placeholder="Optional" />
+                    </label>
+                  </div>
+
+                  <div data-workflow-section="new_referral">
+                    <label>
+                      Referral text
+                      <textarea
+                        name="raw_text"
+                        rows="9"
+                        placeholder="Paste the referral email, webform, voicemail transcript, or intake message."
+                      ></textarea>
+                    </label>
+                  </div>
+
+                  <div data-workflow-section="session_completed" hidden>
+                    <label>
+                      Session note
+                      <textarea name="note_text" rows="7" placeholder="Paste the therapist-approved session note."></textarea>
+                    </label>
+                    <label>
+                      Report request
+                      <textarea
+                        name="report_request"
+                        rows="4"
+                        placeholder="Describe the report, insurer evidence pack, treatment review, or discharge summary needed."
+                      ></textarea>
+                    </label>
+                    <div class="form-grid">
+                      <label>
+                        Selected protocol
+                        <input name="selected_protocol" type="text" placeholder="Optional protocol name" />
+                      </label>
+                      <label>
+                        Therapist ID
+                        <input name="therapist_id" type="text" placeholder="Optional" />
+                      </label>
+                      <label>
+                        Protocol ID
+                        <input name="protocol_id" type="text" placeholder="Optional" />
+                      </label>
+                    </div>
+                  </div>
+
+                  <label>
+                    Upload text file
+                    <input name="file" type="file" accept=".txt,.md,.csv,.json" />
+                  </label>
+
+                  <div class="actions">
+                    <button id="run-button" type="submit">Run workflow</button>
+                    <button id="reset-button" type="button" class="secondary">Reset</button>
+                  </div>
+                </form>
+              </section>
+
+              <div class="monitor-stack">
+                <section class="panel timeline-panel" aria-labelledby="timeline-title">
+                  <div class="panel-header">
+                    <div>
+                      <p class="eyebrow">Trace</p>
+                      <h3 id="timeline-title">Workflow visualization</h3>
+                    </div>
+                    <span id="job-id-label">No job</span>
+                  </div>
+                  <ol id="timeline" class="timeline"></ol>
+                </section>
+
+                <section class="panel detail-panel" aria-labelledby="detail-title">
+                  <div class="panel-header">
+                    <div>
+                      <p class="eyebrow">Payloads</p>
+                      <h3 id="detail-title">Data handoffs</h3>
+                    </div>
+                    <button id="export-button" type="button" class="secondary compact" disabled>Export JSON</button>
+                  </div>
+                  <div id="handoffs" class="handoffs"></div>
+                  <div id="final-output" class="final-output" hidden>
+                    <h3>Final output</h3>
+                    <pre id="result-json"></pre>
+                  </div>
+                </section>
+              </div>
             </div>
-            <div id="referral-list" class="record-list"></div>
           </section>
 
-          <section class="product-panel" aria-labelledby="referral-detail-title">
-            <div class="panel-header">
-              <h3 id="referral-detail-title">Referral detail</h3>
-            </div>
-            <div id="referral-detail" class="detail-view">
-              <p class="empty-state">Select a referral to inspect structured fields, drafts, and source text.</p>
+          <section class="page" data-page="referrals" aria-labelledby="referrals-title">
+            <div class="split-layout">
+              <section class="panel" aria-labelledby="referrals-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Intake</p>
+                    <h2 id="referrals-title">Referral queue</h2>
+                  </div>
+                </div>
+                <div id="referral-list" class="record-list large-list"></div>
+              </section>
+
+              <section class="panel" aria-labelledby="referral-detail-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Record</p>
+                    <h2 id="referral-detail-title">Referral detail</h2>
+                  </div>
+                </div>
+                <div id="referral-detail" class="detail-view">
+                  <p class="empty-state">Select a referral to inspect structured fields, drafts, and source text.</p>
+                </div>
+              </section>
             </div>
           </section>
 
-          <section class="product-panel" aria-labelledby="review-title">
-            <div class="panel-header">
-              <h3 id="review-title">Review inbox</h3>
-            </div>
-            <div id="review-task-list" class="record-list"></div>
+          <section class="page" data-page="review" aria-labelledby="review-title">
+            <section class="panel" aria-labelledby="review-title">
+              <div class="panel-header">
+                <div>
+                  <p class="eyebrow">Governance</p>
+                  <h2 id="review-title">Review inbox</h2>
+                </div>
+              </div>
+              <div id="review-task-list" class="record-list review-list"></div>
+            </section>
           </section>
 
-          <section class="product-panel" aria-labelledby="therapist-title">
-            <div class="panel-header">
-              <h3 id="therapist-title">Therapist profiles</h3>
-            </div>
-            <div id="therapist-list" class="record-list"></div>
+          <section class="page" data-page="therapists" aria-labelledby="therapist-title">
+            <section class="panel" aria-labelledby="therapist-title">
+              <div class="panel-header">
+                <div>
+                  <p class="eyebrow">Network</p>
+                  <h2 id="therapist-title">Therapist profiles</h2>
+                </div>
+              </div>
+              <form id="therapist-form" class="inline-form">
+                <input name="name" type="text" placeholder="Name" required />
+                <input name="email" type="email" placeholder="Email" />
+                <input name="specialties" type="text" placeholder="Specialties, comma-separated" />
+                <input name="languages" type="text" placeholder="Languages" />
+                <input name="modalities" type="text" placeholder="Modalities" />
+                <input name="insurers" type="text" placeholder="Insurers" />
+                <input name="capacity_per_week" type="number" min="0" placeholder="Capacity/week" />
+                <textarea
+                  name="availability_blocks"
+                  rows="3"
+                  placeholder='Availability JSON, e.g. [{"weekday":"Tuesday","start":"10:00","end":"13:00","modality":"online"}]'
+                ></textarea>
+                <button type="submit">Add therapist</button>
+              </form>
+              <div id="therapist-list" class="record-list therapist-grid"></div>
+            </section>
           </section>
-        </section>
-      </section>
-    </main>
+
+          <section class="page" data-page="intake" aria-labelledby="intake-title">
+            <section class="panel" aria-labelledby="intake-title">
+              <div class="panel-header">
+                <div>
+                  <p class="eyebrow">Pre-session</p>
+                  <h2 id="intake-title">Intake workspace</h2>
+                </div>
+                <a class="text-link" href="/referrals" data-nav>Choose referral</a>
+              </div>
+              <div id="intake-workspace" class="detail-view">
+                <p class="empty-state">Select a referral, then start intake from the referral detail actions.</p>
+              </div>
+            </section>
+          </section>
+
+          <section class="page" data-page="clinical" aria-labelledby="clinical-title">
+            <div class="workspace-grid">
+              <section class="panel" aria-labelledby="clinical-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Clinical foundation</p>
+                    <h2 id="clinical-title">Patient workspace</h2>
+                  </div>
+                </div>
+                <form id="session-note-form" class="inline-form">
+                  <input name="referral_id" type="text" placeholder="Referral ID" required />
+                  <input name="therapist_id" type="text" placeholder="Therapist ID optional" />
+                  <input name="title" type="text" placeholder="Session note title" />
+                  <textarea name="body" rows="5" placeholder="Therapist-authored session note" required></textarea>
+                  <button type="submit">Save note</button>
+                </form>
+                <form id="report-draft-form" class="inline-form">
+                  <input name="referral_id" type="text" placeholder="Referral ID" required />
+                  <select name="report_type">
+                    <option value="session_summary">Session summary</option>
+                    <option value="treatment_review">Treatment review</option>
+                    <option value="assessment_report">Assessment report</option>
+                    <option value="discharge_summary">Discharge summary</option>
+                    <option value="insurance_evidence_pack">Insurance evidence pack</option>
+                  </select>
+                  <input name="title" type="text" placeholder="Report title optional" />
+                  <textarea name="request_text" rows="4" placeholder="Report request, insurer requirement, or summary focus"></textarea>
+                  <button type="submit">Draft report</button>
+                </form>
+                <div id="clinical-workspace" class="detail-view">
+                  <p class="empty-state">Open a referral with a patient record or save a session note to inspect the governed workspace.</p>
+                </div>
+              </section>
+
+              <section class="panel" aria-labelledby="library-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Retrieval sources</p>
+                    <h2 id="library-title">Clinical library</h2>
+                  </div>
+                </div>
+                <form id="clinical-library-form" class="inline-form">
+                  <select name="record_type">
+                    <option value="protocol">Protocol</option>
+                    <option value="template">Report template</option>
+                    <option value="insurer_rule">Insurer rule</option>
+                    <option value="clinical_reference">Clinical reference</option>
+                  </select>
+                  <input name="title" type="text" placeholder="Title" required />
+                  <input name="version" type="text" placeholder="Version optional" />
+                  <textarea name="body" rows="5" placeholder="Approved source text for retrieval" required></textarea>
+                  <button type="submit">Add source</button>
+                </form>
+                <div id="clinical-library-list" class="record-list"></div>
+              </section>
+            </div>
+          </section>
+
+          <section class="page" data-page="integrations" aria-labelledby="integrations-title">
+            <div class="workspace-grid">
+              <section class="panel" aria-labelledby="integrations-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Channels</p>
+                    <h2 id="integrations-title">Referral imports</h2>
+                  </div>
+                </div>
+                <form id="referral-import-form" class="inline-form">
+                  <select name="source_channel">
+                    <option value="csv_import">CSV import</option>
+                    <option value="eap_batch">EAP batch</option>
+                    <option value="insurer_batch">Insurer batch</option>
+                  </select>
+                  <input name="file" type="file" accept=".csv,.txt" required />
+                  <button type="submit">Import referrals</button>
+                </form>
+                <div id="import-batch-list" class="record-list"></div>
+              </section>
+
+              <section class="panel" aria-labelledby="integration-health-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Status</p>
+                    <h2 id="integration-health-title">Integration health</h2>
+                  </div>
+                </div>
+                <div id="integration-health-list" class="record-list"></div>
+              </section>
+            </div>
+          </section>
+
+          <section class="page" data-page="system" aria-labelledby="model-health-title">
+            <div class="workspace-grid">
+              <section class="panel model-health-panel" aria-labelledby="model-health-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">System</p>
+                    <h2 id="model-health-title">Model health</h2>
+                  </div>
+                  <button id="refresh-health-button" type="button" class="secondary compact">Refresh</button>
+                </div>
+                <div id="model-health-list" class="record-list health-grid"></div>
+              </section>
+
+              <section class="panel" aria-labelledby="security-posture-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Governance</p>
+                    <h2 id="security-posture-title">Security posture</h2>
+                  </div>
+                </div>
+                <div id="security-posture-list" class="record-list"></div>
+              </section>
+
+              <section class="panel" aria-labelledby="feedback-metrics-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Learning loop</p>
+                    <h2 id="feedback-metrics-title">Feedback metrics</h2>
+                  </div>
+                </div>
+                <div id="feedback-metrics-list" class="record-list"></div>
+              </section>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
 
     <script src="/static/app.js"></script>
   </body>
