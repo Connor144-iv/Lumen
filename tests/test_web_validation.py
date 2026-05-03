@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from app import app
+from backend.lumen_web.workflow_state import canonical_referral_status
 from backend.lumen_web.workflow_jobs import WorkflowJobManager, WorkflowRequest
 
 
@@ -39,3 +40,11 @@ def test_examples_endpoint_returns_samples() -> None:
 
     assert response.status_code == 200
     assert response.json()["examples"]
+
+
+def test_legacy_referral_statuses_map_to_admin_workflow_terms() -> None:
+    assert canonical_referral_status("new") == "new_referral"
+    assert canonical_referral_status("normalizing") == "normalising"
+    assert canonical_referral_status("match_pending_approval") == "match_recommended"
+    assert canonical_referral_status("ready_to_contact") == "awaiting_patient_contact"
+    assert canonical_referral_status("contacted") == "appointment_confirmed"

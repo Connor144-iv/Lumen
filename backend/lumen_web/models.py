@@ -166,7 +166,7 @@ class HumanReviewTask(Base, TimestampMixin):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), nullable=False, index=True)
-    workflow_run_id: Mapped[str] = mapped_column(ForeignKey("workflow_runs.id"), nullable=False, index=True)
+    workflow_run_id: Mapped[str | None] = mapped_column(ForeignKey("workflow_runs.id"), index=True)
     referral_id: Mapped[str | None] = mapped_column(ForeignKey("referrals.id"), index=True)
     patient_id: Mapped[str | None] = mapped_column(ForeignKey("patients.id"), index=True)
     task_type: Mapped[str] = mapped_column(String(80), nullable=False, index=True)

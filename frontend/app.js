@@ -1,8 +1,8 @@
 const routes = {
   "/": { page: "overview", title: "Overview", label: "Clinic operations" },
   "/overview": { page: "overview", title: "Overview", label: "Clinic operations" },
-  "/workflows": { page: "workflows", title: "Run workflow", label: "Automation" },
-  "/referrals": { page: "referrals", title: "Referrals", label: "Intake" },
+  "/workflows": { page: "workflows", title: "Workflow trace", label: "Developer demo" },
+  "/referrals": { page: "referrals", title: "Referral queue", label: "Admin intake" },
   "/review": { page: "review", title: "Review inbox", label: "Governance" },
   "/therapists": { page: "therapists", title: "Therapists", label: "Network" },
   "/intake": { page: "intake", title: "Intake", label: "Pre-session" },
@@ -27,11 +27,13 @@ const resultJson = document.querySelector("#result-json");
 const exampleButtons = document.querySelector("#example-buttons");
 const modelHealthList = document.querySelector("#model-health-list");
 const referralList = document.querySelector("#referral-list");
+const referralFilterForm = document.querySelector("#referral-filter-form");
 const referralDetail = document.querySelector("#referral-detail");
 const reviewTaskList = document.querySelector("#review-task-list");
 const therapistList = document.querySelector("#therapist-list");
 const therapistForm = document.querySelector("#therapist-form");
 const intakeWorkspace = document.querySelector("#intake-workspace");
+const intakeTrackerList = document.querySelector("#intake-tracker-list");
 const clinicalWorkspace = document.querySelector("#clinical-workspace");
 const sessionNoteForm = document.querySelector("#session-note-form");
 const reportDraftForm = document.querySelector("#report-draft-form");
@@ -130,6 +132,8 @@ exportButton.addEventListener("click", () => {
 
 refreshHealthButton.addEventListener("click", () => loadModelHealth());
 refreshProductButton.addEventListener("click", () => refreshProductWorkspace());
+
+referralFilterForm.addEventListener("change", () => renderReferralLists());
 
 therapistForm.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -470,6 +474,7 @@ async function refreshProductWorkspace() {
   await Promise.all([
     loadReferrals(),
     loadReviewTasks(),
+    loadIntakeTracker(),
     loadTherapists(),
     loadWorkflows(),
     loadClinicalLibrary(),
@@ -503,10 +508,30 @@ async function loadReferrals() {
   latestReferrals = data.referrals || [];
   metricReferrals.textContent = latestReferrals.length;
 
-  renderCollection(referralList, latestReferrals, "No referrals yet.", (referral) => referralCard(referral, false));
+  renderReferralLists();
+}
+
+function renderReferralLists() {
+  const filtered = filterReferrals(latestReferrals);
+  renderCollection(referralList, filtered, "No referrals match these filters.", (referral) => referralCard(referral, false));
   renderCollection(overviewReferralList, latestReferrals.slice(0, 4), "No referrals yet.", (referral) =>
     referralCard(referral, true),
   );
+}
+
+function filterReferrals(referrals) {
+  const formData = new FormData(referralFilterForm);
+  const status = String(formData.get("status") || "");
+  const source = String(formData.get("source") || "");
+  const flag = String(formData.get("flag") || "");
+  const nextAction = String(formData.get("next_action") || "");
+  return referrals.filter((referral) => {
+    if (status && referral.status !== status) return false;
+    if (source && referral.source_channel !== source) return false;
+    if (flag && !(referral.secondary_flags || []).includes(flag)) return false;
+    if (nextAction && referral.next_action !== nextAction) return false;
+    return true;
+  });
 }
 
 function referralCard(referral, jumpToDetail) {
@@ -514,7 +539,13 @@ function referralCard(referral, jumpToDetail) {
     title: referral.patient_name || referral.input_summary || "Unnamed referral",
     status: referral.status,
     body: referral.contact_email || referral.insurer || referral.source_channel,
-    meta: [referral.source_channel, referral.risk_category || "risk pending", formatDate(referral.updated_at)],
+    meta: [
+      referral.status_label || referral.status,
+      referral.source_channel,
+      referral.risk_category || "risk pending",
+      referral.next_action_label,
+      formatDate(referral.updated_at),
+    ],
   });
   item.classList.add("clickable");
   item.addEventListener("click", async () => {
@@ -536,41 +567,70 @@ async function loadReferralDetail(referralId) {
   const actions = document.createElement("div");
   actions.className = "actions tight";
   actions.append(
+    actionButton("Draft missing info", () => draftMissingInfo(referral.id)),
+    actionButton("Record missing reply", () => recordMissingInfoReply(referral.id)),
+    actionButton("Clinical review", () => requestClinicalReview(referral.id)),
+    actionButton("Suitability review", () => requestSuitabilityReview(referral.id)),
+    actionButton("Duplicate review", () => requestDuplicateReview(referral.id)),
     actionButton("Run deterministic match", () => runReferralMatch(referral.id)),
     actionButton("Propose slots", () => proposeReferralSlots(referral.id)),
+    actionButton("Draft first contact", () => draftFirstContact(referral.id)),
     actionButton("Start intake", () => startReferralIntake(referral.id)),
+    actionButton("Draft intake packet", () => draftIntakePacket(referral.id)),
     actionButton("Draft reminder", () => draftIntakeReminder(referral.id)),
     actionButton("Prep brief", () => generateReferralPrepBrief(referral.id)),
   );
-  if (referral.patient_id) {
-    actions.append(actionButton("Patient workspace", () => loadPatientWorkspace(referral.patient_id)));
-  }
-  actions.append(actionButton("New session note", () => prepareSessionNoteFromReferral(referral)));
-  actions.append(actionButton("Draft report", () => prepareReportDraftFromReferral(referral)));
   header.append(
     heading(referral.patient_name || "Unnamed referral"),
-    metaRow([referral.status, referral.source_channel, referral.urgency || "urgency pending"]),
+    metaRow([
+      referral.status_label || referral.status,
+      referral.next_action_label,
+      referral.source_channel,
+      referral.urgency || "urgency pending",
+      ...(referral.secondary_flags || []),
+    ]),
     keyValue("Contact", [referral.contact_email, referral.contact_phone].filter(Boolean).join(" | ") || "Missing"),
-    keyValue("Insurer", referral.insurer || "Missing"),
-    keyValue("Missing fields", (referral.missing_fields || []).join(", ") || "None recorded"),
     actions,
   );
 
-  const raw = document.createElement("details");
-  raw.className = "handoff";
-  const rawSummary = document.createElement("summary");
-  rawSummary.textContent = "Source text";
-  const rawText = document.createElement("pre");
-  rawText.textContent = referral.raw_text || "";
-  raw.append(rawSummary, rawText);
+  const readinessSection = operationSection("First-session readiness");
+  renderSimpleList(
+    readinessSection.body,
+    referral.readiness_blockers || [],
+    "Appointment, intake, and prep brief gates are complete.",
+    (blocker) => recordItem({ title: blocker, status: "open", body: "Must be resolved before first session readiness.", meta: [] }),
+  );
 
-  const draft = referral.communication_drafts?.[0];
-  if (draft) {
-    header.append(keyValue("Latest draft", `${draft.channel}${draft.subject ? ` | ${draft.subject}` : ""}`));
-    const draftPre = document.createElement("pre");
-    draftPre.textContent = draft.body;
-    header.appendChild(draftPre);
-  }
+  const fieldsSection = operationSection("Extracted fields");
+  fieldsSection.body.append(
+    keyValue("Patient", referral.patient_name || "Missing"),
+    keyValue("Date of birth", referral.date_of_birth || "Missing"),
+    keyValue("Contact", [referral.contact_email, referral.contact_phone].filter(Boolean).join(" | ") || "Missing"),
+    keyValue("Insurer", referral.insurer || "Missing"),
+    keyValue("Language / modality", [referral.language_preference, referral.modality_preference].filter(Boolean).join(" / ") || "Not recorded"),
+    keyValue("Referrer", referral.referring_entity || "Not recorded"),
+  );
+
+  const missingSection = operationSection("Missing information");
+  renderSimpleList(
+    missingSection.body,
+    referral.missing_fields || [],
+    "No missing fields recorded.",
+    (field) => recordItem({ title: field.replaceAll("_", " "), status: "missing", body: "Admin review field", meta: [] }),
+  );
+
+  const riskSection = operationSection("Risk and suitability");
+  riskSection.body.append(
+    recordItem({
+      title: referral.risk_category || "Risk pending",
+      status: referral.risk_present ? "needs_clinical_review" : referral.risk_category ? "ok" : "open",
+      body: referral.risk_present ? "Risk signal requires clinical review before matching." : "No elevated risk recorded in the current referral record.",
+      meta: [referral.urgency || "urgency pending"],
+    }),
+  );
+
+  const taskSection = operationSection("Review tasks");
+  renderSimpleList(taskSection.body, referral.review_tasks || [], "No review tasks for this referral.", reviewTaskCard);
 
   const matchSection = operationSection("Deterministic match");
   renderMatchSummary(matchSection.body, referral.match_summary);
@@ -578,7 +638,52 @@ async function loadReferralDetail(referralId) {
   const appointmentSection = operationSection("Appointment proposals");
   const intakeSection = operationSection("Intake status");
   const briefSection = operationSection("Prep briefs");
-  referralDetail.append(header, matchSection.section, appointmentSection.section, intakeSection.section, briefSection.section, raw);
+  const draftSection = operationSection("Communication drafts");
+  renderCommunicationDrafts(draftSection.body, referral.communication_drafts || []);
+  const missingReplySection = operationSection("Missing-info replies");
+  renderDocuments(missingReplySection.body, referral.missing_info_replies || [], "No missing-information replies recorded.");
+  const patientReplySection = operationSection("Patient reply history");
+  renderDocuments(patientReplySection.body, referral.patient_replies || [], "No patient replies recorded.");
+
+  const raw = document.createElement("details");
+  raw.className = "handoff";
+  const rawSummary = document.createElement("summary");
+  rawSummary.textContent = "Raw referral source";
+  const rawText = document.createElement("pre");
+  rawText.textContent = referral.raw_text || "";
+  raw.append(rawSummary, rawText);
+
+  const activitySection = operationSection("Activity and workflow traces");
+  renderSimpleList(
+    activitySection.body,
+    referral.workflow_runs || [],
+    "No workflow traces attached to this referral.",
+    (workflow) =>
+      recordItem({
+        title: friendlyWorkflowType(workflow.workflow_type),
+        status: workflow.status,
+        body: workflow.input_summary || workflow.job_id,
+        meta: [shortId(workflow.job_id), formatDate(workflow.created_at)],
+      }),
+  );
+
+  referralDetail.append(
+    header,
+    readinessSection.section,
+    fieldsSection.section,
+    missingSection.section,
+    riskSection.section,
+    taskSection.section,
+    matchSection.section,
+    appointmentSection.section,
+    draftSection.section,
+    missingReplySection.section,
+    patientReplySection.section,
+    intakeSection.section,
+    briefSection.section,
+    raw,
+    activitySection.section,
+  );
   await loadReferralOperations(referral.id, appointmentSection.body, intakeSection.body, briefSection.body);
 }
 
@@ -624,6 +729,131 @@ async function proposeReferralSlots(referralId) {
   await loadReferralDetail(referralId);
 }
 
+async function draftMissingInfo(referralId) {
+  const note = window.prompt("Optional note for the missing-information draft", "") || "";
+  const response = await fetch(`/api/referrals/${referralId}/missing-info-draft`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ recipient: "patient", note }),
+  });
+  const body = await readResponseBody(response);
+  if (!response.ok) {
+    window.alert(body.detail || "Could not draft missing-information message.");
+    return;
+  }
+  await refreshProductWorkspace();
+  await loadReferralDetail(referralId);
+}
+
+async function recordMissingInfoReply(referralId) {
+  const email = window.prompt("Patient/referrer email from reply, if provided", "") || "";
+  const insurer = window.prompt("Insurer from reply, if provided", "") || "";
+  const phone = window.prompt("Phone from reply, if provided", "") || "";
+  const dob = window.prompt("Date of birth from reply, if provided", "") || "";
+  const notes = window.prompt("Reply notes", "") || "";
+  const updates = {};
+  if (email) updates.contact_email = email;
+  if (insurer) updates.insurer = insurer;
+  if (phone) updates.contact_phone = phone;
+  if (dob) updates.date_of_birth = dob;
+  const response = await fetch(`/api/referrals/${referralId}/missing-info-replies`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source: "patient", updates, notes }),
+  });
+  const body = await readResponseBody(response);
+  if (!response.ok) {
+    window.alert(body.detail || "Could not record missing-information reply.");
+    return;
+  }
+  await refreshProductWorkspace();
+  await loadReferralDetail(referralId);
+}
+
+async function requestClinicalReview(referralId) {
+  const response = await fetch(`/api/referrals/${referralId}/clinical-review`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reason: "Clinical risk or suitability review is required before matching." }),
+  });
+  const body = await readResponseBody(response);
+  if (!response.ok) {
+    window.alert(body.detail || "Could not create clinical review task.");
+    return;
+  }
+  await refreshProductWorkspace();
+  await loadReferralDetail(referralId);
+}
+
+async function requestSuitabilityReview(referralId) {
+  const reason = window.prompt("Reason for suitability review", "Suitability review is required before therapist matching.");
+  if (reason === null) return;
+  const response = await fetch(`/api/referrals/${referralId}/suitability-review`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reason }),
+  });
+  const body = await readResponseBody(response);
+  if (!response.ok) {
+    window.alert(body.detail || "Could not create suitability review task.");
+    return;
+  }
+  await refreshProductWorkspace();
+  await loadReferralDetail(referralId);
+}
+
+async function requestDuplicateReview(referralId) {
+  const candidate = window.prompt("Duplicate candidate referral ID, if known", "") || "";
+  const reason = window.prompt("Reason for duplicate review", "Potential duplicate referral requires admin resolution before matching.") || "";
+  const response = await fetch(`/api/referrals/${referralId}/duplicate-review`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ candidate_referral_id: candidate || null, reason }),
+  });
+  const body = await readResponseBody(response);
+  if (!response.ok) {
+    window.alert(body.detail || "Could not create duplicate review task.");
+    return;
+  }
+  await refreshProductWorkspace();
+  await loadReferralDetail(referralId);
+}
+
+async function draftFirstContact(referralId) {
+  const note = window.prompt("Optional note for first-contact draft", "") || "";
+  const response = await fetch(`/api/referrals/${referralId}/contact-draft`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ note }),
+  });
+  const body = await readResponseBody(response);
+  if (!response.ok) {
+    window.alert(body.detail || "Could not draft first-contact message.");
+    return;
+  }
+  await refreshProductWorkspace();
+  await loadReferralDetail(referralId);
+}
+
+async function simulatePatientReply(referralId, appointmentId, replyType) {
+  const response = await fetch(`/api/referrals/${referralId}/patient-replies`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      reply_type: replyType,
+      appointment_id: appointmentId,
+      notes: "Simulated clinic-admin patient reply.",
+    }),
+  });
+  const body = await readResponseBody(response);
+  if (!response.ok) {
+    window.alert(body.detail || "Could not record simulated patient reply.");
+    return;
+  }
+  await refreshProductWorkspace();
+  await loadReferralDetail(referralId);
+}
+
 async function confirmAppointment(appointmentId) {
   const response = await fetch(`/api/appointments/${appointmentId}/confirm`, { method: "POST" });
   const body = await readResponseBody(response);
@@ -650,6 +880,22 @@ async function startReferralIntake(referralId) {
   await loadReferralDetail(referralId);
 }
 
+async function draftIntakePacket(referralId) {
+  const note = window.prompt("Optional note for intake packet", "") || "";
+  const response = await fetch(`/api/referrals/${referralId}/intake-packet-draft`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ note }),
+  });
+  const body = await readResponseBody(response);
+  if (!response.ok) {
+    window.alert(body.detail || "Could not draft intake packet.");
+    return;
+  }
+  await refreshProductWorkspace();
+  await loadReferralDetail(referralId);
+}
+
 async function completeIntakeItem(itemId) {
   const response = await fetch(`/api/intake/items/${itemId}/complete`, {
     method: "POST",
@@ -661,6 +907,23 @@ async function completeIntakeItem(itemId) {
   if (selectedReferralId) await loadReferralDetail(selectedReferralId);
 }
 
+async function requestIntakeItemException(itemId) {
+  const reason = window.prompt("Reason for waiving this intake item", "Admin-approved intake exception.");
+  if (reason === null) return;
+  const response = await fetch(`/api/intake/items/${itemId}/exception-request`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reason }),
+  });
+  const body = await readResponseBody(response);
+  if (!response.ok) {
+    window.alert(body.detail || "Could not request intake exception.");
+    return;
+  }
+  await refreshProductWorkspace();
+  if (selectedReferralId) await loadReferralDetail(selectedReferralId);
+}
+
 async function completeConsent(consentId) {
   const response = await fetch(`/api/consent-records/${consentId}/complete`, {
     method: "POST",
@@ -669,6 +932,23 @@ async function completeConsent(consentId) {
   });
   const body = await readResponseBody(response);
   if (!response.ok) window.alert(body.detail || "Could not complete consent.");
+  if (selectedReferralId) await loadReferralDetail(selectedReferralId);
+}
+
+async function requestConsentException(consentId) {
+  const reason = window.prompt("Reason for waiving this consent requirement", "Admin-approved consent exception.");
+  if (reason === null) return;
+  const response = await fetch(`/api/consent-records/${consentId}/exception-request`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reason }),
+  });
+  const body = await readResponseBody(response);
+  if (!response.ok) {
+    window.alert(body.detail || "Could not request consent exception.");
+    return;
+  }
+  await refreshProductWorkspace();
   if (selectedReferralId) await loadReferralDetail(selectedReferralId);
 }
 
@@ -770,6 +1050,28 @@ async function loadReviewTasks() {
   );
 }
 
+async function loadIntakeTracker() {
+  if (!intakeTrackerList) return;
+  const response = await fetch("/api/intake/tracker");
+  if (!response.ok) return;
+  const data = await readResponseBody(response);
+  renderCollection(intakeTrackerList, data.items || [], "No active intake items yet.", (row) => {
+    const referral = row.referral || {};
+    const item = recordItem({
+      title: referral.patient_name || referral.id || "Referral",
+      status: row.intake_status,
+      body: `${row.missing_count || 0} missing, ${row.completed_count || 0} completed, ${row.waived_count || 0} waived`,
+      meta: [referral.status_label || referral.status, referral.next_action_label],
+    });
+    item.classList.add("clickable");
+    item.addEventListener("click", async () => {
+      navigate("/referrals");
+      await loadReferralDetail(referral.id);
+    });
+    return item;
+  });
+}
+
 function reviewTaskCard(task) {
   const item = recordItem({
     title: task.task_type.replaceAll("_", " "),
@@ -831,6 +1133,9 @@ async function submitReviewAction(taskId, action, extra = {}) {
     return;
   }
   await refreshProductWorkspace();
+  if (selectedReferralId) {
+    await loadReferralDetail(selectedReferralId);
+  }
   if (body.resumed_job) {
     navigate("/workflows");
     resetRunState();
@@ -1095,6 +1400,44 @@ function operationSection(title) {
   return { section, body };
 }
 
+function renderSimpleList(container, items, emptyText, renderer) {
+  container.replaceChildren();
+  if (!items.length) {
+    container.appendChild(emptyState(emptyText));
+    return;
+  }
+  items.forEach((item) => container.appendChild(renderer(item)));
+}
+
+function renderCommunicationDrafts(container, drafts) {
+  renderSimpleList(container, drafts, "No communication drafts yet.", (draft) => {
+    const item = recordItem({
+      title: draft.subject || "Draft message",
+      status: draft.status,
+      body: draft.body,
+      meta: [draft.channel, draft.requires_human_send ? "requires approval" : "no approval required"],
+    });
+    return item;
+  });
+}
+
+function renderDocuments(container, documents, emptyText) {
+  renderSimpleList(container, documents, emptyText, (documentRecord) => {
+    const metadata = documentRecord.metadata || {};
+    const bodyParts = [
+      metadata.reply_type ? `Reply type: ${metadata.reply_type}` : null,
+      metadata.source ? `Source: ${metadata.source}` : null,
+      metadata.notes || null,
+    ].filter(Boolean);
+    return recordItem({
+      title: documentRecord.title,
+      status: documentRecord.document_type,
+      body: bodyParts.join(" | ") || documentRecord.document_type.replaceAll("_", " "),
+      meta: [formatDate(documentRecord.created_at)],
+    });
+  });
+}
+
 function renderMatchSummary(container, matchSummary) {
   container.replaceChildren();
   const ranked = matchSummary?.ranked_matches || [];
@@ -1144,7 +1487,12 @@ function renderAppointments(container, appointments) {
     if (appointment.status === "proposed") {
       const actions = document.createElement("div");
       actions.className = "actions tight";
-      actions.appendChild(actionButton("Confirm slot", () => confirmAppointment(appointment.id)));
+      if (selectedReferralId) {
+        actions.append(
+          actionButton("Simulate accepted reply", () => simulatePatientReply(selectedReferralId, appointment.id, "accepted_slot")),
+          actionButton("Simulate declined", () => simulatePatientReply(selectedReferralId, appointment.id, "declined")),
+        );
+      }
       item.appendChild(actions);
     }
     container.appendChild(item);
@@ -1182,12 +1530,13 @@ function renderIntakeWorkspace(container, data, includeActions) {
       body: item.item_type,
       meta: [item.due_at ? `due ${formatDate(item.due_at)}` : null],
     });
-    if (includeActions && item.status !== "completed") {
+    if (includeActions && !["completed", "waived"].includes(item.status)) {
       const actions = document.createElement("div");
       actions.className = "actions tight";
       actions.append(
         actionButton("Upload file", () => uploadIntakeDocument(data.referral.id, item)),
         actionButton("Mark complete", () => completeIntakeItem(item.id)),
+        actionButton("Request waiver", () => requestIntakeItemException(item.id)),
       );
       row.appendChild(actions);
     }
@@ -1201,10 +1550,13 @@ function renderIntakeWorkspace(container, data, includeActions) {
       body: "Consent record",
       meta: [consent.expires_at ? `expires ${formatDate(consent.expires_at)}` : "no expiry"],
     });
-    if (includeActions && consent.status !== "completed") {
+    if (includeActions && !["completed", "waived"].includes(consent.status)) {
       const actions = document.createElement("div");
       actions.className = "actions tight";
-      actions.appendChild(actionButton("Complete consent", () => completeConsent(consent.id)));
+      actions.append(
+        actionButton("Complete consent", () => completeConsent(consent.id)),
+        actionButton("Request waiver", () => requestConsentException(consent.id)),
+      );
       row.appendChild(actions);
     }
     container.appendChild(row);

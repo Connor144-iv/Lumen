@@ -3,8 +3,8 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Lumen Workflow Console</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <title>Lumen Admin Workflow</title>
+    <link rel="stylesheet" href="static/styles.css" />
   </head>
   <body>
     <div class="app-shell">
@@ -19,7 +19,6 @@
 
         <nav class="side-nav">
           <a href="/" data-nav data-page-link="overview">Overview</a>
-          <a href="/workflows" data-nav data-page-link="workflows">Run workflow</a>
           <a href="/referrals" data-nav data-page-link="referrals">Referrals</a>
           <a href="/review" data-nav data-page-link="review">Review inbox</a>
           <a href="/therapists" data-nav data-page-link="therapists">Therapists</a>
@@ -47,7 +46,7 @@
             <h1 id="page-title">Overview</h1>
           </div>
           <div class="topbar-actions">
-            <a class="button-link primary-action" href="/workflows" data-nav>New workflow</a>
+            <a class="button-link primary-action" href="/referrals" data-nav>Referral queue</a>
             <button id="refresh-product-button" type="button" class="secondary compact">Refresh data</button>
           </div>
         </header>
@@ -83,8 +82,8 @@
               <section class="panel" aria-labelledby="recent-workflows-title">
                 <div class="panel-header">
                   <div>
-                    <p class="eyebrow">Automation</p>
-                    <h3 id="recent-workflows-title">Recent workflows</h3>
+                    <p class="eyebrow">Developer demo</p>
+                    <h3 id="recent-workflows-title">Recent workflow traces</h3>
                   </div>
                   <span class="panel-stat" id="metric-workflows">-</span>
                 </div>
@@ -120,8 +119,8 @@
               <section class="panel form-panel" aria-labelledby="workflow-title">
                 <div class="panel-header">
                   <div>
-                    <p class="eyebrow">Command</p>
-                    <h2 id="workflow-title">Run workflow</h2>
+                    <p class="eyebrow">Developer demo</p>
+                    <h2 id="workflow-title">Workflow trace runner</h2>
                   </div>
                 </div>
 
@@ -210,7 +209,7 @@
                   </label>
 
                   <div class="actions">
-                    <button id="run-button" type="submit">Run workflow</button>
+                    <button id="run-button" type="submit">Run demo workflow</button>
                     <button id="reset-button" type="button" class="secondary">Reset</button>
                   </div>
                 </form>
@@ -255,18 +254,82 @@
                     <h2 id="referrals-title">Referral queue</h2>
                   </div>
                 </div>
+                <form id="referral-filter-form" class="filter-form">
+                  <label>
+                    Status
+                    <select name="status">
+                      <option value="">All statuses</option>
+                      <option value="new_referral">New referral</option>
+                      <option value="needs_admin_review">Needs admin review</option>
+                      <option value="waiting_for_missing_info">Waiting for missing info</option>
+                      <option value="needs_clinical_review">Needs clinical review</option>
+                      <option value="clinical_escalation_review">Clinical escalation</option>
+                      <option value="ready_for_matching">Ready for matching</option>
+                      <option value="match_recommended">Match recommended</option>
+                      <option value="match_approved">Match approved</option>
+                      <option value="slot_options_ready">Slot options ready</option>
+                      <option value="awaiting_patient_contact">Awaiting patient contact</option>
+                      <option value="contact_sent">Contact sent</option>
+                      <option value="awaiting_patient_reply">Awaiting patient reply</option>
+                      <option value="appointment_confirmed">Appointment confirmed</option>
+                      <option value="intake_packet_sent">Intake packet sent</option>
+                      <option value="intake_incomplete">Intake incomplete</option>
+                      <option value="intake_complete">Intake complete</option>
+                      <option value="prep_brief_ready">Prep brief ready</option>
+                      <option value="first_session_ready">First session ready</option>
+                    </select>
+                  </label>
+                  <label>
+                    Source
+                    <select name="source">
+                      <option value="">All sources</option>
+                      <option value="webform">Web form</option>
+                      <option value="email">Email</option>
+                      <option value="csv_import">CSV import</option>
+                      <option value="doctoralia">Doctoralia</option>
+                      <option value="voicemail">Voicemail</option>
+                    </select>
+                  </label>
+                  <label>
+                    Flag
+                    <select name="flag">
+                      <option value="">All flags</option>
+                      <option value="missing_contact">Missing contact</option>
+                      <option value="insurance_unclear">Insurance unclear</option>
+                      <option value="duplicate_candidate">Duplicate candidate</option>
+                      <option value="risk_unknown">Risk unknown</option>
+                      <option value="risk_elevated">Risk elevated</option>
+                    </select>
+                  </label>
+                  <label>
+                    Next action
+                    <select name="next_action">
+                      <option value="">All actions</option>
+                      <option value="review_missing_info">Resolve missing info</option>
+                      <option value="clinical_review">Clinical review</option>
+                      <option value="run_matching">Run matching</option>
+                      <option value="approve_match">Approve match</option>
+                      <option value="approve_slots">Approve slots</option>
+                      <option value="approve_contact">Approve contact</option>
+                      <option value="wait_patient_reply">Wait for patient reply</option>
+                      <option value="start_intake">Start intake</option>
+                      <option value="complete_intake">Complete intake</option>
+                      <option value="generate_prep_brief">Generate prep brief</option>
+                    </select>
+                  </label>
+                </form>
                 <div id="referral-list" class="record-list large-list"></div>
               </section>
 
               <section class="panel" aria-labelledby="referral-detail-title">
                 <div class="panel-header">
                   <div>
-                    <p class="eyebrow">Record</p>
-                    <h2 id="referral-detail-title">Referral detail</h2>
+                    <p class="eyebrow">Admin workflow</p>
+                    <h2 id="referral-detail-title">Admin workbench</h2>
                   </div>
                 </div>
                 <div id="referral-detail" class="detail-view">
-                  <p class="empty-state">Select a referral to inspect structured fields, drafts, and source text.</p>
+                  <p class="empty-state">Select a referral to review fields, gates, matching, scheduling, intake, and prep status.</p>
                 </div>
               </section>
             </div>
@@ -312,6 +375,15 @@
           </section>
 
           <section class="page" data-page="intake" aria-labelledby="intake-title">
+            <section class="panel" aria-labelledby="intake-tracker-title">
+              <div class="panel-header">
+                <div>
+                  <p class="eyebrow">Pre-session</p>
+                  <h2 id="intake-tracker-title">Intake tracker</h2>
+                </div>
+              </div>
+              <div id="intake-tracker-list" class="record-list large-list"></div>
+            </section>
             <section class="panel" aria-labelledby="intake-title">
               <div class="panel-header">
                 <div>
@@ -419,6 +491,23 @@
 
           <section class="page" data-page="system" aria-labelledby="model-health-title">
             <div class="workspace-grid">
+              <section class="panel" aria-labelledby="workflow-trace-link-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Developer demo</p>
+                    <h2 id="workflow-trace-link-title">Workflow trace</h2>
+                  </div>
+                  <a class="text-link" href="/workflows" data-nav>Open trace runner</a>
+                </div>
+                <div class="record-list">
+                  <article class="record-item" data-status="configured">
+                    <h4>Agent workflow console</h4>
+                    <span class="pill">demo-only</span>
+                    <p>Run sample payloads and inspect agent handoffs without making it the clinic admin journey.</p>
+                  </article>
+                </div>
+              </section>
+
               <section class="panel model-health-panel" aria-labelledby="model-health-title">
                 <div class="panel-header">
                   <div>
@@ -455,6 +544,6 @@
       </div>
     </div>
 
-    <script src="/static/app.js"></script>
+    <script src="static/app.js"></script>
   </body>
 </html>

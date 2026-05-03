@@ -71,6 +71,25 @@ The UI includes:
 - Referral CSV batch imports with source artifact storage, imported referral records, and row-level import errors.
 - Integration health, security posture, and feedback metrics panels.
 
+## Admin Referral MVP Redesign Status
+
+The first admin-referral redesign patch keeps the existing backend services but aligns the app around the clinic admin workflow:
+
+- Referral statuses now map toward the target admin workflow terms, with legacy statuses translated for existing local data.
+- Referral list/detail responses include derived `secondary_flags`, `next_action`, and human-readable labels for queue filtering and workbench triage.
+- Match recommendations, slot proposals, and intake reminders now create review tasks using the existing review inbox.
+- Missing-information drafts, clinical escalation checks, simulated patient replies, appointment confirmations, and intake waivers now use explicit review tasks before advancing the admin state gates.
+- Missing-information replies are recorded as referral history and can update extracted referral fields.
+- Duplicate resolution, suitability review, first-contact message approval, and intake-packet send approval are now explicit admin review gates.
+- The Intake page includes a global tracker for active referral intake status and blockers.
+- `first_session_ready` is only reached after a confirmed appointment, complete-or-waived intake, and a generated therapist prep brief.
+- The main navigation emphasizes the Referral Queue and Admin Workbench. The previous Run Workflow page is preserved as a developer/demo workflow trace runner under System.
+
+Recommended next steps from the redesign master plan remain intentionally deferred until the admin gates are stable:
+
+- Add provider-backed patient reply ingestion beyond the current simulated/manual reply capture.
+- Keep real email sending and calendar write-back deferred; current communication and scheduling behavior is simulated/manual.
+
 ## Smoke Test
 
 Start the server, then run:
@@ -94,14 +113,25 @@ GET /api/therapists
 POST /api/therapists
 POST /api/referrals/{referral_id}/match
 POST /api/referrals/{referral_id}/appointment-proposals
+POST /api/referrals/{referral_id}/missing-info-draft
+POST /api/referrals/{referral_id}/missing-info-replies
+POST /api/referrals/{referral_id}/clinical-review
+POST /api/referrals/{referral_id}/duplicate-review
+POST /api/referrals/{referral_id}/suitability-review
+POST /api/referrals/{referral_id}/contact-draft
+POST /api/referrals/{referral_id}/patient-replies
 POST /api/appointments/{appointment_id}/confirm
 GET /api/intake/templates
+GET /api/intake/tracker
 POST /api/referrals/{referral_id}/intake
 GET /api/referrals/{referral_id}/intake
 POST /api/referrals/{referral_id}/documents
+POST /api/referrals/{referral_id}/intake-packet-draft
 POST /api/referrals/{referral_id}/intake-reminder
 POST /api/intake/items/{item_id}/complete
+POST /api/intake/items/{item_id}/exception-request
 POST /api/consent-records/{consent_id}/complete
+POST /api/consent-records/{consent_id}/exception-request
 POST /api/referrals/{referral_id}/questionnaires
 POST /api/referrals/{referral_id}/prep-brief
 GET /api/patients/{patient_id}/workspace

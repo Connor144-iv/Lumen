@@ -24,7 +24,7 @@ def test_phase6_session_note_library_and_retrieval_foundation() -> None:
             tenant_id=tenant.id,
             source_channel="webform",
             raw_text="Adult anxiety referral with sleep impairment.",
-            status="contacted",
+            status="appointment_confirmed",
             patient_name="Phase Six Patient",
         )
         session.add(referral)

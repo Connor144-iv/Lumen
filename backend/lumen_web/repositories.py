@@ -42,6 +42,15 @@ from .models import (
     new_id,
 )
 from .seed import DEMO_THERAPIST_USER_ID, DEMO_USER_ID
+from .workflow_state import (
+    canonical_referral_status,
+    next_action_for_referral,
+    next_action_label,
+    secondary_flags_for_referral,
+    status_filter_values,
+    status_label,
+    transition_referral_status,
+)
 
 
 ROLE_PERMISSIONS: dict[str, list[str]] = {
@@ -138,11 +147,12 @@ def create_referral_for_request(session: Session, request: Any) -> Referral | No
         source_channel=str(raw_input.get("source_channel") or "webform"),
         raw_text=str(raw_input.get("raw_text") or ""),
         uploaded_file_name=raw_input.get("uploaded_file_name"),
-        status="normalizing",
+        status="normalising",
         missing_fields=_deterministic_missing_fields(raw_input),
     )
     session.add(referral)
     session.flush()
+    _ensure_admin_missing_info_task(session, referral)
     write_audit(
         session,
         tenant_id=request.tenant_id,
@@ -316,7 +326,8 @@ def list_referrals(session: Session, tenant_id: str | None = None, status: str |
     if tenant_id:
         query = query.where(Referral.tenant_id == tenant_id)
     if status:
-        query = query.where(Referral.status == status)
+        values = status_filter_values(status) or [status]
+        query = query.where(Referral.status.in_(values))
     return [referral_summary(referral) for referral in session.scalars(query)]
 
 
@@ -341,6 +352,9 @@ def referral_detail(session: Session, referral_id: str) -> dict[str, Any]:
             "communication_drafts": [communication_draft_to_dict(draft) for draft in drafts],
             "review_tasks": [review_task_to_dict(task) for task in tasks],
             "workflow_runs": [workflow_run_to_dict(run, include_events=False) for run in workflows],
+            "patient_replies": _referral_documents(session, referral, "patient_reply"),
+            "missing_info_replies": _referral_documents(session, referral, "missing_info_reply"),
+            "readiness_blockers": _first_session_readiness_blockers(session, referral),
         }
     )
     return detail
@@ -460,11 +474,12 @@ def create_email_referral(
         source_channel="email",
         raw_text=raw_text,
         contact_email=sender.strip() if "@" in sender else None,
-        status="new",
+        status="new_referral",
         missing_fields=_deterministic_missing_fields({"raw_text": raw_text}),
     )
     session.add_all([document, referral])
     session.flush()
+    _ensure_admin_missing_info_task(session, referral)
     write_audit(
         session,
         tenant_id=tenant_id,
@@ -600,6 +615,650 @@ def list_review_tasks(session: Session, tenant_id: str | None = None, status: st
     return [review_task_to_dict(task) for task in session.scalars(query)]
 
 
+def create_review_task(
+    session: Session,
+    *,
+    tenant_id: str,
+    task_type: str,
+    reason: str,
+    payload_key: str,
+    source_payload: Any | None = None,
+    draft_text: str | None = None,
+    referral_id: str | None = None,
+    patient_id: str | None = None,
+    workflow_run_id: str | None = None,
+) -> HumanReviewTask:
+    query = select(HumanReviewTask).where(
+        HumanReviewTask.tenant_id == tenant_id,
+        HumanReviewTask.task_type == task_type,
+        HumanReviewTask.payload_key == payload_key,
+        HumanReviewTask.status == "open",
+    )
+    if referral_id:
+        query = query.where(HumanReviewTask.referral_id == referral_id)
+    if workflow_run_id:
+        query = query.where(HumanReviewTask.workflow_run_id == workflow_run_id)
+    existing = session.scalar(query)
+    if existing is not None:
+        return existing
+
+    task = HumanReviewTask(
+        tenant_id=tenant_id,
+        workflow_run_id=workflow_run_id,
+        referral_id=referral_id,
+        patient_id=patient_id,
+        task_type=task_type,
+        reason=reason,
+        payload_key=payload_key,
+        source_payload=json_safe(source_payload),
+        draft_text=draft_text if draft_text is not None else _draft_text_for_payload(source_payload),
+    )
+    session.add(task)
+    session.flush()
+    write_audit(
+        session,
+        tenant_id=tenant_id,
+        action="create",
+        entity_type="human_review_task",
+        entity_id=task.id,
+        after=review_task_to_dict(task),
+    )
+    return task
+
+
+def draft_missing_info_request(
+    session: Session,
+    referral_id: str,
+    *,
+    recipient: str = "patient",
+    note: str = "",
+) -> dict[str, Any]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    missing_fields = list(referral.missing_fields or [])
+    if not missing_fields:
+        raise ValueError("Referral has no recorded missing fields.")
+
+    patient = _ensure_patient_for_referral(session, referral)
+    _ensure_admin_missing_info_task(session, referral)
+    recipient_label = {
+        "patient": "patient",
+        "referrer": "referrer",
+        "internal_admin": "clinic admin team",
+    }.get(recipient, "patient")
+    field_lines = [f"- {field.replace('_', ' ')}" for field in missing_fields]
+    note_lines = ["", "Clinic note:", note.strip()] if note.strip() else []
+    body = "\n".join(
+        [
+            f"Hello {referral.patient_name or patient.display_name or 'there'},",
+            "",
+            "We need a little more information before we can continue this referral.",
+            "",
+            "Missing information:",
+            *field_lines,
+            *note_lines,
+            "",
+            "This is a simulated draft. Clinic staff must review and send it manually in this prototype.",
+        ]
+    )
+    draft = CommunicationDraft(
+        tenant_id=referral.tenant_id,
+        referral_id=referral.id,
+        patient_id=patient.id,
+        workflow_run_id=None,
+        channel="email",
+        subject=f"Missing information for {recipient_label} referral",
+        body=body,
+        status="draft_pending_review",
+        proposed_slots=[],
+        requires_human_send=True,
+    )
+    session.add(draft)
+    session.flush()
+    referral.communication_draft_id = draft.id
+    transition_referral_status(
+        session,
+        referral,
+        "needs_admin_review",
+        reason="Missing-information message drafted for review.",
+    )
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="create",
+        entity_type="communication_draft",
+        entity_id=draft.id,
+        after=communication_draft_to_dict(draft),
+    )
+    create_review_task(
+        session,
+        tenant_id=referral.tenant_id,
+        workflow_run_id=None,
+        referral_id=referral.id,
+        patient_id=patient.id,
+        task_type="missing_info_message_approval",
+        reason="Missing-information message requires staff approval before simulated send.",
+        payload_key=f"missing_info_message:{draft.id[:8]}",
+        source_payload=communication_draft_to_dict(draft),
+        draft_text=draft.body,
+    )
+    return communication_draft_to_dict(draft)
+
+
+def create_clinical_escalation_review(
+    session: Session,
+    referral_id: str,
+    *,
+    reason: str = "Clinical risk or suitability review is required before matching.",
+) -> HumanReviewTask:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    patient = _ensure_patient_for_referral(session, referral)
+    transition_referral_status(
+        session,
+        referral,
+        "clinical_escalation_review",
+        reason=reason,
+    )
+    return create_review_task(
+        session,
+        tenant_id=referral.tenant_id,
+        workflow_run_id=referral.workflow_run_id,
+        referral_id=referral.id,
+        patient_id=patient.id,
+        task_type="clinical_risk_review",
+        reason=reason,
+        payload_key="risk_review",
+        source_payload={
+            "risk_category": referral.risk_category,
+            "urgency": referral.urgency,
+            "risk_present": referral.risk_present,
+            "reason": reason,
+        },
+    )
+
+
+def record_simulated_patient_reply(
+    session: Session,
+    referral_id: str,
+    *,
+    reply_type: str,
+    appointment_id: str | None = None,
+    notes: str = "",
+) -> dict[str, Any]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    patient = _ensure_patient_for_referral(session, referral)
+    allowed = {"accepted_slot", "declined", "alternative_requested", "asked_question", "unclear", "no_response"}
+    if reply_type not in allowed:
+        raise ValueError(f"Unsupported patient reply type: {reply_type}")
+
+    appointment = None
+    if appointment_id:
+        appointment = session.get(Appointment, appointment_id)
+        if appointment is None:
+            raise KeyError(f"Unknown appointment: {appointment_id}")
+        if appointment.referral_id != referral.id:
+            raise ValueError("Appointment does not belong to this referral.")
+    elif reply_type == "accepted_slot":
+        raise ValueError("Accepted slot replies require an appointment_id.")
+
+    document = Document(
+        tenant_id=referral.tenant_id,
+        patient_id=patient.id,
+        document_type="patient_reply",
+        title=f"Simulated patient reply: {reply_type.replace('_', ' ')}",
+        metadata_json={
+            "simulation": True,
+            "reply_type": reply_type,
+            "appointment_id": appointment_id,
+            "notes": notes.strip(),
+            "referral_id": referral.id,
+        },
+    )
+    session.add(document)
+    session.flush()
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="record_simulated_patient_reply",
+        entity_type="document",
+        entity_id=document.id,
+        after=document_to_dict(document),
+    )
+
+    task: HumanReviewTask | None = None
+    if reply_type == "accepted_slot":
+        transition_referral_status(
+            session,
+            referral,
+            "awaiting_patient_reply",
+            reason="Simulated patient accepted a proposed slot; confirmation requires review.",
+        )
+        task = create_review_task(
+            session,
+            tenant_id=referral.tenant_id,
+            workflow_run_id=referral.workflow_run_id,
+            referral_id=referral.id,
+            patient_id=patient.id,
+            task_type="appointment_confirmation_approval",
+            reason="Patient accepted a proposed slot; approve to confirm the appointment record.",
+            payload_key=f"appointment_confirmation:{appointment.id[:8] if appointment else 'manual'}",
+            source_payload={
+                "reply_type": reply_type,
+                "appointment_id": appointment_id,
+                "patient_reply_document_id": document.id,
+                "notes": notes.strip(),
+            },
+        )
+    elif reply_type == "declined":
+        transition_referral_status(session, referral, "closed_declined", reason="Simulated patient declined offered slots.")
+    elif reply_type == "alternative_requested":
+        transition_referral_status(session, referral, "slot_options_ready", reason="Simulated patient requested alternative slots.")
+    elif reply_type == "no_response":
+        transition_referral_status(session, referral, "closed_no_response", reason="Simulated no-response outcome recorded.")
+    else:
+        transition_referral_status(session, referral, "needs_admin_review", reason="Simulated patient reply needs admin review.")
+
+    return {
+        "reply": document_to_dict(document),
+        "task": review_task_to_dict(task) if task else None,
+        "referral": referral_summary(referral),
+    }
+
+
+def request_intake_item_exception(
+    session: Session,
+    item_id: str,
+    *,
+    reason: str = "Authorised exception requested by clinic admin.",
+) -> HumanReviewTask:
+    item = session.get(IntakeChecklistItem, item_id)
+    if item is None:
+        raise KeyError(f"Unknown intake checklist item: {item_id}")
+    if _intake_done(item.status):
+        raise ValueError("Completed or waived intake items do not need an exception.")
+    return create_review_task(
+        session,
+        tenant_id=item.tenant_id,
+        referral_id=item.referral_id,
+        patient_id=item.patient_id,
+        task_type="intake_exception_approval",
+        reason=reason,
+        payload_key=f"intake_exception_item:{item.id[:8]}",
+        source_payload={
+            "target_type": "intake_item",
+            "item_id": item.id,
+            "label": item.label,
+            "reason": reason,
+        },
+        draft_text=reason,
+    )
+
+
+def request_consent_exception(
+    session: Session,
+    consent_id: str,
+    *,
+    reason: str = "Authorised exception requested by clinic admin.",
+) -> HumanReviewTask:
+    consent = session.get(ConsentRecord, consent_id)
+    if consent is None:
+        raise KeyError(f"Unknown consent record: {consent_id}")
+    if _intake_done(consent.status):
+        raise ValueError("Completed or waived consent records do not need an exception.")
+    referral_id = _latest_referral_id_for_patient(session, consent.tenant_id, consent.patient_id)
+    return create_review_task(
+        session,
+        tenant_id=consent.tenant_id,
+        referral_id=referral_id,
+        patient_id=consent.patient_id,
+        task_type="intake_exception_approval",
+        reason=reason,
+        payload_key=f"intake_exception_consent:{consent.id[:8]}",
+        source_payload={
+            "target_type": "consent_record",
+            "consent_id": consent.id,
+            "scope": consent.scope,
+            "reason": reason,
+        },
+        draft_text=reason,
+    )
+
+
+def record_missing_info_reply(
+    session: Session,
+    referral_id: str,
+    *,
+    source: str = "patient",
+    updates: dict[str, Any] | None = None,
+    notes: str = "",
+) -> dict[str, Any]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    clean_updates = _clean_missing_info_updates(updates or {})
+    if not clean_updates and not notes.strip():
+        raise ValueError("Missing-information reply requires updates or notes.")
+    before = referral_summary(referral)
+    _apply_referral_updates(referral, clean_updates)
+    referral.missing_fields = _remaining_missing_fields(referral.missing_fields, clean_updates)
+    referral.updated_at = utc_now()
+    patient = _ensure_patient_for_referral(session, referral)
+    document = Document(
+        tenant_id=referral.tenant_id,
+        patient_id=patient.id,
+        document_type="missing_info_reply",
+        title=f"Missing information reply from {source}",
+        metadata_json={
+            "referral_id": referral.id,
+            "source": source,
+            "updates": json_safe(clean_updates),
+            "notes": notes.strip(),
+            "remaining_missing_fields": list(referral.missing_fields or []),
+        },
+    )
+    session.add(document)
+    session.flush()
+    transition_referral_status(
+        session,
+        referral,
+        _next_admin_gate_status(referral),
+        reason="Missing-information reply recorded.",
+    )
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="record_missing_info_reply",
+        entity_type="referral",
+        entity_id=referral.id,
+        before=before,
+        after=referral_summary(referral),
+    )
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="create",
+        entity_type="document",
+        entity_id=document.id,
+        after=document_to_dict(document),
+    )
+    return {"reply": document_to_dict(document), "referral": referral_summary(referral)}
+
+
+def create_duplicate_resolution_review(
+    session: Session,
+    referral_id: str,
+    *,
+    candidate_referral_id: str | None = None,
+    reason: str = "Potential duplicate referral requires admin resolution before matching.",
+) -> HumanReviewTask:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    candidates = list(referral.duplicate_candidates or [])
+    if candidate_referral_id and candidate_referral_id not in candidates:
+        candidates.append(candidate_referral_id)
+        referral.duplicate_candidates = candidates
+        referral.updated_at = utc_now()
+    if not candidates:
+        raise ValueError("No duplicate candidates are recorded for this referral.")
+    return create_review_task(
+        session,
+        tenant_id=referral.tenant_id,
+        workflow_run_id=referral.workflow_run_id,
+        referral_id=referral.id,
+        patient_id=referral.patient_id,
+        task_type="duplicate_resolution",
+        reason=reason,
+        payload_key="duplicate_candidates",
+        source_payload={"duplicate_candidates": candidates, "reason": reason},
+    )
+
+
+def create_suitability_review(
+    session: Session,
+    referral_id: str,
+    *,
+    reason: str = "Suitability review is required before therapist matching.",
+) -> HumanReviewTask:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    patient = _ensure_patient_for_referral(session, referral)
+    transition_referral_status(
+        session,
+        referral,
+        "clinical_escalation_review",
+        reason=reason,
+    )
+    return create_review_task(
+        session,
+        tenant_id=referral.tenant_id,
+        workflow_run_id=referral.workflow_run_id,
+        referral_id=referral.id,
+        patient_id=patient.id,
+        task_type="suitability_review",
+        reason=reason,
+        payload_key="suitability_review",
+        source_payload={
+            "risk_category": referral.risk_category,
+            "urgency": referral.urgency,
+            "reason": reason,
+        },
+    )
+
+
+def draft_first_contact_message(
+    session: Session,
+    referral_id: str,
+    *,
+    note: str = "",
+) -> dict[str, Any]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    patient = _ensure_patient_for_referral(session, referral)
+    appointments = list(
+        session.scalars(
+            select(Appointment)
+            .where(Appointment.referral_id == referral.id, Appointment.status == "proposed")
+            .order_by(Appointment.starts_at)
+        )
+    )
+    if not appointments:
+        raise ValueError("First-contact draft requires proposed appointment slots.")
+    slot_lines = [
+        f"- {iso_or_none(appointment.starts_at)} to {iso_or_none(appointment.ends_at)}"
+        for appointment in appointments[:3]
+    ]
+    note_lines = ["", "Clinic note:", note.strip()] if note.strip() else []
+    body = "\n".join(
+        [
+            f"Hello {referral.patient_name or patient.display_name or 'there'},",
+            "",
+            "We have reviewed your referral and can offer the following first-session options:",
+            "",
+            *slot_lines,
+            *note_lines,
+            "",
+            "Please reply with the option that works best. This prototype records replies manually or through simulation.",
+        ]
+    )
+    draft = CommunicationDraft(
+        tenant_id=referral.tenant_id,
+        referral_id=referral.id,
+        patient_id=patient.id,
+        workflow_run_id=None,
+        channel="email",
+        subject="First appointment options",
+        body=body,
+        status="draft_pending_review",
+        proposed_slots=[appointment.id for appointment in appointments[:3]],
+        requires_human_send=True,
+    )
+    session.add(draft)
+    session.flush()
+    referral.communication_draft_id = draft.id
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="create",
+        entity_type="communication_draft",
+        entity_id=draft.id,
+        after=communication_draft_to_dict(draft),
+    )
+    create_review_task(
+        session,
+        tenant_id=referral.tenant_id,
+        workflow_run_id=None,
+        referral_id=referral.id,
+        patient_id=patient.id,
+        task_type="send_approval",
+        reason="First-contact message requires staff approval before simulated/manual send.",
+        payload_key=f"first_contact_draft:{draft.id[:8]}",
+        source_payload=communication_draft_to_dict(draft),
+        draft_text=draft.body,
+    )
+    transition_referral_status(
+        session,
+        referral,
+        "awaiting_patient_contact",
+        reason="First-contact message drafted for approval.",
+    )
+    return communication_draft_to_dict(draft)
+
+
+def draft_intake_packet(
+    session: Session,
+    referral_id: str,
+    *,
+    note: str = "",
+    template_id: str | None = None,
+) -> dict[str, Any]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    if canonical_referral_status(referral.status) not in {
+        "appointment_confirmed",
+        "intake_packet_sent",
+        "intake_incomplete",
+        "intake_complete",
+        "prep_brief_ready",
+        "first_session_ready",
+    }:
+        raise ValueError("Intake packet can only be drafted after appointment confirmation.")
+    workspace = intake_workspace(session, referral_id)
+    if workspace["status"] == "not_started":
+        workspace = start_intake_for_referral(session, referral_id, template_id)
+    patient = _ensure_patient_for_referral(session, referral)
+    item_lines = [f"- {item['label']}" for item in workspace["items"] if not _intake_done(item["status"])]
+    consent_lines = [f"- {consent['scope'].replace('_', ' ')} consent" for consent in workspace["consents"] if not _intake_done(consent["status"])]
+    note_lines = ["", "Clinic note:", note.strip()] if note.strip() else []
+    body = "\n".join(
+        [
+            f"Hello {referral.patient_name or patient.display_name or 'there'},",
+            "",
+            "Before your first session, please complete the intake items below.",
+            "",
+            "Required forms and documents:",
+            *(item_lines or ["- No document checklist items are outstanding."]),
+            "",
+            "Required consents:",
+            *(consent_lines or ["- No consent records are outstanding."]),
+            *note_lines,
+            "",
+            "This intake packet is a draft and must be approved by clinic staff before sending.",
+        ]
+    )
+    draft = CommunicationDraft(
+        tenant_id=referral.tenant_id,
+        referral_id=referral.id,
+        patient_id=patient.id,
+        workflow_run_id=None,
+        channel="email",
+        subject="Intake packet for your first session",
+        body=body,
+        status="draft_pending_review",
+        proposed_slots=[],
+        requires_human_send=True,
+    )
+    session.add(draft)
+    session.flush()
+    referral.communication_draft_id = draft.id
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="create",
+        entity_type="communication_draft",
+        entity_id=draft.id,
+        after=communication_draft_to_dict(draft),
+    )
+    create_review_task(
+        session,
+        tenant_id=referral.tenant_id,
+        workflow_run_id=None,
+        referral_id=referral.id,
+        patient_id=patient.id,
+        task_type="send_approval",
+        reason="Intake packet requires staff approval before simulated/manual send.",
+        payload_key=f"intake_packet_draft:{draft.id[:8]}",
+        source_payload=communication_draft_to_dict(draft),
+        draft_text=draft.body,
+    )
+    return communication_draft_to_dict(draft)
+
+
+def list_intake_tracker(session: Session, tenant_id: str | None = None) -> list[dict[str, Any]]:
+    query = select(Referral).order_by(Referral.updated_at.desc())
+    if tenant_id:
+        query = query.where(Referral.tenant_id == tenant_id)
+    rows: list[dict[str, Any]] = []
+    for referral in session.scalars(query):
+        status = canonical_referral_status(referral.status)
+        if status in {"closed_declined", "closed_no_response", "closed_not_suitable"}:
+            continue
+        items = list(session.scalars(select(IntakeChecklistItem).where(IntakeChecklistItem.referral_id == referral.id)))
+        consents = []
+        if referral.patient_id:
+            consents = list(
+                session.scalars(
+                    select(ConsentRecord).where(
+                        ConsentRecord.tenant_id == referral.tenant_id,
+                        ConsentRecord.patient_id == referral.patient_id,
+                    )
+                )
+            )
+        if not items and not consents and status not in {
+            "appointment_confirmed",
+            "intake_packet_sent",
+            "intake_incomplete",
+            "intake_complete",
+            "prep_brief_ready",
+            "first_session_ready",
+        }:
+            continue
+        missing_count = len([item for item in items if not _intake_done(item.status)]) + len(
+            [consent for consent in consents if not _intake_done(consent.status)]
+        )
+        rows.append(
+            {
+                "referral": referral_summary(referral),
+                "intake_status": _intake_status(items, consents),
+                "missing_count": missing_count,
+                "waived_count": len([item for item in items if item.status == "waived"])
+                + len([consent for consent in consents if consent.status == "waived"]),
+                "completed_count": len([item for item in items if item.status == "completed"])
+                + len([consent for consent in consents if consent.status == "completed"]),
+                "readiness_blockers": _first_session_readiness_blockers(session, referral),
+            }
+        )
+    return rows
+
+
 def apply_review_action(
     session: Session,
     *,
@@ -633,24 +1292,91 @@ def apply_review_action(
     else:
         raise ValueError("action must be approve, reject, request_changes, or escalate.")
 
-    if task.payload_key == "intake_reminder_draft":
-        draft_id = (task.source_payload or {}).get("id") if isinstance(task.source_payload, dict) else None
-        draft = session.get(CommunicationDraft, draft_id) if draft_id else None
-        if draft:
-            draft.status = "approved_pending_send" if action == "approve" else task.status
-            if action == "approve" and task.final_text:
-                draft.body = task.final_text
-            draft.updated_at = utc_now()
+    if task.task_type in {"intake_reminder_approval", "missing_info_message_approval", "send_approval"}:
+        _update_reviewed_draft(session, task, action)
 
     if task.referral_id:
         referral = session.get(Referral, task.referral_id)
         if referral:
             if action == "approve" and task.task_type == "send_approval":
-                referral.status = "ready_to_contact"
+                _approve_send_task(session, task, referral)
             elif action == "approve" and task.task_type == "match_approval":
-                referral.status = "outreach_draft_pending"
+                transition_referral_status(
+                    session,
+                    referral,
+                    "match_approved",
+                    actor_user_id=task.reviewer_id,
+                    reason="Therapist match approved in review inbox.",
+                )
+            elif action == "approve" and task.task_type == "slot_offer_approval":
+                transition_referral_status(
+                    session,
+                    referral,
+                    "awaiting_patient_contact",
+                    actor_user_id=task.reviewer_id,
+                    reason="Slot options approved for patient contact.",
+                )
+            elif action == "approve" and task.task_type == "clinical_risk_review":
+                transition_referral_status(
+                    session,
+                    referral,
+                    "ready_for_matching" if not referral.missing_fields else "needs_admin_review",
+                    actor_user_id=task.reviewer_id,
+                    reason="Clinical risk review approved.",
+                )
+            elif action == "approve" and task.task_type == "suitability_review":
+                transition_referral_status(
+                    session,
+                    referral,
+                    "ready_for_matching" if not referral.missing_fields and not referral.duplicate_candidates else "needs_admin_review",
+                    actor_user_id=task.reviewer_id,
+                    reason="Suitability review approved.",
+                )
+            elif action == "approve" and task.task_type == "duplicate_resolution":
+                referral.duplicate_candidates = []
+                transition_referral_status(
+                    session,
+                    referral,
+                    _next_admin_gate_status(referral),
+                    actor_user_id=task.reviewer_id,
+                    reason="Duplicate candidates resolved.",
+                )
+            elif action == "approve" and task.task_type == "appointment_confirmation_approval":
+                _approve_appointment_confirmation(session, task, referral)
+            elif action == "approve" and task.task_type == "missing_info_message_approval":
+                transition_referral_status(
+                    session,
+                    referral,
+                    "waiting_for_missing_info",
+                    actor_user_id=task.reviewer_id,
+                    reason="Missing-information message approved for simulated manual send.",
+                )
+            elif action == "approve" and task.task_type == "intake_exception_approval":
+                _approve_intake_exception(session, task)
+            elif action == "escalate":
+                transition_referral_status(
+                    session,
+                    referral,
+                    "clinical_escalation_review",
+                    actor_user_id=task.reviewer_id,
+                    reason=task.rejection_reason,
+                )
+            elif action == "reject" and task.task_type == "suitability_review":
+                transition_referral_status(
+                    session,
+                    referral,
+                    "closed_not_suitable",
+                    actor_user_id=task.reviewer_id,
+                    reason=task.rejection_reason,
+                )
             elif action == "reject":
-                referral.status = "needs_admin_review"
+                transition_referral_status(
+                    session,
+                    referral,
+                    "needs_admin_review",
+                    actor_user_id=task.reviewer_id,
+                    reason=task.rejection_reason,
+                )
 
     write_audit(
         session,
@@ -663,6 +1389,124 @@ def apply_review_action(
         after=review_task_to_dict(task),
     )
     return task
+
+
+def _update_reviewed_draft(session: Session, task: HumanReviewTask, action: str) -> None:
+    draft_id = (task.source_payload or {}).get("id") if isinstance(task.source_payload, dict) else None
+    draft = session.get(CommunicationDraft, draft_id) if draft_id else None
+    if draft is None:
+        return
+    draft.status = "approved_pending_send" if action == "approve" else task.status
+    if action == "approve" and task.final_text:
+        draft.body = task.final_text
+    draft.updated_at = utc_now()
+
+
+def _approve_send_task(session: Session, task: HumanReviewTask, referral: Referral) -> None:
+    if task.payload_key.startswith("intake_packet_draft"):
+        transition_referral_status(
+            session,
+            referral,
+            "intake_packet_sent",
+            actor_user_id=task.reviewer_id,
+            reason="Intake packet approved for simulated/manual send.",
+        )
+        return
+    transition_referral_status(
+        session,
+        referral,
+        "contact_sent",
+        actor_user_id=task.reviewer_id,
+        reason="Patient-facing contact draft approved for simulated/manual send.",
+    )
+
+
+def _approve_appointment_confirmation(session: Session, task: HumanReviewTask, referral: Referral) -> None:
+    payload = task.source_payload if isinstance(task.source_payload, dict) else {}
+    appointment_id = str(payload.get("appointment_id") or "").strip()
+    if appointment_id:
+        confirm_appointment(session, appointment_id)
+        return
+    transition_referral_status(
+        session,
+        referral,
+        "appointment_confirmed",
+        actor_user_id=task.reviewer_id,
+        reason="Appointment confirmation approved.",
+    )
+    _maybe_mark_first_session_ready(session, referral)
+
+
+def _approve_intake_exception(session: Session, task: HumanReviewTask) -> None:
+    payload = task.source_payload if isinstance(task.source_payload, dict) else {}
+    target_type = payload.get("target_type")
+    reason = task.final_text or payload.get("reason") or "Intake exception approved."
+
+    if target_type == "intake_item":
+        item = session.get(IntakeChecklistItem, payload.get("item_id"))
+        if item is None:
+            raise KeyError("Unknown intake checklist item for exception task.")
+        before = intake_item_to_dict(item)
+        item.status = "waived"
+        item.completed_at = utc_now()
+        item.notes = reason
+        item.updated_at = utc_now()
+        write_audit(
+            session,
+            tenant_id=item.tenant_id,
+            actor_user_id=task.reviewer_id,
+            action="waive",
+            entity_type="intake_checklist_item",
+            entity_id=item.id,
+            before=before,
+            after=intake_item_to_dict(item),
+        )
+        if item.referral_id:
+            _refresh_referral_intake_status(session, item.referral_id)
+        return
+
+    if target_type == "consent_record":
+        consent = session.get(ConsentRecord, payload.get("consent_id"))
+        if consent is None:
+            raise KeyError("Unknown consent record for exception task.")
+        before = consent_record_to_dict(consent)
+        consent.status = "waived"
+        consent.updated_at = utc_now()
+        touched_referrals: set[str] = set()
+        for item in session.scalars(
+            select(IntakeChecklistItem).where(
+                IntakeChecklistItem.tenant_id == consent.tenant_id,
+                IntakeChecklistItem.patient_id == consent.patient_id,
+                IntakeChecklistItem.item_type == "consent",
+            )
+        ):
+            if _intake_done(item.status):
+                continue
+            item_key = _normal(item.item_key)
+            item_label = _normal(item.label)
+            scope = _normal(consent.scope)
+            if scope and (scope in item_key or scope in item_label or item_key in scope):
+                item.status = "waived"
+                item.completed_at = utc_now()
+                item.notes = reason
+                item.updated_at = utc_now()
+                if item.referral_id:
+                    touched_referrals.add(item.referral_id)
+        write_audit(
+            session,
+            tenant_id=consent.tenant_id,
+            actor_user_id=task.reviewer_id,
+            action="waive",
+            entity_type="consent_record",
+            entity_id=consent.id,
+            before=before,
+            after=consent_record_to_dict(consent),
+        )
+        for referral_id in touched_referrals or ({task.referral_id} if task.referral_id else set()):
+            _refresh_referral_intake_status(session, referral_id)
+        return
+
+    raise ValueError("Unsupported intake exception task target.")
 
 
 def list_therapists(session: Session, tenant_id: str | None = None) -> list[dict[str, Any]]:
@@ -764,6 +1608,21 @@ def deterministic_match_for_referral(session: Session, referral_id: str) -> dict
     referral = session.get(Referral, referral_id)
     if referral is None:
         raise KeyError(f"Unknown referral: {referral_id}")
+    if referral.missing_fields:
+        raise ValueError("Missing information must be resolved before matching.")
+    if referral.duplicate_candidates:
+        raise ValueError("Duplicate candidates must be resolved before matching.")
+    current_status = canonical_referral_status(referral.status)
+    unresolved_risk = (
+        referral.risk_present
+        or referral.urgency in {"elevated", "urgent"}
+        or referral.risk_category == "unknown"
+        or referral.urgency == "unknown"
+    )
+    if current_status in {"needs_clinical_review", "clinical_escalation_review"} or (
+        unresolved_risk and current_status != "ready_for_matching"
+    ):
+        raise ValueError("Clinical review must be resolved before matching.")
     therapists = list(
         session.scalars(
             select(Therapist).where(Therapist.tenant_id == referral.tenant_id).order_by(Therapist.name)
@@ -785,19 +1644,34 @@ def deterministic_match_for_referral(session: Session, referral_id: str) -> dict
         "hard_constraints_checked": ["active", "capacity", "insurance", "language", "modality", "age_group"],
         "requires_human_approval": True,
     }
-    before = referral_summary(referral)
     referral.match_summary = match
-    referral.status = "match_pending_approval" if included else "needs_admin_review"
-    referral.updated_at = utc_now()
+    target_status = "match_recommended" if included else "needs_admin_review"
+    transition_referral_status(
+        session,
+        referral,
+        target_status,
+        reason="Deterministic therapist matching completed.",
+    )
     write_audit(
         session,
         tenant_id=referral.tenant_id,
         action="deterministic_match",
         entity_type="referral",
         entity_id=referral.id,
-        before=before,
         after=referral_summary(referral),
     )
+    if included:
+        create_review_task(
+            session,
+            tenant_id=referral.tenant_id,
+            workflow_run_id=referral.workflow_run_id,
+            referral_id=referral.id,
+            patient_id=referral.patient_id,
+            task_type="match_approval",
+            reason="Therapist match recommendation requires admin or director approval.",
+            payload_key="match_recommendation",
+            source_payload=match,
+        )
     return match
 
 
@@ -837,33 +1711,52 @@ def propose_appointment_slots(
     for appointment in existing:
         proposals.append(appointment_to_dict(appointment))
         if len(proposals) >= limit:
-            return proposals
-
-    for starts_at, ends_at, block in _generate_slots(therapist.availability_blocks, limit * 4):
-        if len(proposals) >= limit:
             break
-        if _appointment_conflicts(session, therapist.id, starts_at, ends_at):
-            continue
-        appointment = Appointment(
-            tenant_id=referral.tenant_id,
-            patient_id=referral.patient_id,
-            therapist_id=therapist.id,
-            referral_id=referral.id,
-            starts_at=starts_at,
-            ends_at=ends_at,
-            status="proposed",
-            source=f"availability:{block.get('weekday', 'manual')}",
+
+    if len(proposals) < limit:
+        for starts_at, ends_at, block in _generate_slots(therapist.availability_blocks, limit * 4):
+            if len(proposals) >= limit:
+                break
+            if _appointment_conflicts(session, therapist.id, starts_at, ends_at):
+                continue
+            appointment = Appointment(
+                tenant_id=referral.tenant_id,
+                patient_id=referral.patient_id,
+                therapist_id=therapist.id,
+                referral_id=referral.id,
+                starts_at=starts_at,
+                ends_at=ends_at,
+                status="proposed",
+                source=f"availability:{block.get('weekday', 'manual')}",
+            )
+            session.add(appointment)
+            session.flush()
+            proposals.append(appointment_to_dict(appointment))
+            write_audit(
+                session,
+                tenant_id=referral.tenant_id,
+                action="create",
+                entity_type="appointment",
+                entity_id=appointment.id,
+                after=appointment_to_dict(appointment),
+            )
+    if proposals:
+        transition_referral_status(
+            session,
+            referral,
+            "slot_options_ready",
+            reason="Appointment slot options generated from therapist availability.",
         )
-        session.add(appointment)
-        session.flush()
-        proposals.append(appointment_to_dict(appointment))
-        write_audit(
+        create_review_task(
             session,
             tenant_id=referral.tenant_id,
-            action="create",
-            entity_type="appointment",
-            entity_id=appointment.id,
-            after=appointment_to_dict(appointment),
+            workflow_run_id=referral.workflow_run_id,
+            referral_id=referral.id,
+            patient_id=referral.patient_id,
+            task_type="slot_offer_approval",
+            reason="Proposed appointment slots require admin approval before being offered to the patient.",
+            payload_key="slot_options",
+            source_payload={"appointments": proposals},
         )
     return proposals
 
@@ -904,7 +1797,13 @@ def confirm_appointment(session: Session, appointment_id: str) -> dict[str, Any]
     if appointment.referral_id:
         referral = session.get(Referral, appointment.referral_id)
         if referral:
-            referral.status = "contacted"
+            transition_referral_status(
+                session,
+                referral,
+                "appointment_confirmed",
+                reason="Appointment record confirmed in Lumen.",
+            )
+            _maybe_mark_first_session_ready(session, referral)
     write_audit(
         session,
         tenant_id=appointment.tenant_id,
@@ -997,6 +1896,8 @@ def create_referral_document(
         )
         if item.item_type == "consent":
             _complete_matching_consent_for_item(session, item, document.id)
+        if item.referral_id:
+            _refresh_referral_intake_status(session, item.referral_id)
 
     return document_to_dict(document)
 
@@ -1055,19 +1956,18 @@ def start_intake_for_referral(session: Session, referral_id: str, template_id: s
                     )
                 )
 
-    before = referral_summary(referral)
-    if referral.status in {"ready_to_contact", "contacted", "closed"}:
-        pass
-    else:
-        referral.status = "needs_admin_review"
-    referral.updated_at = utc_now()
+    transition_referral_status(
+        session,
+        referral,
+        "intake_incomplete",
+        reason="Intake checklist started for first-session readiness.",
+    )
     write_audit(
         session,
         tenant_id=referral.tenant_id,
         action="start_intake",
         entity_type="referral",
         entity_id=referral.id,
-        before=before,
         after=referral_summary(referral),
     )
     session.flush()
@@ -1145,8 +2045,8 @@ def generate_missing_intake_reminder(session: Session, referral_id: str) -> dict
         raise KeyError(f"Unknown referral: {referral_id}")
     patient = _ensure_patient_for_referral(session, referral)
     workspace = intake_workspace(session, referral_id)
-    missing_items = [item for item in workspace["items"] if item["status"] != "completed"]
-    missing_consents = [consent for consent in workspace["consents"] if consent["status"] != "completed"]
+    missing_items = [item for item in workspace["items"] if not _intake_done(item["status"])]
+    missing_consents = [consent for consent in workspace["consents"] if not _intake_done(consent["status"])]
     if not missing_items and not missing_consents:
         raise ValueError("No missing intake items need a reminder.")
 
@@ -1193,28 +2093,18 @@ def generate_missing_intake_reminder(session: Session, referral_id: str) -> dict
         entity_id=draft.id,
         after=communication_draft_to_dict(draft),
     )
-    if referral.workflow_run_id:
-        task = HumanReviewTask(
-            tenant_id=referral.tenant_id,
-            workflow_run_id=referral.workflow_run_id,
-            referral_id=referral.id,
-            patient_id=patient.id,
-            task_type="intake_reminder_approval",
-            reason="Patient-facing intake reminder requires staff approval before sending.",
-            payload_key="intake_reminder_draft",
-            source_payload=communication_draft_to_dict(draft),
-            draft_text=draft.body,
-        )
-        session.add(task)
-        session.flush()
-        write_audit(
-            session,
-            tenant_id=referral.tenant_id,
-            action="create",
-            entity_type="human_review_task",
-            entity_id=task.id,
-            after=review_task_to_dict(task),
-        )
+    create_review_task(
+        session,
+        tenant_id=referral.tenant_id,
+        workflow_run_id=referral.workflow_run_id,
+        referral_id=referral.id,
+        patient_id=patient.id,
+        task_type="intake_reminder_approval",
+        reason="Patient-facing intake reminder requires staff approval before sending.",
+        payload_key="intake_reminder_draft",
+        source_payload=communication_draft_to_dict(draft),
+        draft_text=draft.body,
+    )
     return communication_draft_to_dict(draft)
 
 
@@ -1236,6 +2126,8 @@ def complete_intake_item(session: Session, item_id: str, notes: str | None = Non
         before=before,
         after=intake_item_to_dict(item),
     )
+    if item.referral_id:
+        _refresh_referral_intake_status(session, item.referral_id)
     return intake_item_to_dict(item)
 
 
@@ -1247,17 +2139,20 @@ def complete_consent_record(session: Session, consent_id: str, expires_at: datet
     consent.status = "completed"
     consent.expires_at = expires_at
     consent.updated_at = utc_now()
+    touched_referrals: set[str] = set()
     for item in session.scalars(
         select(IntakeChecklistItem).where(
             IntakeChecklistItem.tenant_id == consent.tenant_id,
             IntakeChecklistItem.patient_id == consent.patient_id,
             IntakeChecklistItem.item_type == "consent",
-            IntakeChecklistItem.status != "completed",
+            IntakeChecklistItem.status.notin_(["completed", "waived"]),
         )
     ):
         if item.item_key == consent.scope or item.label.lower().startswith(consent.scope.lower()):
             item.status = "completed"
             item.completed_at = utc_now()
+            if item.referral_id:
+                touched_referrals.add(item.referral_id)
     write_audit(
         session,
         tenant_id=consent.tenant_id,
@@ -1267,6 +2162,8 @@ def complete_consent_record(session: Session, consent_id: str, expires_at: datet
         before=before,
         after=consent_record_to_dict(consent),
     )
+    for referral_id in touched_referrals:
+        _refresh_referral_intake_status(session, referral_id)
     return consent_record_to_dict(consent)
 
 
@@ -1308,11 +2205,12 @@ def save_questionnaire_response(
             IntakeChecklistItem.tenant_id == referral.tenant_id,
             IntakeChecklistItem.referral_id == referral.id,
             IntakeChecklistItem.item_type == "questionnaire",
-            IntakeChecklistItem.status != "completed",
+            IntakeChecklistItem.status.notin_(["completed", "waived"]),
         )
     ):
         item.status = "completed"
         item.completed_at = utc_now()
+    _refresh_referral_intake_status(session, referral.id)
     write_audit(
         session,
         tenant_id=referral.tenant_id,
@@ -1347,8 +2245,8 @@ def generate_prep_brief(session: Session, referral_id: str, therapist_id: str | 
     appointments = list(
         session.scalars(select(Appointment).where(Appointment.referral_id == referral.id).order_by(Appointment.starts_at))
     )
-    missing_items = [item.label for item in items if item.status != "completed"]
-    completed_items = [item.label for item in items if item.status == "completed"]
+    missing_items = [item.label for item in items if not _intake_done(item.status)]
+    completed_items = [item.label for item in items if _intake_done(item.status)]
     lines = [
         f"# Therapist Prep Brief: {referral.patient_name or patient.display_name or 'Referral'}",
         "",
@@ -1391,6 +2289,13 @@ def generate_prep_brief(session: Session, referral_id: str, therapist_id: str | 
     )
     session.add(brief)
     session.flush()
+    if not _maybe_mark_first_session_ready(session, referral):
+        transition_referral_status(
+            session,
+            referral,
+            "prep_brief_ready",
+            reason="Therapist prep brief generated.",
+        )
     write_audit(
         session,
         tenant_id=referral.tenant_id,
@@ -1910,7 +2815,7 @@ def update_referral_from_result(session: Session, run: WorkflowRun) -> None:
     result = run.result or {}
     outputs = result.get("outputs") or {}
 
-    referral.status = _referral_status_from_result(result, run.status)
+    referral.status = _referral_status_from_result(result, run.status, run.approvals)
     referral.workflow_run_id = run.id
     referral.updated_at = utc_now()
 
@@ -1978,19 +2883,12 @@ def persist_human_review_tasks(session: Session, run: WorkflowRun) -> None:
     outputs = result.get("outputs") or {}
     for item in result.get("human_review_queue") or []:
         task_type = item.get("gate") or "admin_review"
+        if task_type == "clinical_review":
+            task_type = "clinical_risk_review"
         payload_key = item.get("payload_key") or "workflow"
-        exists = session.scalar(
-            select(HumanReviewTask).where(
-                HumanReviewTask.workflow_run_id == run.id,
-                HumanReviewTask.task_type == task_type,
-                HumanReviewTask.payload_key == payload_key,
-                HumanReviewTask.status == "open",
-            )
-        )
-        if exists is not None:
-            continue
         source_payload = outputs.get(payload_key) or item
-        task = HumanReviewTask(
+        create_review_task(
+            session,
             tenant_id=run.tenant_id,
             workflow_run_id=run.id,
             referral_id=run.referral_id,
@@ -2001,19 +2899,11 @@ def persist_human_review_tasks(session: Session, run: WorkflowRun) -> None:
             source_payload=json_safe(source_payload),
             draft_text=_draft_text_for_payload(source_payload),
         )
-        session.add(task)
-        session.flush()
-        write_audit(
-            session,
-            tenant_id=run.tenant_id,
-            action="create",
-            entity_type="human_review_task",
-            entity_id=task.id,
-            after=review_task_to_dict(task),
-        )
 
 
 def approval_payload_for_task(session: Session, task: HumanReviewTask) -> dict[str, Any] | None:
+    if not task.workflow_run_id:
+        return None
     run = session.get(WorkflowRun, task.workflow_run_id)
     if run is None:
         return None
@@ -2099,13 +2989,18 @@ def event_to_dict(event: WorkflowEvent) -> dict[str, Any]:
 
 
 def referral_summary(referral: Referral) -> dict[str, Any]:
+    status = canonical_referral_status(referral.status)
+    next_action = next_action_for_referral(referral)
     return {
         "id": referral.id,
         "tenant_id": referral.tenant_id,
         "patient_id": referral.patient_id,
         "workflow_run_id": referral.workflow_run_id,
         "source_channel": referral.source_channel,
-        "status": referral.status,
+        "status": status,
+        "status_label": status_label(status),
+        "next_action": next_action,
+        "next_action_label": next_action_label(next_action),
         "patient_name": referral.patient_name,
         "date_of_birth": referral.date_of_birth,
         "contact_email": referral.contact_email,
@@ -2120,6 +3015,7 @@ def referral_summary(referral: Referral) -> dict[str, Any]:
         "risk_present": referral.risk_present,
         "match_summary": json_safe(referral.match_summary),
         "duplicate_candidates": referral.duplicate_candidates,
+        "secondary_flags": secondary_flags_for_referral(referral),
         "communication_draft_id": referral.communication_draft_id,
         "created_at": iso_or_none(referral.created_at),
         "updated_at": iso_or_none(referral.updated_at),
@@ -2501,7 +3397,7 @@ def _referral_from_import_row(
         tenant_id=tenant_id,
         source_channel=_row_get(row, "source_channel") or source_channel,
         raw_text=raw_text,
-        status="new",
+        status="new_referral",
         patient_name=_row_get(row, "patient_name", "name"),
         date_of_birth=_row_get(row, "date_of_birth", "dob"),
         contact_email=_row_get(row, "contact_email", "email"),
@@ -2514,6 +3410,7 @@ def _referral_from_import_row(
     )
     session.add(referral)
     session.flush()
+    _ensure_admin_missing_info_task(session, referral)
     write_audit(
         session,
         tenant_id=tenant_id,
@@ -2915,6 +3812,116 @@ def _complete_matching_consent_for_item(session: Session, item: IntakeChecklistI
             )
 
 
+def _ensure_admin_missing_info_task(session: Session, referral: Referral) -> HumanReviewTask | None:
+    missing_fields = list(referral.missing_fields or [])
+    if not missing_fields:
+        return None
+    return create_review_task(
+        session,
+        tenant_id=referral.tenant_id,
+        workflow_run_id=referral.workflow_run_id,
+        referral_id=referral.id,
+        patient_id=referral.patient_id,
+        task_type="admin_missing_info_review",
+        reason="Referral has missing information that must be resolved before the admin workflow can continue.",
+        payload_key="missing_information",
+        source_payload={
+            "missing_fields": missing_fields,
+            "patient_name": referral.patient_name,
+            "contact_email": referral.contact_email,
+            "contact_phone": referral.contact_phone,
+        },
+    )
+
+
+def _referral_documents(session: Session, referral: Referral, document_type: str) -> list[dict[str, Any]]:
+    if not referral.patient_id:
+        return []
+    documents = [
+        document
+        for document in session.scalars(
+            select(Document)
+            .where(
+                Document.tenant_id == referral.tenant_id,
+                Document.patient_id == referral.patient_id,
+                Document.document_type == document_type,
+            )
+            .order_by(Document.created_at.desc())
+        )
+        if (document.metadata_json or {}).get("referral_id") == referral.id
+    ]
+    return [document_to_dict(document) for document in documents]
+
+
+def _clean_missing_info_updates(updates: dict[str, Any]) -> dict[str, str]:
+    allowed = {
+        "patient_name",
+        "date_of_birth",
+        "dob",
+        "contact_email",
+        "email",
+        "contact_phone",
+        "phone",
+        "insurer",
+        "referring_entity",
+        "language_preference",
+        "modality_preference",
+    }
+    clean: dict[str, str] = {}
+    for key, value in updates.items():
+        normalised_key = str(key or "").strip()
+        text = str(value or "").strip()
+        if normalised_key in allowed and text:
+            clean[normalised_key] = text
+    return clean
+
+
+def _apply_referral_updates(referral: Referral, updates: dict[str, str]) -> None:
+    field_map = {
+        "dob": "date_of_birth",
+        "email": "contact_email",
+        "phone": "contact_phone",
+    }
+    for key, value in updates.items():
+        target = field_map.get(key, key)
+        if hasattr(referral, target):
+            setattr(referral, target, value)
+
+
+def _remaining_missing_fields(existing: list[str], updates: dict[str, str]) -> list[str]:
+    resolved = set(updates.keys())
+    if "dob" in resolved:
+        resolved.add("date_of_birth")
+    if "email" in resolved:
+        resolved.add("contact_email")
+    if "phone" in resolved:
+        resolved.add("contact_phone")
+    if {"contact_phone", "date_of_birth", "phone", "dob"} & resolved:
+        resolved.add("contact_phone_or_date_of_birth")
+    remaining = [field for field in existing or [] if field not in resolved]
+    return list(dict.fromkeys(remaining))
+
+
+def _next_admin_gate_status(referral: Referral) -> str:
+    if referral.missing_fields:
+        return "needs_admin_review"
+    if referral.duplicate_candidates:
+        return "needs_admin_review"
+    if referral.risk_present or referral.urgency in {"elevated", "urgent", "unknown"} or referral.risk_category == "unknown":
+        return "needs_clinical_review"
+    return "ready_for_matching"
+
+
+def _latest_referral_id_for_patient(session: Session, tenant_id: str, patient_id: str) -> str | None:
+    referral = session.scalar(
+        select(Referral)
+        .where(Referral.tenant_id == tenant_id, Referral.patient_id == patient_id)
+        .order_by(Referral.updated_at.desc())
+        .limit(1)
+    )
+    return referral.id if referral else None
+
+
 def _normal(value: Any) -> str:
     return str(value or "").strip().lower().replace("_", " ")
 
@@ -2985,16 +3992,100 @@ def _select_intake_template(session: Session, referral: Referral, template_id: s
     return sorted(candidates, key=_score, reverse=True)[0]
 
 
+def _intake_done(status: str | None) -> bool:
+    return status in {"completed", "waived"}
+
+
 def _intake_status(items: list[IntakeChecklistItem], consents: list[ConsentRecord]) -> str:
     if not items and not consents:
         return "not_started"
-    missing_items = [item for item in items if item.status != "completed"]
-    missing_consents = [consent for consent in consents if consent.status != "completed"]
+    missing_items = [item for item in items if not _intake_done(item.status)]
+    missing_consents = [consent for consent in consents if not _intake_done(consent.status)]
     if not missing_items and not missing_consents:
         return "complete"
     if any(item.status == "expired" for item in items) or any(consent.status == "expired" for consent in consents):
         return "expired_items"
     return "missing_items"
+
+
+def _first_session_readiness_blockers(session: Session, referral: Referral) -> list[str]:
+    status = canonical_referral_status(referral.status)
+    if status in {"closed_declined", "closed_no_response", "closed_not_suitable"}:
+        return ["Referral is closed."]
+    blockers: list[str] = []
+    confirmed = session.scalar(
+        select(func.count(Appointment.id)).where(
+            Appointment.referral_id == referral.id,
+            Appointment.status == "confirmed",
+        )
+    )
+    if not confirmed:
+        blockers.append("No confirmed appointment.")
+
+    items = list(session.scalars(select(IntakeChecklistItem).where(IntakeChecklistItem.referral_id == referral.id)))
+    consents = []
+    if referral.patient_id:
+        consents = list(
+            session.scalars(
+                select(ConsentRecord).where(
+                    ConsentRecord.tenant_id == referral.tenant_id,
+                    ConsentRecord.patient_id == referral.patient_id,
+                )
+            )
+        )
+    intake_status = _intake_status(items, consents)
+    if intake_status != "complete":
+        blockers.append("Required intake is not complete or waived.")
+
+    prep_briefs = session.scalar(
+        select(func.count(TherapistPrepBrief.id)).where(TherapistPrepBrief.referral_id == referral.id)
+    )
+    if not prep_briefs:
+        blockers.append("Therapist prep brief is not generated.")
+    return blockers
+
+
+def _maybe_mark_first_session_ready(session: Session, referral: Referral) -> bool:
+    if canonical_referral_status(referral.status) in {"closed_declined", "closed_no_response", "closed_not_suitable"}:
+        return False
+    blockers = _first_session_readiness_blockers(session, referral)
+    if blockers:
+        return False
+    transition_referral_status(
+        session,
+        referral,
+        "first_session_ready",
+        reason="Appointment, intake, and prep brief gates are complete.",
+    )
+    return True
+
+
+def _refresh_referral_intake_status(session: Session, referral_id: str) -> None:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        return
+    status = canonical_referral_status(referral.status)
+    if status in {"first_session_ready", "closed_declined", "closed_no_response", "closed_not_suitable"}:
+        return
+    items = list(session.scalars(select(IntakeChecklistItem).where(IntakeChecklistItem.referral_id == referral.id)))
+    consents = []
+    if referral.patient_id:
+        consents = list(
+            session.scalars(
+                select(ConsentRecord).where(
+                    ConsentRecord.tenant_id == referral.tenant_id,
+                    ConsentRecord.patient_id == referral.patient_id,
+                )
+            )
+        )
+    intake_status = _intake_status(items, consents)
+    if intake_status == "complete":
+        if _maybe_mark_first_session_ready(session, referral):
+            return
+        if status != "prep_brief_ready":
+            transition_referral_status(session, referral, "intake_complete", reason="Required intake is complete.")
+    elif intake_status != "not_started":
+        transition_referral_status(session, referral, "intake_incomplete", reason="Required intake remains incomplete.")
 
 
 def _score_questionnaire(answers: dict[str, Any]) -> dict[str, Any]:
@@ -3032,7 +4123,7 @@ def _merge_missing_fields(existing: list[str], incoming: list[str]) -> list[str]
     return merged
 
 
-def _referral_status_from_result(result: dict[str, Any], run_status: str) -> str:
+def _referral_status_from_result(result: dict[str, Any], run_status: str, approvals: dict[str, Any] | None = None) -> str:
     if run_status == "failed" or result.get("errors"):
         return "needs_admin_review"
     review_gates = {item.get("gate") for item in result.get("human_review_queue") or []}
@@ -3041,11 +4132,13 @@ def _referral_status_from_result(result: dict[str, Any], run_status: str) -> str
     if "clinical_review" in review_gates or risk.get("required_handoff") in {"clinician_review", "director_review"}:
         return "needs_clinical_review"
     if "match_approval" in review_gates:
-        return "match_pending_approval"
+        return "match_recommended"
     if "send_approval" in review_gates:
-        return "outreach_draft_pending"
+        return "awaiting_patient_contact"
+    if run_status == "completed" and (approvals or {}).get("send_approval"):
+        return "contact_sent"
     if run_status == "completed":
-        return "ready_to_contact"
+        return "awaiting_patient_contact"
     return "needs_admin_review"
 
 

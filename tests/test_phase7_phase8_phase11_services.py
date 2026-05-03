@@ -31,7 +31,7 @@ def test_phase7_report_validation_export_phase8_import_and_phase11_feedback() ->
             tenant_id=tenant.id,
             source_channel="webform",
             raw_text="Adult anxiety referral with sleep impairment and work stress.",
-            status="contacted",
+            status="appointment_confirmed",
             patient_name="Phase Seven Patient",
         )
         session.add(referral)

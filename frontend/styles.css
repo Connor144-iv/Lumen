@@ -505,6 +505,14 @@ form {
   grid-column: span 2;
 }
 
+.filter-form {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  border-bottom: 1px solid var(--border);
+  padding: 12px 16px;
+}
+
 label {
   display: grid;
   gap: 7px;
@@ -724,7 +732,13 @@ textarea:focus {
 .record-item[data-status="ok"],
 .record-item[data-status="active"],
 .record-item[data-status="completed"],
-.record-item[data-status="ready_to_contact"],
+.record-item[data-status="match_approved"],
+.record-item[data-status="contact_sent"],
+.record-item[data-status="appointment_confirmed"],
+.record-item[data-status="intake_complete"],
+.record-item[data-status="prep_brief_ready"],
+.record-item[data-status="first_session_ready"],
+.record-item[data-status="waived"],
 .record-item[data-status="approved_pending_send"],
 .record-item[data-status="signed_off"],
 .record-item[data-status="approved"] {
@@ -733,11 +747,17 @@ textarea:focus {
 
 .record-item[data-status="queued"],
 .record-item[data-status="running"],
-.record-item[data-status="normalizing"],
+.record-item[data-status="new_referral"],
+.record-item[data-status="normalising"],
+.record-item[data-status="needs_admin_review"],
 .record-item[data-status="needs_review"],
 .record-item[data-status="needs_human_review"],
-.record-item[data-status="match_pending_approval"],
-.record-item[data-status="outreach_draft_pending"],
+.record-item[data-status="match_recommended"],
+.record-item[data-status="slot_options_ready"],
+.record-item[data-status="awaiting_patient_contact"],
+.record-item[data-status="awaiting_patient_reply"],
+.record-item[data-status="waiting_for_missing_info"],
+.record-item[data-status="intake_incomplete"],
 .record-item[data-status="pending_approval"],
 .record-item[data-status="pending_signoff"],
 .record-item[data-status="open"],
@@ -746,7 +766,10 @@ textarea:focus {
   border-left-color: var(--warning);
 }
 
-.record-item[data-status="needs_clinical_review"] {
+.record-item[data-status="needs_clinical_review"],
+.record-item[data-status="clinical_escalation_review"],
+.record-item[data-status="patient_reply"],
+.record-item[data-status="missing_info_reply"] {
   border-left-color: var(--info);
 }
 
@@ -757,7 +780,10 @@ textarea:focus {
 .record-item[data-status="excluded"],
 .record-item[data-status="rejected"],
 .record-item[data-status="changes_requested"],
-.record-item[data-status="escalated"] {
+.record-item[data-status="escalated"],
+.record-item[data-status="closed_declined"],
+.record-item[data-status="closed_no_response"],
+.record-item[data-status="closed_not_suitable"] {
   border-left-color: var(--danger);
 }
 
@@ -964,6 +990,7 @@ pre {
   .metric-grid,
   .form-grid,
   .segmented,
+  .filter-form,
   .inline-form,
   .therapist-grid,
   .health-grid {

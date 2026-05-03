@@ -27,9 +27,15 @@ from backend.lumen_web.repositories import (
     approve_session_note,
     create_clinical_library_record,
     create_email_referral,
+    create_clinical_escalation_review,
+    create_duplicate_resolution_review,
     create_referral_document,
     create_session_note,
+    create_suitability_review,
     create_therapist,
+    draft_first_contact_message,
+    draft_intake_packet,
+    draft_missing_info_request,
     draft_feedback_metrics,
     export_report_draft,
     deterministic_match_for_referral,
@@ -41,6 +47,7 @@ from backend.lumen_web.repositories import (
     import_referral_batch,
     integration_health,
     intake_workspace,
+    list_intake_tracker,
     list_referral_import_batches,
     list_referral_import_errors,
     list_appointments,
@@ -54,7 +61,11 @@ from backend.lumen_web.repositories import (
     propose_appointment_slots,
     referral_detail,
     record_draft_feedback,
+    record_missing_info_reply,
+    record_simulated_patient_reply,
     review_task_to_dict,
+    request_consent_exception,
+    request_intake_item_exception,
     save_questionnaire_response,
     search_retrieval_chunks,
     security_context,
@@ -128,6 +139,10 @@ class CompleteConsentRequest(BaseModel):
     expires_at: str | None = None
 
 
+class IntakeExceptionRequest(BaseModel):
+    reason: str = "Authorised exception requested by clinic admin."
+
+
 class QuestionnaireRequest(BaseModel):
     questionnaire_name: str
     answers: dict[str, Any]
@@ -135,6 +150,37 @@ class QuestionnaireRequest(BaseModel):
 
 class PrepBriefRequest(BaseModel):
     therapist_id: str | None = None
+
+
+class MissingInfoDraftRequest(BaseModel):
+    recipient: Literal["patient", "referrer", "internal_admin"] = "patient"
+    note: str = ""
+
+
+class MissingInfoReplyRequest(BaseModel):
+    source: Literal["patient", "referrer", "internal_admin"] = "patient"
+    updates: dict[str, Any] = Field(default_factory=dict)
+    notes: str = ""
+
+
+class ClinicalReviewRequest(BaseModel):
+    reason: str = "Clinical risk or suitability review is required before matching."
+
+
+class ReviewCreateRequest(BaseModel):
+    reason: str = ""
+    candidate_referral_id: str | None = None
+
+
+class DraftMessageRequest(BaseModel):
+    note: str = ""
+    template_id: str | None = None
+
+
+class PatientReplyRequest(BaseModel):
+    reply_type: Literal["accepted_slot", "declined", "alternative_requested", "asked_question", "unclear", "no_response"]
+    appointment_id: str | None = None
+    notes: str = ""
 
 
 class SessionNoteRequest(BaseModel):
@@ -302,6 +348,93 @@ def appointment_proposals(referral_id: str, body: AppointmentProposalRequest) ->
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/referrals/{referral_id}/missing-info-draft", status_code=201)
+def referral_missing_info_draft(referral_id: str, body: MissingInfoDraftRequest) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            return {"draft": draft_missing_info_request(session, referral_id, recipient=body.recipient, note=body.note)}
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/referrals/{referral_id}/missing-info-replies", status_code=201)
+def referral_missing_info_reply(referral_id: str, body: MissingInfoReplyRequest) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            return record_missing_info_reply(
+                session,
+                referral_id,
+                source=body.source,
+                updates=body.updates,
+                notes=body.notes,
+            )
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/referrals/{referral_id}/clinical-review", status_code=201)
+def referral_clinical_review(referral_id: str, body: ClinicalReviewRequest) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            task = create_clinical_escalation_review(session, referral_id, reason=body.reason)
+            return {"task": review_task_to_dict(task)}
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/referrals/{referral_id}/duplicate-review", status_code=201)
+def referral_duplicate_review(referral_id: str, body: ReviewCreateRequest) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            task = create_duplicate_resolution_review(
+                session,
+                referral_id,
+                candidate_referral_id=body.candidate_referral_id,
+                reason=body.reason or "Potential duplicate referral requires admin resolution before matching.",
+            )
+            return {"task": review_task_to_dict(task)}
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/referrals/{referral_id}/suitability-review", status_code=201)
+def referral_suitability_review(referral_id: str, body: ReviewCreateRequest) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            task = create_suitability_review(
+                session,
+                referral_id,
+                reason=body.reason or "Suitability review is required before therapist matching.",
+            )
+            return {"task": review_task_to_dict(task)}
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/referrals/{referral_id}/contact-draft", status_code=201)
+def referral_contact_draft(referral_id: str, body: DraftMessageRequest) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            return {"draft": draft_first_contact_message(session, referral_id, note=body.note)}
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/referrals/{referral_id}/patient-replies", status_code=201)
+def referral_patient_reply(referral_id: str, body: PatientReplyRequest) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            return record_simulated_patient_reply(
+                session,
+                referral_id=referral_id,
+                reply_type=body.reply_type,
+                appointment_id=body.appointment_id,
+                notes=body.notes,
+            )
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/appointments")
 def appointments(
     tenant_id: str | None = None,
@@ -414,6 +547,12 @@ def intake_templates(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
         return {"templates": list_intake_templates(session, tenant_id=tenant_id)}
 
 
+@app.get("/api/intake/tracker")
+def intake_tracker(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
+    with session_scope() as session:
+        return {"items": list_intake_tracker(session, tenant_id=tenant_id)}
+
+
 @app.get("/api/referrals/{referral_id}/intake")
 def referral_intake(referral_id: str) -> dict[str, Any]:
     try:
@@ -428,6 +567,22 @@ def referral_intake_start(referral_id: str, body: StartIntakeRequest) -> dict[st
     try:
         with session_scope() as session:
             return start_intake_for_referral(session, referral_id, body.template_id)
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/referrals/{referral_id}/intake-packet-draft", status_code=201)
+def referral_intake_packet_draft(referral_id: str, body: DraftMessageRequest) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            return {
+                "draft": draft_intake_packet(
+                    session,
+                    referral_id,
+                    note=body.note,
+                    template_id=body.template_id,
+                )
+            }
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -478,6 +633,16 @@ def intake_item_complete(item_id: str, body: CompleteIntakeItemRequest) -> dict[
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@app.post("/api/intake/items/{item_id}/exception-request", status_code=201)
+def intake_item_exception_request(item_id: str, body: IntakeExceptionRequest) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            task = request_intake_item_exception(session, item_id, reason=body.reason)
+            return {"task": review_task_to_dict(task)}
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/consent-records/{consent_id}/complete")
 def consent_complete(consent_id: str, body: CompleteConsentRequest) -> dict[str, Any]:
     try:
@@ -486,6 +651,16 @@ def consent_complete(consent_id: str, body: CompleteConsentRequest) -> dict[str,
             expires_at = datetime.fromisoformat(body.expires_at.replace("Z", "+00:00"))
         with session_scope() as session:
             return {"consent": complete_consent_record(session, consent_id, expires_at=expires_at)}
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/consent-records/{consent_id}/exception-request", status_code=201)
+def consent_exception_request(consent_id: str, body: IntakeExceptionRequest) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            task = request_consent_exception(session, consent_id, reason=body.reason)
+            return {"task": review_task_to_dict(task)}
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
