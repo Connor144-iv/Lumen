@@ -5,10 +5,10 @@ const routes = {
   "/referrals": { page: "referrals", title: "Referral queue", label: "Admin intake" },
   "/review": { page: "review", title: "Review inbox", label: "Governance" },
   "/therapists": { page: "therapists", title: "Therapists", label: "Network" },
-  "/intake": { page: "intake", title: "Intake", label: "Pre-session" },
+  "/intake": { page: "intake", title: "Intake & scheduling", label: "Pre-session" },
   "/clinical": { page: "clinical", title: "Clinical", label: "Documentation" },
   "/integrations": { page: "integrations", title: "Integrations", label: "Channels" },
-  "/system": { page: "system", title: "System", label: "Runtime" },
+  "/system": { page: "system", title: "System", label: "Developer / demo" },
 };
 
 const form = document.querySelector("#workflow-form");
@@ -17,6 +17,7 @@ const resetButton = document.querySelector("#reset-button");
 const exportButton = document.querySelector("#export-button");
 const refreshHealthButton = document.querySelector("#refresh-health-button");
 const refreshProductButton = document.querySelector("#refresh-product-button");
+const viewTraceLink = document.querySelector("#view-trace-link");
 const statusStrip = document.querySelector("#status-strip");
 const monitorTitle = document.querySelector("#monitor-title");
 const jobIdLabel = document.querySelector("#job-id-label");
@@ -34,6 +35,7 @@ const therapistList = document.querySelector("#therapist-list");
 const therapistForm = document.querySelector("#therapist-form");
 const intakeWorkspace = document.querySelector("#intake-workspace");
 const intakeTrackerList = document.querySelector("#intake-tracker-list");
+const schedulingList = document.querySelector("#scheduling-list");
 const clinicalWorkspace = document.querySelector("#clinical-workspace");
 const sessionNoteForm = document.querySelector("#session-note-form");
 const reportDraftForm = document.querySelector("#report-draft-form");
@@ -48,12 +50,14 @@ const pageTitle = document.querySelector("#page-title");
 const sectionLabel = document.querySelector("#section-label");
 const recentWorkflowList = document.querySelector("#recent-workflow-list");
 const overviewReferralList = document.querySelector("#overview-referral-list");
+const overviewActionList = document.querySelector("#overview-action-list");
 const overviewReviewList = document.querySelector("#overview-review-list");
 const metricReferrals = document.querySelector("#metric-referrals");
 const metricReviews = document.querySelector("#metric-reviews");
 const metricTherapists = document.querySelector("#metric-therapists");
 const metricModels = document.querySelector("#metric-models");
 const metricWorkflows = document.querySelector("#metric-workflows");
+const metricActionQueue = document.querySelector("#metric-action-queue");
 
 let activeSource = null;
 let pollTimer = null;
@@ -62,6 +66,7 @@ let latestReferrals = [];
 let latestReviewTasks = [];
 let latestTherapists = [];
 let latestWorkflows = [];
+let latestAppointments = [];
 let selectedReferralId = null;
 
 document.querySelectorAll("[data-nav]").forEach((link) => {
@@ -96,6 +101,7 @@ form.addEventListener("submit", async (event) => {
       throw new Error(body.detail || "Unable to start workflow.");
     }
     jobIdLabel.textContent = body.job_id;
+    setActiveJob(body.job_id);
     openEventStream(body.job_id, body.events_url);
     startPolling(body.status_url);
     await refreshProductWorkspace();
@@ -475,6 +481,7 @@ async function refreshProductWorkspace() {
     loadReferrals(),
     loadReviewTasks(),
     loadIntakeTracker(),
+    loadScheduling(),
     loadTherapists(),
     loadWorkflows(),
     loadClinicalLibrary(),
@@ -509,6 +516,8 @@ async function loadReferrals() {
   metricReferrals.textContent = latestReferrals.length;
 
   renderReferralLists();
+  renderSchedulingList();
+  renderOverviewActionQueue();
 }
 
 function renderReferralLists() {
@@ -517,6 +526,34 @@ function renderReferralLists() {
   renderCollection(overviewReferralList, latestReferrals.slice(0, 4), "No referrals yet.", (referral) =>
     referralCard(referral, true),
   );
+}
+
+function renderOverviewActionQueue() {
+  if (!overviewActionList) return;
+  const actionableNextActions = new Set([
+    "review_referral",
+    "review_missing_info",
+    "clinical_review",
+    "run_matching",
+    "approve_match",
+    "approve_slots",
+    "approve_contact",
+    "confirm_appointment",
+    "start_intake",
+    "complete_intake",
+    "generate_prep_brief",
+  ]);
+
+  const actionable = (latestReferrals || [])
+    .filter((referral) => actionableNextActions.has(referral.next_action))
+    .sort((a, b) => new Date(b.updated_at || 0).getTime() - new Date(a.updated_at || 0).getTime())
+    .slice(0, 10);
+
+  if (metricActionQueue) {
+    metricActionQueue.textContent = actionable.length;
+  }
+
+  renderCollection(overviewActionList, actionable, "No items need action right now.", (referral) => referralCard(referral, true));
 }
 
 function filterReferrals(referrals) {
@@ -535,15 +572,18 @@ function filterReferrals(referrals) {
 }
 
 function referralCard(referral, jumpToDetail) {
+  const title = referral.patient_name || referral.contact_email || `Referral ${shortId(referral.id)}`;
+  const contact = [referral.contact_email, referral.contact_phone].filter(Boolean).join(" | ");
   const item = recordItem({
-    title: referral.patient_name || referral.input_summary || "Unnamed referral",
+    title,
     status: referral.status,
-    body: referral.contact_email || referral.insurer || referral.source_channel,
+    body: referral.next_action_label || referral.next_action || "Next action pending",
     meta: [
       referral.status_label || referral.status,
       referral.source_channel,
+      contact || referral.insurer,
       referral.risk_category || "risk pending",
-      referral.next_action_label,
+      ...(referral.secondary_flags || []),
       formatDate(referral.updated_at),
     ],
   });
@@ -564,6 +604,15 @@ async function loadReferralDetail(referralId) {
 
   const header = document.createElement("div");
   header.className = "detail-stack";
+
+  const openGates = (referral.review_tasks || []).filter((task) => task.status === "open").length;
+  const workflowState = document.createElement("div");
+  workflowState.append(
+    keyValue("Status", referral.status_label || referral.status),
+    keyValue("Next action", referral.next_action_label || referral.next_action || "Pending"),
+    keyValue("Open gates", openGates ? `${openGates} review task${openGates === 1 ? "" : "s"}` : "None"),
+  );
+
   const actions = document.createElement("div");
   actions.className = "actions tight";
   actions.append(
@@ -582,13 +631,8 @@ async function loadReferralDetail(referralId) {
   );
   header.append(
     heading(referral.patient_name || "Unnamed referral"),
-    metaRow([
-      referral.status_label || referral.status,
-      referral.next_action_label,
-      referral.source_channel,
-      referral.urgency || "urgency pending",
-      ...(referral.secondary_flags || []),
-    ]),
+    metaRow([referral.source_channel, referral.urgency || "urgency pending", ...(referral.secondary_flags || [])]),
+    workflowState,
     keyValue("Contact", [referral.contact_email, referral.contact_phone].filter(Boolean).join(" | ") || "Missing"),
     actions,
   );
@@ -653,7 +697,7 @@ async function loadReferralDetail(referralId) {
   rawText.textContent = referral.raw_text || "";
   raw.append(rawSummary, rawText);
 
-  const activitySection = operationSection("Activity and workflow traces");
+  const activitySection = operationSection("Workflow traces (dev)");
   renderSimpleList(
     activitySection.body,
     referral.workflow_runs || [],
@@ -685,6 +729,54 @@ async function loadReferralDetail(referralId) {
     activitySection.section,
   );
   await loadReferralOperations(referral.id, appointmentSection.body, intakeSection.body, briefSection.body);
+}
+
+async function loadScheduling() {
+  if (!schedulingList) return;
+  const response = await fetch("/api/appointments");
+  if (!response.ok) return;
+  const data = await readResponseBody(response);
+  latestAppointments = data.appointments || [];
+  renderSchedulingList();
+}
+
+function renderSchedulingList() {
+  if (!schedulingList) return;
+  const referralsById = new Map((latestReferrals || []).map((referral) => [referral.id, referral]));
+  const appointments = (latestAppointments || [])
+    .filter((appointment) => appointment.status !== "cancelled")
+    .slice(0, 12);
+
+  renderCollection(schedulingList, appointments, "No appointments scheduled yet.", (appointment) =>
+    appointmentCard(appointment, referralsById),
+  );
+}
+
+function appointmentCard(appointment, referralsById) {
+  const referral = appointment.referral_id ? referralsById.get(appointment.referral_id) : null;
+  const title = referral?.patient_name || (appointment.referral_id ? `Referral ${shortId(appointment.referral_id)}` : "Appointment");
+  const starts = appointment.starts_at ? formatDate(appointment.starts_at) : "Time pending";
+  const ends = appointment.ends_at ? formatDate(appointment.ends_at) : "";
+  const body = ends ? `${starts} → ${ends}` : starts;
+  const item = recordItem({
+    title,
+    status: appointment.status,
+    body,
+    meta: [
+      referral?.status_label || referral?.status,
+      referral?.next_action_label,
+      appointment.therapist_id ? `therapist ${shortId(appointment.therapist_id)}` : null,
+      appointment.source,
+    ],
+  });
+  if (appointment.referral_id) {
+    item.classList.add("clickable");
+    item.addEventListener("click", async () => {
+      navigate("/referrals");
+      await loadReferralDetail(appointment.referral_id);
+    });
+  }
+  return item;
 }
 
 async function loadReferralOperations(referralId, appointmentBody, intakeBody, briefBody) {
@@ -1048,6 +1140,8 @@ async function loadReviewTasks() {
       meta: [task.payload_key, task.referral_id ? `referral ${shortId(task.referral_id)}` : "no referral"],
     }),
   );
+
+  renderOverviewActionQueue();
 }
 
 async function loadIntakeTracker() {
@@ -1122,14 +1216,8 @@ async function submitReviewAction(taskId, action, extra = {}) {
   });
   const body = await readResponseBody(response);
   if (!response.ok) {
-    navigate("/workflows");
-    appendTimelineEvent({
-      type: "error",
-      status: "failed",
-      node: "review",
-      message: body.detail || "Review action failed.",
-      tools: [],
-    });
+    setStatus("failed", "Review action failed");
+    window.alert(body.detail || "Review action failed.");
     return;
   }
   await refreshProductWorkspace();
@@ -1137,10 +1225,10 @@ async function submitReviewAction(taskId, action, extra = {}) {
     await loadReferralDetail(selectedReferralId);
   }
   if (body.resumed_job) {
-    navigate("/workflows");
     resetRunState();
     jobIdLabel.textContent = body.resumed_job.job_id;
-    setStatus(body.resumed_job.status, statusLabel(body.resumed_job.status));
+    setActiveJob(body.resumed_job.job_id);
+    setStatus(body.resumed_job.status, `${statusLabel(body.resumed_job.status)} · ${shortId(body.resumed_job.job_id)}`);
     openEventStream(body.resumed_job.job_id, `/api/events/${body.resumed_job.job_id}`);
     startPolling(`/api/status/${body.resumed_job.job_id}`);
   }
@@ -1692,6 +1780,17 @@ function setStatus(status, label) {
   monitorTitle.textContent = label || "Idle";
 }
 
+function setActiveJob(jobId) {
+  if (!viewTraceLink) return;
+  if (!jobId) {
+    viewTraceLink.hidden = true;
+    viewTraceLink.textContent = "View trace";
+    return;
+  }
+  viewTraceLink.hidden = false;
+  viewTraceLink.textContent = `View trace ${shortId(jobId)}`;
+}
+
 function statusLabel(status) {
   const labels = {
     queued: "Queued",
@@ -1717,6 +1816,7 @@ function resetRunState() {
   resultJson.textContent = "";
   exportButton.disabled = true;
   jobIdLabel.textContent = "No job";
+  setActiveJob(null);
 }
 
 function closeEventStream() {
