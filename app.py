@@ -59,7 +59,9 @@ from backend.lumen_web.repositories import (
     list_workflow_runs,
     patient_workspace,
     propose_appointment_slots,
+    referral_journey_dashboard,
     referral_detail,
+    referral_workbench_state,
     record_draft_feedback,
     record_missing_info_reply,
     record_simulated_patient_reply,
@@ -315,11 +317,26 @@ def referrals(tenant_id: str | None = None, status: str | None = None) -> dict[s
         return {"referrals": list_referrals(session, tenant_id=tenant_id, status=status)}
 
 
+@app.get("/api/referral-journey")
+def referral_journey(tenant_id: str | None = None) -> dict[str, Any]:
+    with session_scope() as session:
+        return referral_journey_dashboard(session, tenant_id=tenant_id)
+
+
 @app.get("/api/referrals/{referral_id}")
 def referral(referral_id: str) -> dict[str, Any]:
     try:
         with session_scope() as session:
             return referral_detail(session, referral_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/referrals/{referral_id}/workbench")
+def referral_workbench(referral_id: str) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            return {"workbench_state": referral_workbench_state(session, referral_id)}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -485,6 +502,7 @@ def review_task_action(task_id: str, body: ReviewActionRequest) -> dict[str, Any
                 if body.action == "approve" and task.task_type in {"match_approval", "send_approval", "therapist_signoff"}
                 else None
             )
+            referral_payload = referral_detail(session, task.referral_id) if task.referral_id else None
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -504,8 +522,26 @@ def review_task_action(task_id: str, body: ReviewActionRequest) -> dict[str, Any
     return {
         "task": task_payload,
         "resumed_job": resumed_job,
-        "message": "Review action recorded.",
+        "referral": referral_payload,
+        "workbench_state": referral_payload.get("workbench_state") if referral_payload else None,
+        "message": _review_action_message(body.action, task_payload, referral_payload),
     }
+
+
+def _review_action_message(action: str, task: dict[str, Any], referral: dict[str, Any] | None) -> str:
+    action_labels = {
+        "approve": "approved",
+        "reject": "rejected",
+        "request_changes": "sent back for changes",
+        "escalate": "escalated",
+    }
+    task_type = str(task.get("task_type") or "review task").replace("_", " ")
+    if referral:
+        state = referral.get("workbench_state") or {}
+        next_action = state.get("primary_action_label") or referral.get("next_action_label") or "Review next action"
+        status = state.get("primary_status_label") or referral.get("status_label") or referral.get("status")
+        return f"{task_type.title()} {action_labels.get(action, 'updated')}. Referral is now {status}; next action: {next_action}."
+    return f"{task_type.title()} {action_labels.get(action, 'updated')}."
 
 
 @app.get("/api/therapists")

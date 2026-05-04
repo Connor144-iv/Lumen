@@ -53,13 +53,13 @@
 
         <main class="content">
           <section class="page is-active" data-page="overview" aria-labelledby="overview-title">
-            <h2 id="overview-title" class="sr-only">Operations overview</h2>
+            <h2 id="overview-title" class="sr-only">Referral Journey Dashboard</h2>
 
             <section class="metric-grid" aria-label="Operational metrics">
               <article class="metric-card">
                 <span>Referrals</span>
                 <strong id="metric-referrals">-</strong>
-                <small>Current intake queue</small>
+                <small>Active journey</small>
               </article>
               <article class="metric-card">
                 <span>Review tasks</span>
@@ -72,10 +72,21 @@
                 <small>Active profiles</small>
               </article>
               <article class="metric-card">
-                <span>Models</span>
-                <strong id="metric-models">-</strong>
-                <small>Configured checks</small>
+                <span>Blocked</span>
+                <strong id="metric-blocked">-</strong>
+                <small>Needs attention</small>
               </article>
+            </section>
+
+            <section class="panel journey-panel" aria-labelledby="journey-dashboard-title">
+              <div class="panel-header">
+                <div>
+                  <p class="eyebrow">Referral journey</p>
+                  <h3 id="journey-dashboard-title">Where active referrals are now</h3>
+                </div>
+                <span class="panel-stat" id="metric-ready">- ready</span>
+              </div>
+              <div id="referral-journey-board" class="journey-board"></div>
             </section>
 
             <div class="overview-grid">

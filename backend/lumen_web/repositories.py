@@ -85,6 +85,134 @@ ROLE_PERMISSIONS: dict[str, list[str]] = {
 }
 
 
+CLOSED_REFERRAL_STATUSES = {"closed_declined", "closed_no_response", "closed_not_suitable"}
+
+REFERRAL_JOURNEY_STAGES = (
+    {
+        "id": "triage",
+        "label": "Triage",
+        "description": "Captured referrals, normalisation, and missing information.",
+        "statuses": ("new_referral", "normalising", "needs_admin_review", "waiting_for_missing_info"),
+    },
+    {
+        "id": "clinical",
+        "label": "Clinical review",
+        "description": "Risk, suitability, and escalation gates before matching.",
+        "statuses": ("needs_clinical_review", "clinical_escalation_review"),
+    },
+    {
+        "id": "matching",
+        "label": "Matching",
+        "description": "Therapist recommendation and match approval.",
+        "statuses": ("ready_for_matching", "match_recommended", "match_approved"),
+    },
+    {
+        "id": "contact_scheduling",
+        "label": "Contact & scheduling",
+        "description": "Slot offers, patient contact, replies, and appointment confirmation.",
+        "statuses": (
+            "slot_options_ready",
+            "awaiting_patient_contact",
+            "contact_sent",
+            "awaiting_patient_reply",
+            "appointment_confirmed",
+        ),
+    },
+    {
+        "id": "intake_prep",
+        "label": "Intake & prep",
+        "description": "Intake packet, outstanding paperwork, and therapist prep brief.",
+        "statuses": ("intake_packet_sent", "intake_incomplete", "intake_complete", "prep_brief_ready"),
+    },
+    {
+        "id": "ready",
+        "label": "Ready",
+        "description": "First-session readiness reached.",
+        "statuses": ("first_session_ready",),
+    },
+)
+
+REFERRAL_STAGE_BY_STATUS = {
+    status: stage["id"]
+    for stage in REFERRAL_JOURNEY_STAGES
+    for status in stage["statuses"]
+}
+
+REVIEW_TASK_NEXT_ACTIONS = {
+    "admin_missing_info_review": ("review_missing_info", "Resolve missing information"),
+    "missing_info_message_approval": ("approve_contact", "Approve missing-info message"),
+    "duplicate_resolution": ("review_missing_info", "Resolve duplicate candidate"),
+    "clinical_risk_review": ("clinical_review", "Complete clinical review"),
+    "suitability_review": ("clinical_review", "Complete suitability review"),
+    "match_approval": ("approve_match", "Approve therapist match"),
+    "slot_offer_approval": ("approve_slots", "Approve slot options"),
+    "send_approval": ("approve_contact", "Approve patient contact"),
+    "appointment_confirmation_approval": ("confirm_appointment", "Confirm appointment"),
+    "intake_reminder_approval": ("complete_intake", "Approve intake reminder"),
+    "intake_exception_approval": ("complete_intake", "Review intake exception"),
+}
+
+REVIEW_TASK_PRIORITY = (
+    "clinical_risk_review",
+    "suitability_review",
+    "appointment_confirmation_approval",
+    "intake_exception_approval",
+    "admin_missing_info_review",
+    "duplicate_resolution",
+    "missing_info_message_approval",
+    "match_approval",
+    "slot_offer_approval",
+    "send_approval",
+    "intake_reminder_approval",
+)
+
+ACTION_OWNER_LABELS = {
+    "review_referral": "Admin",
+    "review_missing_info": "Admin",
+    "clinical_review": "Clinician",
+    "run_matching": "Agent",
+    "approve_match": "Admin",
+    "approve_slots": "Admin",
+    "approve_contact": "Admin",
+    "wait_patient_reply": "Patient",
+    "confirm_appointment": "Admin",
+    "start_intake": "Admin",
+    "complete_intake": "Patient / admin",
+    "generate_prep_brief": "Agent",
+    "ready": "Complete",
+    "closed": "Complete",
+    "review_gate": "Admin",
+    "revise_agent_output": "Agent / admin",
+}
+
+NEXT_ACTION_ALLOWED_ACTIONS = {
+    "review_referral": ("draft_missing_info", "record_missing_reply", "duplicate_review", "clinical_review"),
+    "review_missing_info": ("draft_missing_info", "record_missing_reply", "duplicate_review", "clinical_review"),
+    "clinical_review": ("clinical_review", "suitability_review"),
+    "run_matching": ("run_match",),
+    "approve_match": ("review_gate", "run_match"),
+    "approve_slots": ("review_gate", "propose_slots"),
+    "approve_contact": ("review_gate", "draft_first_contact"),
+    "wait_patient_reply": ("record_patient_reply",),
+    "confirm_appointment": ("review_gate",),
+    "start_intake": ("start_intake", "draft_intake_packet"),
+    "complete_intake": ("draft_intake_reminder", "generate_prep_brief"),
+    "generate_prep_brief": ("generate_prep_brief",),
+    "ready": (),
+    "closed": (),
+    "review_gate": ("review_gate",),
+    "revise_agent_output": ("revise_agent_output",),
+}
+
+REQUEST_CHANGES_ACTIONS = {
+    "missing_info_message_approval": ("draft_missing_info",),
+    "send_approval": ("draft_first_contact", "draft_intake_packet", "draft_intake_reminder"),
+    "match_approval": ("run_match",),
+    "slot_offer_approval": ("propose_slots",),
+    "intake_reminder_approval": ("draft_intake_reminder",),
+}
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -331,6 +459,68 @@ def list_referrals(session: Session, tenant_id: str | None = None, status: str |
     return [referral_summary(referral) for referral in session.scalars(query)]
 
 
+def referral_journey_dashboard(session: Session, tenant_id: str | None = None) -> dict[str, Any]:
+    query = select(Referral).order_by(Referral.updated_at.desc())
+    if tenant_id:
+        query = query.where(Referral.tenant_id == tenant_id)
+    referrals = [
+        referral
+        for referral in session.scalars(query)
+        if canonical_referral_status(referral.status) not in CLOSED_REFERRAL_STATUSES
+    ]
+    referral_ids = [referral.id for referral in referrals]
+
+    tasks_by_referral: dict[str, list[HumanReviewTask]] = {referral_id: [] for referral_id in referral_ids}
+    if referral_ids:
+        for task in session.scalars(
+            select(HumanReviewTask)
+            .where(HumanReviewTask.referral_id.in_(referral_ids), HumanReviewTask.status == "open")
+            .order_by(HumanReviewTask.created_at.desc())
+        ):
+            if task.referral_id:
+                tasks_by_referral.setdefault(task.referral_id, []).append(task)
+
+    cards = [
+        _referral_journey_card(session, referral, tasks_by_referral.get(referral.id, []))
+        for referral in referrals
+    ]
+    cards_by_stage: dict[str, list[dict[str, Any]]] = {stage["id"]: [] for stage in REFERRAL_JOURNEY_STAGES}
+    for card in cards:
+        cards_by_stage.setdefault(card["stage_id"], []).append(card)
+
+    metrics = {
+        "active_referrals": len(cards),
+        "needs_action": len([card for card in cards if _journey_card_needs_action(card)]),
+        "clinical_escalations": len(
+            [
+                card
+                for card in cards
+                if card["status"] in {"needs_clinical_review", "clinical_escalation_review"}
+                or any(blocker["code"] == "clinical_escalation" for blocker in card["blockers"])
+            ]
+        ),
+        "intake_blockers": len(
+            [card for card in cards if any(blocker["code"] == "intake_incomplete" for blocker in card["blockers"])]
+        ),
+        "first_session_ready": len([card for card in cards if card["status"] == "first_session_ready"]),
+        "blocked_referrals": len([card for card in cards if card["blockers"]]),
+    }
+    return {
+        "metrics": metrics,
+        "stages": [
+            {
+                "id": stage["id"],
+                "label": stage["label"],
+                "description": stage["description"],
+                "statuses": list(stage["statuses"]),
+                "count": len(cards_by_stage.get(stage["id"], [])),
+                "referrals": cards_by_stage.get(stage["id"], []),
+            }
+            for stage in REFERRAL_JOURNEY_STAGES
+        ],
+    }
+
+
 def referral_detail(session: Session, referral_id: str) -> dict[str, Any]:
     referral = session.get(Referral, referral_id)
     if referral is None:
@@ -355,9 +545,437 @@ def referral_detail(session: Session, referral_id: str) -> dict[str, Any]:
             "patient_replies": _referral_documents(session, referral, "patient_reply"),
             "missing_info_replies": _referral_documents(session, referral, "missing_info_reply"),
             "readiness_blockers": _first_session_readiness_blockers(session, referral),
+            "workbench_state": _referral_workbench_state(
+                session,
+                referral,
+                tasks=tasks,
+                drafts=drafts,
+                workflows=workflows,
+            ),
         }
     )
     return detail
+
+
+def referral_workbench_state(session: Session, referral_id: str) -> dict[str, Any]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    tasks = list(
+        session.scalars(select(HumanReviewTask).where(HumanReviewTask.referral_id == referral_id).order_by(HumanReviewTask.created_at.desc()))
+    )
+    drafts = list(
+        session.scalars(select(CommunicationDraft).where(CommunicationDraft.referral_id == referral_id).order_by(CommunicationDraft.created_at.desc()))
+    )
+    workflows = list(
+        session.scalars(select(WorkflowRun).where(WorkflowRun.referral_id == referral_id).order_by(WorkflowRun.created_at.desc()))
+    )
+    return _referral_workbench_state(session, referral, tasks=tasks, drafts=drafts, workflows=workflows)
+
+
+def _referral_workbench_state(
+    session: Session,
+    referral: Referral,
+    *,
+    tasks: list[HumanReviewTask],
+    drafts: list[CommunicationDraft],
+    workflows: list[WorkflowRun],
+) -> dict[str, Any]:
+    summary = referral_summary(referral)
+    status = summary["status"]
+    stage = _journey_stage(status)
+    open_tasks = [task for task in tasks if task.status == "open"]
+    change_tasks = [task for task in tasks if task.status == "changes_requested"]
+    next_action, next_label = _task_aware_next_action(summary, open_tasks)
+    blockers = _journey_blockers(session, referral, open_tasks)
+
+    open_gate = _highest_priority_task(open_tasks)
+    changed_gate = change_tasks[0] if change_tasks else None
+    primary_action = next_action
+    primary_action_label = next_label
+    owner = ACTION_OWNER_LABELS.get(next_action, "Admin")
+    allowed_actions = list(NEXT_ACTION_ALLOWED_ACTIONS.get(next_action, ("review_referral",)))
+
+    if open_gate is not None:
+        primary_action = "review_gate"
+        primary_action_label = REVIEW_TASK_NEXT_ACTIONS.get(
+            open_gate.task_type,
+            ("review_gate", f"Review {open_gate.task_type.replace('_', ' ')}"),
+        )[1]
+        owner = "Clinician" if open_gate.task_type in {"clinical_risk_review", "suitability_review"} else "Admin"
+        allowed_actions = ["review_gate"]
+    elif changed_gate is not None:
+        primary_action = "revise_agent_output"
+        primary_action_label = _changes_requested_action_label(changed_gate)
+        owner = ACTION_OWNER_LABELS[primary_action]
+        allowed_actions = _actions_for_changes_task(changed_gate)
+        _append_blocker(
+            blockers,
+            "changes_requested",
+            f"Changes requested: {changed_gate.rejection_reason or changed_gate.reason}",
+            "warning",
+        )
+
+    primary_blocker = _primary_blocker(blockers)
+    if primary_blocker is None and open_gate is not None:
+        primary_blocker = {
+            "code": f"review_{open_gate.task_type}",
+            "label": open_gate.reason,
+            "severity": "warning",
+        }
+
+    return {
+        "stage_id": stage["id"],
+        "stage_label": stage["label"],
+        "stage_description": stage["description"],
+        "primary_status": status,
+        "primary_status_label": summary["status_label"],
+        "primary_blocker": primary_blocker,
+        "blockers": blockers,
+        "owner": owner,
+        "primary_action": primary_action,
+        "primary_action_label": primary_action_label,
+        "allowed_actions": allowed_actions,
+        "open_review_gate": review_task_to_dict(open_gate) if open_gate else None,
+        "changes_requested_gate": review_task_to_dict(changed_gate) if changed_gate else None,
+        "agent_outputs": _agent_outputs_for_referral(session, referral, tasks=tasks, drafts=drafts),
+        "activity": _referral_activity(session, referral, tasks=tasks, drafts=drafts, workflows=workflows),
+    }
+
+
+def _journey_stage(status: str) -> dict[str, Any]:
+    stage_id = REFERRAL_STAGE_BY_STATUS.get(status, "triage")
+    for stage in REFERRAL_JOURNEY_STAGES:
+        if stage["id"] == stage_id:
+            return stage
+    return REFERRAL_JOURNEY_STAGES[0]
+
+
+def _highest_priority_task(tasks: list[HumanReviewTask]) -> HumanReviewTask | None:
+    if not tasks:
+        return None
+    priority = {task_type: index for index, task_type in enumerate(REVIEW_TASK_PRIORITY)}
+    return sorted(tasks, key=lambda task: (priority.get(task.task_type, len(priority)), task.created_at), reverse=False)[0]
+
+
+def _primary_blocker(blockers: list[dict[str, str]]) -> dict[str, str] | None:
+    if not blockers:
+        return None
+    severity_rank = {"danger": 0, "warning": 1, "info": 2}
+    return sorted(blockers, key=lambda blocker: severity_rank.get(blocker.get("severity", "info"), 3))[0]
+
+
+def _changes_requested_action_label(task: HumanReviewTask) -> str:
+    if task.task_type == "match_approval":
+        return "Revise therapist match"
+    if task.task_type == "slot_offer_approval":
+        return "Revise slot options"
+    if task.task_type == "intake_reminder_approval":
+        return "Revise intake reminder"
+    if task.task_type == "missing_info_message_approval":
+        return "Revise missing-info message"
+    if task.task_type == "send_approval":
+        payload_key = str(task.payload_key or "")
+        if payload_key.startswith("intake_packet_draft"):
+            return "Revise intake packet"
+        if payload_key.startswith("intake_reminder"):
+            return "Revise intake reminder"
+        return "Revise patient contact"
+    return f"Revise {task.task_type.replace('_', ' ')}"
+
+
+def _actions_for_changes_task(task: HumanReviewTask) -> list[str]:
+    if task.task_type == "send_approval":
+        payload_key = str(task.payload_key or "")
+        if payload_key.startswith("intake_packet_draft"):
+            return ["draft_intake_packet"]
+        if payload_key.startswith("intake_reminder"):
+            return ["draft_intake_reminder"]
+        return ["draft_first_contact"]
+    return list(REQUEST_CHANGES_ACTIONS.get(task.task_type, ("review_gate",)))
+
+
+def _agent_outputs_for_referral(
+    session: Session,
+    referral: Referral,
+    *,
+    tasks: list[HumanReviewTask],
+    drafts: list[CommunicationDraft],
+) -> list[dict[str, Any]]:
+    outputs: list[dict[str, Any]] = []
+    task_by_draft = {
+        str((task.source_payload or {}).get("id")): task
+        for task in tasks
+        if isinstance(task.source_payload, dict) and (task.source_payload or {}).get("id")
+    }
+    for draft in drafts[:6]:
+        review_task = task_by_draft.get(draft.id) or _task_for_payload_prefix(tasks, draft.id)
+        outputs.append(
+            {
+                "id": draft.id,
+                "type": _draft_output_type(draft),
+                "title": draft.subject or "Draft message",
+                "status": review_task.status if review_task and review_task.status == "changes_requested" else draft.status,
+                "body": draft.body,
+                "review_task_id": review_task.id if review_task else None,
+                "review_status": review_task.status if review_task else None,
+                "review_reason": review_task.rejection_reason if review_task else None,
+                "created_at": iso_or_none(draft.created_at),
+                "updated_at": iso_or_none(draft.updated_at),
+            }
+        )
+
+    match_summary = json_safe(referral.match_summary or {})
+    ranked = match_summary.get("ranked_matches") if isinstance(match_summary, dict) else None
+    if ranked:
+        first = ranked[0] or {}
+        outputs.append(
+            {
+                "id": f"match:{referral.id}",
+                "type": "match_recommendation",
+                "title": f"Therapist match: {first.get('name') or first.get('therapist_id') or 'recommended therapist'}",
+                "status": canonical_referral_status(referral.status),
+                "body": first.get("rationale") or ", ".join(first.get("reasons") or []) or "Deterministic therapist match is available.",
+                "review_task_id": _latest_task_id(tasks, "match_approval"),
+                "created_at": iso_or_none(referral.updated_at),
+                "updated_at": iso_or_none(referral.updated_at),
+            }
+        )
+
+    appointments = list(
+        session.scalars(
+            select(Appointment)
+            .where(Appointment.referral_id == referral.id)
+            .order_by(Appointment.created_at.desc())
+            .limit(4)
+        )
+    )
+    if appointments:
+        outputs.append(
+            {
+                "id": f"slots:{referral.id}",
+                "type": "slot_options",
+                "title": "Appointment slot options",
+                "status": appointments[0].status,
+                "body": f"{len(appointments)} appointment option{'s' if len(appointments) != 1 else ''} recorded.",
+                "review_task_id": _latest_task_id(tasks, "slot_offer_approval"),
+                "created_at": iso_or_none(appointments[-1].created_at),
+                "updated_at": iso_or_none(appointments[0].updated_at),
+            }
+        )
+
+    briefs = list(
+        session.scalars(
+            select(TherapistPrepBrief)
+            .where(TherapistPrepBrief.referral_id == referral.id)
+            .order_by(TherapistPrepBrief.created_at.desc())
+            .limit(2)
+        )
+    )
+    for brief in briefs:
+        outputs.append(
+            {
+                "id": brief.id,
+                "type": "prep_brief",
+                "title": brief.title,
+                "status": brief.status,
+                "body": brief.body,
+                "created_at": iso_or_none(brief.created_at),
+                "updated_at": iso_or_none(brief.updated_at),
+            }
+        )
+    return outputs
+
+
+def _task_for_payload_prefix(tasks: list[HumanReviewTask], source_id: str) -> HumanReviewTask | None:
+    short = source_id[:8]
+    return next((task for task in tasks if short and short in str(task.payload_key or "")), None)
+
+
+def _latest_task_id(tasks: list[HumanReviewTask], task_type: str) -> str | None:
+    task = next((task for task in tasks if task.task_type == task_type), None)
+    return task.id if task else None
+
+
+def _draft_output_type(draft: CommunicationDraft) -> str:
+    subject = f"{draft.subject or ''} {draft.channel or ''}".lower()
+    if "intake" in subject:
+        return "intake_message"
+    if "missing" in subject:
+        return "missing_info_message"
+    return "patient_message"
+
+
+def _referral_activity(
+    session: Session,
+    referral: Referral,
+    *,
+    tasks: list[HumanReviewTask],
+    drafts: list[CommunicationDraft],
+    workflows: list[WorkflowRun],
+) -> list[dict[str, Any]]:
+    items: list[tuple[datetime, dict[str, Any]]] = []
+
+    def add(created_at: datetime | None, item: dict[str, Any]) -> None:
+        timestamp = _normalise_datetime(created_at or utc_now())
+        item["created_at"] = iso_or_none(timestamp)
+        items.append((timestamp, item))
+
+    add(
+        referral.created_at,
+        {
+            "type": "referral",
+            "status": canonical_referral_status(referral.status),
+            "title": "Referral captured",
+            "body": referral.source_channel or "Referral source recorded.",
+        },
+    )
+
+    for workflow in workflows[:8]:
+        add(
+            workflow.created_at,
+            {
+                "type": "agent",
+                "status": workflow.status,
+                "title": f"Agent workflow started: {workflow.workflow_type.replace('_', ' ')}",
+                "body": workflow.input_summary or workflow.id,
+            },
+        )
+        add(
+            workflow.updated_at,
+            {
+                "type": "agent",
+                "status": workflow.status,
+                "title": f"Agent workflow {workflow.status}",
+                "body": workflow.workflow_type.replace("_", " "),
+            },
+        )
+
+    workflow_ids = [workflow.id for workflow in workflows]
+    if workflow_ids:
+        for event in session.scalars(
+            select(WorkflowEvent)
+            .where(WorkflowEvent.workflow_run_id.in_(workflow_ids))
+            .order_by(WorkflowEvent.created_at.desc())
+            .limit(20)
+        ):
+            add(
+                event.created_at,
+                {
+                    "type": "agent",
+                    "status": event.status,
+                    "title": _workflow_event_title(event),
+                    "body": event.message,
+                },
+            )
+
+    for task in tasks[:12]:
+        add(
+            task.created_at,
+            {
+                "type": "review",
+                "status": task.status,
+                "title": f"Human review opened: {task.task_type.replace('_', ' ')}",
+                "body": task.reason,
+            },
+        )
+        if task.reviewed_at:
+            add(
+                task.reviewed_at,
+                {
+                    "type": "review",
+                    "status": task.status,
+                    "title": f"Human review {task.status.replace('_', ' ')}",
+                    "body": task.rejection_reason or task.reason,
+                },
+            )
+
+    for draft in drafts[:8]:
+        add(
+            draft.created_at,
+            {
+                "type": "agent_output",
+                "status": draft.status,
+                "title": f"Draft prepared: {draft.subject or 'patient message'}",
+                "body": draft.channel or "Communication draft",
+            },
+        )
+        if draft.updated_at and draft.updated_at != draft.created_at:
+            add(
+                draft.updated_at,
+                {
+                    "type": "agent_output",
+                    "status": draft.status,
+                    "title": f"Draft status updated: {draft.status.replace('_', ' ')}",
+                    "body": draft.subject or "Patient message",
+                },
+            )
+
+    for document in _referral_documents(session, referral, "patient_reply")[:6]:
+        add(
+            _parse_iso(document.get("created_at")),
+            {
+                "type": "patient",
+                "status": "patient_reply",
+                "title": "Patient reply recorded",
+                "body": (document.get("metadata") or {}).get("reply_type") or document.get("title"),
+            },
+        )
+    for document in _referral_documents(session, referral, "missing_info_reply")[:6]:
+        add(
+            _parse_iso(document.get("created_at")),
+            {
+                "type": "patient",
+                "status": "missing_info_reply",
+                "title": "Missing information reply recorded",
+                "body": (document.get("metadata") or {}).get("notes") or document.get("title"),
+            },
+        )
+
+    related_ids = [referral.id, *[task.id for task in tasks], *[draft.id for draft in drafts], *workflow_ids]
+    for audit in session.scalars(
+        select(AuditLog)
+        .where(AuditLog.tenant_id == referral.tenant_id, AuditLog.entity_id.in_(related_ids))
+        .order_by(AuditLog.created_at.desc())
+        .limit(20)
+    ):
+        add(
+            audit.created_at,
+            {
+                "type": "audit",
+                "status": "completed",
+                "title": audit.action.replace("_", " ").title(),
+                "body": f"{audit.entity_type.replace('_', ' ')} updated.",
+            },
+        )
+
+    items.sort(key=lambda item: item[0], reverse=True)
+    return [item for _, item in items[:30]]
+
+
+def _workflow_event_title(event: WorkflowEvent) -> str:
+    if event.type == "human_review":
+        return "Human review gate created"
+    if event.agent:
+        return f"{event.agent} updated"
+    if event.node:
+        return f"Workflow step: {event.node.replace('_', ' ')}"
+    return f"Workflow {event.type.replace('_', ' ')}"
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return _normalise_datetime(datetime.fromisoformat(value))
+    except ValueError:
+        return None
+
+
+def _normalise_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
 
 
 def import_referral_batch(
@@ -2918,6 +3536,181 @@ def approval_payload_for_task(session: Session, task: HumanReviewTask) -> dict[s
         "approvals": approvals,
         "referral_id": run.referral_id,
     }
+
+
+def _referral_journey_card(
+    session: Session,
+    referral: Referral,
+    open_tasks: list[HumanReviewTask],
+) -> dict[str, Any]:
+    summary = referral_summary(referral)
+    next_action, next_action_display = _task_aware_next_action(summary, open_tasks)
+    blockers = _journey_blockers(session, referral, open_tasks)
+    blocker_codes = [blocker["code"] for blocker in blockers]
+    summary["next_action"] = next_action
+    summary["next_action_label"] = next_action_display
+    summary["stage_id"] = REFERRAL_STAGE_BY_STATUS.get(summary["status"], "triage")
+    summary["open_review_task_count"] = len(open_tasks)
+    summary["blockers"] = blockers
+    summary["blocker_codes"] = blocker_codes
+    summary["secondary_flags"] = list(dict.fromkeys([*(summary.get("secondary_flags") or []), *blocker_codes]))
+    return summary
+
+
+def _task_aware_next_action(
+    referral_data: dict[str, Any],
+    open_tasks: list[HumanReviewTask],
+) -> tuple[str, str]:
+    if not open_tasks:
+        return referral_data["next_action"], referral_data["next_action_label"]
+
+    priority = {task_type: index for index, task_type in enumerate(REVIEW_TASK_PRIORITY)}
+    task = sorted(open_tasks, key=lambda item: priority.get(item.task_type, len(priority)))[0]
+    action, label = REVIEW_TASK_NEXT_ACTIONS.get(
+        task.task_type,
+        ("review_referral", f"Review {task.task_type.replace('_', ' ')}"),
+    )
+    if task.task_type == "send_approval":
+        payload_key = str(task.payload_key or "")
+        if payload_key.startswith("intake_packet_draft"):
+            return "approve_contact", "Approve intake packet"
+        if payload_key.startswith("intake_reminder"):
+            return "complete_intake", "Approve intake reminder"
+        return "approve_contact", "Approve patient contact"
+    return action, label
+
+
+def _journey_blockers(
+    session: Session,
+    referral: Referral,
+    open_tasks: list[HumanReviewTask],
+) -> list[dict[str, str]]:
+    blockers: list[dict[str, str]] = []
+    status = canonical_referral_status(referral.status)
+    flags = set(secondary_flags_for_referral(referral))
+    missing_fields = [str(field).replace("_", " ") for field in referral.missing_fields or []]
+
+    if missing_fields:
+        _append_blocker(blockers, "missing_info", f"Missing: {', '.join(missing_fields)}", "warning")
+    elif flags & {"missing_contact", "missing_dob", "insurance_unclear"}:
+        _append_blocker(blockers, "missing_info", "Missing or unclear referral details", "warning")
+    if "duplicate_candidate" in flags:
+        _append_blocker(blockers, "duplicate_candidate", "Duplicate candidate", "warning")
+    if flags & {"risk_unknown", "risk_elevated"}:
+        _append_blocker(blockers, "risk_review", "Risk review needed", "danger")
+    if status in {"needs_clinical_review", "clinical_escalation_review"} or any(
+        task.task_type in {"clinical_risk_review", "suitability_review"} for task in open_tasks
+    ):
+        _append_blocker(blockers, "clinical_escalation", "Clinical review pending", "danger")
+    if status in {"contact_sent", "awaiting_patient_reply"}:
+        _append_blocker(blockers, "awaiting_patient_reply", "Awaiting patient reply", "info")
+    if _patient_question_pending(session, referral):
+        _append_blocker(blockers, "patient_question_pending", "Patient question pending", "warning")
+
+    items, consents = _intake_requirements_for_referral(session, referral)
+    intake_status = _intake_status(items, consents)
+    intake_related = bool(items) or status in {
+        "intake_packet_sent",
+        "intake_incomplete",
+        "intake_complete",
+        "prep_brief_ready",
+        "first_session_ready",
+    }
+    if intake_related:
+        if intake_status not in {"not_started", "complete"}:
+            _append_blocker(blockers, "intake_incomplete", "Intake incomplete", "warning")
+        if any(item.status == "waived" for item in items) or any(consent.status == "waived" for consent in consents):
+            _append_blocker(blockers, "intake_exception_recorded", "Intake exception recorded", "info")
+
+    if _calendar_conflict_for_referral(session, referral):
+        _append_blocker(blockers, "calendar_conflict", "Calendar conflict", "danger")
+
+    for task in open_tasks:
+        _append_blocker(blockers, f"review_{task.task_type}", f"Open review: {task.task_type.replace('_', ' ')}", "warning")
+
+    return blockers
+
+
+def _append_blocker(blockers: list[dict[str, str]], code: str, label: str, severity: str) -> None:
+    if any(blocker["code"] == code for blocker in blockers):
+        return
+    blockers.append({"code": code, "label": label, "severity": severity})
+
+
+def _intake_requirements_for_referral(
+    session: Session,
+    referral: Referral,
+) -> tuple[list[IntakeChecklistItem], list[ConsentRecord]]:
+    items = list(session.scalars(select(IntakeChecklistItem).where(IntakeChecklistItem.referral_id == referral.id)))
+    consents = []
+    if referral.patient_id:
+        consents = list(
+            session.scalars(
+                select(ConsentRecord).where(
+                    ConsentRecord.tenant_id == referral.tenant_id,
+                    ConsentRecord.patient_id == referral.patient_id,
+                )
+            )
+        )
+    return items, consents
+
+
+def _patient_question_pending(session: Session, referral: Referral) -> bool:
+    if not referral.patient_id:
+        return False
+    documents = [
+        document
+        for document in session.scalars(
+            select(Document)
+            .where(
+                Document.tenant_id == referral.tenant_id,
+                Document.patient_id == referral.patient_id,
+                Document.document_type == "patient_reply",
+            )
+            .order_by(Document.created_at.desc())
+        )
+        if (document.metadata_json or {}).get("referral_id") == referral.id
+    ]
+    if not documents:
+        return False
+    reply_type = str((documents[0].metadata_json or {}).get("reply_type") or "")
+    return reply_type in {"asked_question", "unclear", "alternative_requested"}
+
+
+def _calendar_conflict_for_referral(session: Session, referral: Referral) -> bool:
+    appointments = list(
+        session.scalars(
+            select(Appointment).where(
+                Appointment.referral_id == referral.id,
+                Appointment.status.in_(["proposed", "confirmed"]),
+            )
+        )
+    )
+    for appointment in appointments:
+        if not appointment.therapist_id or not appointment.starts_at or not appointment.ends_at:
+            continue
+        conflict = session.scalar(
+            select(Appointment)
+            .where(
+                Appointment.id != appointment.id,
+                Appointment.therapist_id == appointment.therapist_id,
+                Appointment.status.in_(["proposed", "confirmed"]),
+                Appointment.starts_at < appointment.ends_at,
+                Appointment.ends_at > appointment.starts_at,
+            )
+            .limit(1)
+        )
+        if conflict is not None:
+            return True
+    return False
+
+
+def _journey_card_needs_action(card: dict[str, Any]) -> bool:
+    if card["status"] == "first_session_ready":
+        return False
+    if card["next_action"] in {"wait_patient_reply", "ready", "closed"}:
+        return False
+    return True
 
 
 def write_audit(
