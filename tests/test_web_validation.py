@@ -42,6 +42,16 @@ def test_examples_endpoint_returns_samples() -> None:
     assert response.json()["examples"]
 
 
+def test_integration_health_exposes_manual_google_calendar_placeholder() -> None:
+    response = client.get("/api/integrations/health")
+
+    assert response.status_code == 200
+    checks = {check["name"]: check for check in response.json()["checks"]}
+    calendar = checks["Google Calendar availability"]
+    assert calendar["status"] == "manual"
+    assert "not connected yet" in calendar["message"]
+
+
 def test_legacy_referral_statuses_map_to_admin_workflow_terms() -> None:
     assert canonical_referral_status("new") == "new_referral"
     assert canonical_referral_status("normalizing") == "normalising"

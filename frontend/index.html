@@ -19,12 +19,11 @@
 
         <nav class="side-nav">
           <a href="/" data-nav data-page-link="overview">Overview</a>
-          <a href="/referrals" data-nav data-page-link="referrals">Referrals</a>
-          <a href="/review" data-nav data-page-link="review">Review inbox</a>
+          <a href="/workbench" data-nav data-page-link="workbench">Workbench</a>
+          <a href="/new-referral" data-nav data-page-link="new-referral">New referral</a>
           <a href="/therapists" data-nav data-page-link="therapists">Therapists</a>
-          <a href="/intake" data-nav data-page-link="intake">Intake &amp; scheduling</a>
           <a href="/integrations" data-nav data-page-link="integrations">Integrations</a>
-          <a href="/system" data-nav data-page-link="system">System (dev)</a>
+          <a href="/system" data-nav data-page-link="system">System / Agents</a>
         </nav>
 
         <div class="sidebar-footer">
@@ -45,8 +44,7 @@
             <h1 id="page-title">Overview</h1>
           </div>
           <div class="topbar-actions">
-            <a class="button-link primary-action" href="/referrals" data-nav>Referral queue</a>
-            <a id="view-trace-link" class="button-link secondary compact" href="/workflows" data-nav hidden>View trace</a>
+            <a class="button-link primary-action" href="/new-referral" data-nav>New referral</a>
             <button id="refresh-product-button" type="button" class="secondary compact">Refresh data</button>
           </div>
         </header>
@@ -57,24 +55,34 @@
 
             <section class="metric-grid" aria-label="Operational metrics">
               <article class="metric-card">
-                <span>Referrals</span>
+                <span>Active referrals</span>
                 <strong id="metric-referrals">-</strong>
                 <small>Active journey</small>
               </article>
               <article class="metric-card">
-                <span>Review tasks</span>
+                <span>Open human gates</span>
                 <strong id="metric-reviews">-</strong>
-                <small>Open human gates</small>
+                <small>Needs attention</small>
               </article>
               <article class="metric-card">
-                <span>Therapists</span>
+                <span>Active therapists</span>
                 <strong id="metric-therapists">-</strong>
                 <small>Active profiles</small>
               </article>
               <article class="metric-card">
-                <span>Blocked</span>
+                <span>First sessions ready</span>
+                <strong id="metric-ready-count">-</strong>
+                <small>This week</small>
+              </article>
+              <article class="metric-card">
+                <span>Blocked referrals</span>
                 <strong id="metric-blocked">-</strong>
                 <small>Needs attention</small>
+              </article>
+              <article class="metric-card">
+                <span>New referrals</span>
+                <strong id="metric-new-referrals">-</strong>
+                <small>Recent intake</small>
               </article>
             </section>
 
@@ -94,7 +102,7 @@
                 <div class="panel-header">
                   <div>
                     <p class="eyebrow">Operations</p>
-                    <h3 id="action-queue-title">Needs action</h3>
+                    <h3 id="action-queue-title">Needs attention</h3>
                   </div>
                   <span class="panel-stat" id="metric-action-queue">-</span>
                 </div>
@@ -105,33 +113,33 @@
                 <div class="panel-header">
                   <div>
                     <p class="eyebrow">Intake</p>
-                    <h3 id="overview-referrals-title">Referral focus</h3>
+                    <h3 id="overview-referrals-title">Active referral queue</h3>
                   </div>
-                  <a class="text-link" href="/referrals" data-nav>Open queue</a>
+                  <a class="text-link" href="/workbench" data-nav>Open workbench</a>
                 </div>
                 <div id="overview-referral-list" class="record-list"></div>
               </section>
 
-              <section class="panel" aria-labelledby="overview-review-title">
+              <section class="panel" aria-labelledby="overview-health-title">
                 <div class="panel-header">
                   <div>
-                    <p class="eyebrow">Governance</p>
-                    <h3 id="overview-review-title">Review focus</h3>
+                    <p class="eyebrow">Health</p>
+                    <h3 id="overview-health-title">System health</h3>
                   </div>
-                  <a class="text-link" href="/review" data-nav>Open inbox</a>
+                  <span class="panel-stat" id="metric-last-sync">-</span>
                 </div>
-                <div id="overview-review-list" class="record-list"></div>
+                <div id="overview-health-strip" class="health-strip-grid"></div>
               </section>
             </div>
           </section>
 
-          <section class="page" data-page="workflows" aria-labelledby="workflow-title">
+          <section class="page" data-page="new-referral" aria-labelledby="workflow-title">
             <div class="workflow-layout">
               <section class="panel form-panel" aria-labelledby="workflow-title">
                 <div class="panel-header">
                   <div>
-                    <p class="eyebrow">Developer demo</p>
-                    <h2 id="workflow-title">Workflow trace runner</h2>
+                    <p class="eyebrow">New referral</p>
+                    <h2 id="workflow-title">Create and normalise a referral</h2>
                   </div>
                 </div>
 
@@ -143,7 +151,7 @@
                     </label>
                     <label>
                       <input type="radio" name="workflow_type" value="session_completed" />
-                      Session report
+                      Session report demo
                     </label>
                   </fieldset>
 
@@ -220,13 +228,27 @@
                   </label>
 
                   <div class="actions">
-                    <button id="run-button" type="submit">Run demo workflow</button>
+                    <button id="run-button" type="submit">Run referral workflow</button>
                     <button id="reset-button" type="button" class="secondary">Reset</button>
                   </div>
                 </form>
               </section>
 
-              <div class="monitor-stack">
+              <section class="panel result-panel" aria-labelledby="new-referral-result-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Result</p>
+                    <h3 id="new-referral-result-title">Initial result</h3>
+                  </div>
+                </div>
+                <div id="new-referral-result-list" class="record-list">
+                  <p class="empty-state">Run a referral workflow to see captured status, missing items, risk, and the Workbench link.</p>
+                </div>
+              </section>
+
+              <details class="advanced-trace">
+                <summary>Advanced trace</summary>
+                <div class="monitor-stack">
                 <section class="panel timeline-panel" aria-labelledby="timeline-title">
                   <div class="panel-header">
                     <div>
@@ -248,17 +270,18 @@
                   </div>
                   <div id="handoffs" class="handoffs"></div>
                   <div id="final-output" class="final-output" hidden>
-                    <h3>Final output</h3>
+                    <h3>Initial result</h3>
                     <pre id="result-json"></pre>
                   </div>
                 </section>
-              </div>
+                </div>
+              </details>
             </div>
           </section>
 
-          <section class="page" data-page="referrals" aria-labelledby="referrals-title">
+          <section class="page" data-page="workbench" aria-labelledby="referral-detail-title">
             <div class="split-layout">
-              <section class="panel" aria-labelledby="referrals-title">
+              <section class="panel" aria-labelledby="referrals-title" hidden aria-hidden="true">
                 <div class="panel-header">
                   <div>
                     <p class="eyebrow">Intake</p>
@@ -336,11 +359,11 @@
                 <div class="panel-header">
                   <div>
                     <p class="eyebrow">Admin workflow</p>
-                    <h2 id="referral-detail-title">Admin workbench</h2>
+                    <h2 id="referral-detail-title">Referral workbench</h2>
                   </div>
                 </div>
                 <div id="referral-detail" class="detail-view">
-                  <p class="empty-state">Select a referral to review fields, gates, matching, scheduling, intake, and prep status.</p>
+                  <p class="empty-state">Open a referral from Overview to review fields, gates, matching, scheduling, intake, and prep status.</p>
                 </div>
               </section>
             </div>
@@ -359,30 +382,115 @@
           </section>
 
           <section class="page" data-page="therapists" aria-labelledby="therapist-title">
-            <section class="panel" aria-labelledby="therapist-title">
-              <div class="panel-header">
-                <div>
-                  <p class="eyebrow">Network</p>
-                  <h2 id="therapist-title">Therapist profiles</h2>
-                </div>
-              </div>
-              <form id="therapist-form" class="inline-form">
-                <input name="name" type="text" placeholder="Name" required />
-                <input name="email" type="email" placeholder="Email" />
-                <input name="specialties" type="text" placeholder="Specialties, comma-separated" />
-                <input name="languages" type="text" placeholder="Languages" />
-                <input name="modalities" type="text" placeholder="Modalities" />
-                <input name="insurers" type="text" placeholder="Insurers" />
-                <input name="capacity_per_week" type="number" min="0" placeholder="Capacity/week" />
-                <textarea
-                  name="availability_blocks"
-                  rows="3"
-                  placeholder='Availability JSON, e.g. [{"weekday":"Tuesday","start":"10:00","end":"13:00","modality":"online"}]'
-                ></textarea>
-                <button type="submit">Add therapist</button>
-              </form>
-              <div id="therapist-list" class="record-list therapist-grid"></div>
+            <section class="metric-grid therapist-metrics" aria-label="Therapist network metrics">
+              <article class="metric-card">
+                <span>Active therapists</span>
+                <strong id="metric-therapist-active">-</strong>
+                <small>Available profiles</small>
+              </article>
+              <article class="metric-card">
+                <span>Available capacity</span>
+                <strong id="metric-therapist-capacity">-</strong>
+                <small>Remaining weekly slots</small>
+              </article>
+              <article class="metric-card">
+                <span>Fully booked</span>
+                <strong id="metric-therapist-full">-</strong>
+                <small>At or over capacity</small>
+              </article>
+              <article class="metric-card">
+                <span>Missing availability</span>
+                <strong id="metric-therapist-missing">-</strong>
+                <small>No weekly blocks</small>
+              </article>
+              <article class="metric-card">
+                <span>Matching data incomplete</span>
+                <strong id="metric-therapist-incomplete">-</strong>
+                <small>Needs profile data</small>
+              </article>
             </section>
+
+            <div class="therapist-workspace">
+              <section class="panel" aria-labelledby="therapist-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Network</p>
+                    <h2 id="therapist-title">Therapist list</h2>
+                  </div>
+                  <details class="inline-disclosure">
+                    <summary>Add therapist</summary>
+                    <form id="therapist-form" class="therapist-form">
+                      <input name="name" type="text" placeholder="Name" required />
+                      <input name="email" type="email" placeholder="Email" />
+                      <input name="specialties" type="text" placeholder="Specialties, comma-separated" />
+                      <input name="languages" type="text" placeholder="Languages" />
+                      <input name="modalities" type="text" placeholder="Modalities" />
+                      <input name="insurers" type="text" placeholder="Insurers" />
+                      <input name="capacity_per_week" type="number" min="0" placeholder="Capacity/week" />
+                      <label class="checkbox-label">
+                        <input name="active" type="checkbox" checked />
+                        Active
+                      </label>
+                      <fieldset class="availability-fields">
+                        <legend>Weekly availability</legend>
+                        <div class="availability-row" data-availability-row>
+                          <select name="availability_weekday_1">
+                            <option value="">Day</option>
+                            <option value="Monday">Monday</option>
+                            <option value="Tuesday">Tuesday</option>
+                            <option value="Wednesday">Wednesday</option>
+                            <option value="Thursday">Thursday</option>
+                            <option value="Friday">Friday</option>
+                            <option value="Saturday">Saturday</option>
+                            <option value="Sunday">Sunday</option>
+                          </select>
+                          <input name="availability_start_1" type="time" />
+                          <input name="availability_end_1" type="time" />
+                          <select name="availability_modality_1">
+                            <option value="online">Online</option>
+                            <option value="in_person">In person</option>
+                            <option value="hybrid">Hybrid</option>
+                          </select>
+                        </div>
+                        <div class="availability-row" data-availability-row>
+                          <select name="availability_weekday_2">
+                            <option value="">Day</option>
+                            <option value="Monday">Monday</option>
+                            <option value="Tuesday">Tuesday</option>
+                            <option value="Wednesday">Wednesday</option>
+                            <option value="Thursday">Thursday</option>
+                            <option value="Friday">Friday</option>
+                            <option value="Saturday">Saturday</option>
+                            <option value="Sunday">Sunday</option>
+                          </select>
+                          <input name="availability_start_2" type="time" />
+                          <input name="availability_end_2" type="time" />
+                          <select name="availability_modality_2">
+                            <option value="online">Online</option>
+                            <option value="in_person">In person</option>
+                            <option value="hybrid">Hybrid</option>
+                          </select>
+                        </div>
+                      </fieldset>
+                      <button type="submit">Save therapist</button>
+                    </form>
+                  </details>
+                </div>
+                <div id="therapist-list" class="record-list therapist-list"></div>
+              </section>
+
+              <section class="panel" aria-labelledby="therapist-detail-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Selected therapist</p>
+                    <h2 id="therapist-detail-title">Profile and capacity</h2>
+                  </div>
+                </div>
+                <div id="therapist-detail" class="detail-view">
+                  <p class="empty-state">Select a therapist to review capacity, availability, assigned referrals, and matching history.</p>
+                </div>
+              </section>
+            </div>
           </section>
 
           <section class="page" data-page="intake" aria-labelledby="intake-title">
@@ -415,7 +523,7 @@
                     <p class="eyebrow">Pre-session</p>
                     <h2 id="intake-title">Intake workspace</h2>
                   </div>
-                  <a class="text-link" href="/referrals" data-nav>Choose referral</a>
+                  <a class="text-link" href="/workbench" data-nav>Choose referral</a>
                 </div>
                 <div id="intake-workspace" class="detail-view">
                   <p class="empty-state">Select a referral, then start intake from the referral detail actions.</p>
@@ -512,24 +620,51 @@
                 </div>
                 <div id="integration-health-list" class="record-list"></div>
               </section>
+
+              <section class="panel" aria-labelledby="calendar-placeholder-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Calendar</p>
+                    <h2 id="calendar-placeholder-title">Google Calendar placeholder</h2>
+                  </div>
+                  <span class="panel-stat">Manual mode</span>
+                </div>
+                <div class="record-list">
+                  <article class="record-item" data-status="manual">
+                    <h4>Calendar write-back is not configured</h4>
+                    <span class="pill">future adapter</span>
+                    <p>Slot proposals use therapist availability blocks and local proposed or confirmed appointments. A future Google Calendar adapter can replace or augment this without changing the admin workflow.</p>
+                  </article>
+                </div>
+              </section>
             </div>
           </section>
 
           <section class="page" data-page="system" aria-labelledby="model-health-title">
             <div class="workspace-grid">
+              <section class="panel agent-registry-panel" aria-labelledby="agent-registry-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Agent control</p>
+                    <h2 id="agent-registry-title">Agent registry</h2>
+                  </div>
+                </div>
+                <div id="agent-registry-list" class="record-list agent-grid"></div>
+              </section>
+
               <section class="panel" aria-labelledby="workflow-trace-link-title">
                 <div class="panel-header">
                   <div>
                     <p class="eyebrow">Developer demo</p>
                     <h2 id="workflow-trace-link-title">Workflow trace</h2>
                   </div>
-                  <a class="text-link" href="/workflows" data-nav>Open trace runner</a>
+                  <a class="text-link" href="/new-referral" data-nav>Open new referral trace</a>
                 </div>
                 <div class="record-list">
                   <article class="record-item" data-status="configured">
                     <h4>Agent workflow console</h4>
                     <span class="pill">demo-only</span>
-                    <p>Run sample payloads and inspect agent handoffs without making it the clinic admin journey.</p>
+                    <p>Run referral payloads and inspect agent handoffs without making trace output the clinic admin journey.</p>
                   </article>
                 </div>
               </section>

@@ -243,6 +243,8 @@ def index() -> FileResponse:
 
 
 @app.get("/overview", include_in_schema=False)
+@app.get("/workbench", include_in_schema=False)
+@app.get("/new-referral", include_in_schema=False)
 @app.get("/workflows", include_in_schema=False)
 @app.get("/referrals", include_in_schema=False)
 @app.get("/review", include_in_schema=False)

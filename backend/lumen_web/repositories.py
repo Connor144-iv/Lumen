@@ -1158,9 +1158,9 @@ def integration_health(session: Session, tenant_id: str | None = None) -> dict[s
                 "last_seen": None,
             },
             {
-                "name": "Calendar availability",
+                "name": "Google Calendar availability",
                 "status": "manual",
-                "message": "Availability blocks are managed in therapist profiles for this MVP.",
+                "message": "Google Calendar is not connected yet; Lumen is using therapist availability blocks and local appointments.",
                 "last_seen": None,
             },
             {

@@ -1,14 +1,16 @@
 const routes = {
   "/": { page: "overview", title: "Referral Journey Dashboard", label: "Clinic operations" },
   "/overview": { page: "overview", title: "Referral Journey Dashboard", label: "Clinic operations" },
-  "/workflows": { page: "workflows", title: "Workflow trace", label: "Developer demo" },
-  "/referrals": { page: "referrals", title: "Referral queue", label: "Admin intake" },
+  "/new-referral": { page: "new-referral", title: "New referral", label: "Clinic intake" },
+  "/workflows": { page: "new-referral", title: "New referral", label: "Clinic intake" },
+  "/workbench": { page: "workbench", title: "Workbench", label: "Referral operations" },
+  "/referrals": { page: "workbench", title: "Workbench", label: "Referral operations" },
   "/review": { page: "review", title: "Review inbox", label: "Governance" },
   "/therapists": { page: "therapists", title: "Therapists", label: "Network" },
   "/intake": { page: "intake", title: "Intake & scheduling", label: "Pre-session" },
   "/clinical": { page: "clinical", title: "Clinical", label: "Documentation" },
   "/integrations": { page: "integrations", title: "Integrations", label: "Channels" },
-  "/system": { page: "system", title: "System", label: "Developer / demo" },
+  "/system": { page: "system", title: "System / Agents", label: "Agent control" },
 };
 
 const form = document.querySelector("#workflow-form");
@@ -25,6 +27,7 @@ const timeline = document.querySelector("#timeline");
 const handoffs = document.querySelector("#handoffs");
 const finalOutput = document.querySelector("#final-output");
 const resultJson = document.querySelector("#result-json");
+const newReferralResultList = document.querySelector("#new-referral-result-list");
 const exampleButtons = document.querySelector("#example-buttons");
 const modelHealthList = document.querySelector("#model-health-list");
 const referralList = document.querySelector("#referral-list");
@@ -52,6 +55,7 @@ const recentWorkflowList = document.querySelector("#recent-workflow-list");
 const overviewReferralList = document.querySelector("#overview-referral-list");
 const overviewActionList = document.querySelector("#overview-action-list");
 const overviewReviewList = document.querySelector("#overview-review-list");
+const overviewHealthStrip = document.querySelector("#overview-health-strip");
 const referralJourneyBoard = document.querySelector("#referral-journey-board");
 const metricReferrals = document.querySelector("#metric-referrals");
 const metricReviews = document.querySelector("#metric-reviews");
@@ -61,6 +65,16 @@ const metricWorkflows = document.querySelector("#metric-workflows");
 const metricActionQueue = document.querySelector("#metric-action-queue");
 const metricBlocked = document.querySelector("#metric-blocked");
 const metricReady = document.querySelector("#metric-ready");
+const metricReadyCount = document.querySelector("#metric-ready-count");
+const metricNewReferrals = document.querySelector("#metric-new-referrals");
+const metricLastSync = document.querySelector("#metric-last-sync");
+const metricTherapistActive = document.querySelector("#metric-therapist-active");
+const metricTherapistCapacity = document.querySelector("#metric-therapist-capacity");
+const metricTherapistFull = document.querySelector("#metric-therapist-full");
+const metricTherapistMissing = document.querySelector("#metric-therapist-missing");
+const metricTherapistIncomplete = document.querySelector("#metric-therapist-incomplete");
+const therapistDetail = document.querySelector("#therapist-detail");
+const agentRegistryList = document.querySelector("#agent-registry-list");
 
 let activeSource = null;
 let pollTimer = null;
@@ -72,6 +86,7 @@ let latestTherapists = [];
 let latestWorkflows = [];
 let latestAppointments = [];
 let selectedReferralId = null;
+let selectedTherapistId = null;
 let lastReviewOutcome = null;
 
 document.querySelectorAll("[data-nav]").forEach((link) => {
@@ -94,7 +109,7 @@ form.addEventListener("change", (event) => {
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   resetRunState();
-  navigate("/workflows");
+  navigate("/new-referral");
   runButton.disabled = true;
   setStatus("queued", "Submitting workflow");
 
@@ -156,11 +171,8 @@ therapistForm.addEventListener("submit", async (event) => {
   payload.insurers = csvList(payload.insurers);
   payload.age_groups = ["adult"];
   payload.capacity_per_week = Number(payload.capacity_per_week || 0);
-  try {
-    payload.availability_blocks = payload.availability_blocks ? JSON.parse(payload.availability_blocks) : [];
-  } catch {
-    payload.availability_blocks = [];
-  }
+  payload.active = formData.get("active") === "on";
+  payload.availability_blocks = buildAvailabilityBlocks(formData);
   const response = await fetch("/api/therapists", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -416,6 +428,30 @@ function renderFinalResult(job) {
   exportButton.disabled = false;
   finalOutput.hidden = false;
   resultJson.textContent = JSON.stringify(job.result || { error: job.error }, null, 2);
+  renderNewReferralResult(job);
+}
+
+function renderNewReferralResult(job) {
+  if (!newReferralResultList) return;
+  newReferralResultList.replaceChildren();
+  const referralId = job.referral_id || job.result?.referral_id || job.result?.referral?.id;
+  const item = recordItem({
+    title: referralId ? `Referral ${shortId(referralId)} captured` : friendlyWorkflowType(job.workflow_type || "workflow"),
+    status: job.status,
+    body: job.error || "Workflow completed or reached the next human gate.",
+    meta: [
+      referralId ? `referral ${shortId(referralId)}` : null,
+      job.result?.risk_review?.risk_category ? `risk ${job.result.risk_review.risk_category}` : null,
+      job.result?.next_action,
+    ],
+  });
+  if (referralId) {
+    const actions = document.createElement("div");
+    actions.className = "actions tight";
+    actions.appendChild(actionButton("Open in Workbench", () => openReferralWorkbench(referralId)));
+    item.appendChild(actions);
+  }
+  newReferralResultList.appendChild(item);
 }
 
 async function loadExamples() {
@@ -434,7 +470,7 @@ async function loadExamples() {
 }
 
 function applyExample(payload) {
-  navigate("/workflows");
+  navigate("/new-referral");
   form.reset();
   const workflow = payload.workflow_type || "new_referral";
   const workflowInput = form.querySelector(`[name="workflow_type"][value="${workflow}"]`);
@@ -458,6 +494,7 @@ async function loadModelHealth() {
     const checks = data.checks || [];
     const available = checks.filter((check) => check.status === "ok" || check.status === "configured").length;
     if (metricModels) metricModels.textContent = `${available}/${checks.length}`;
+    renderAgentRegistry(checks);
     modelHealthList.replaceChildren(
       ...checks.map((check) =>
         recordItem({
@@ -470,6 +507,7 @@ async function loadModelHealth() {
     );
   } catch (error) {
     if (metricModels) metricModels.textContent = "0";
+    renderAgentRegistry([]);
     modelHealthList.replaceChildren(
       recordItem({
         title: "Model health unavailable",
@@ -479,6 +517,36 @@ async function loadModelHealth() {
       }),
     );
   }
+}
+
+function renderAgentRegistry(modelChecks) {
+  if (!agentRegistryList) return;
+  const modelByRole = new Map((modelChecks || []).map((check) => [String(check.role || "").toLowerCase(), check]));
+  const small = modelByRole.get("small") || modelByRole.get("small model");
+  const medium = modelByRole.get("medium") || modelByRole.get("medium model");
+  const communication = modelByRole.get("communication") || modelByRole.get("communication model");
+  const agents = [
+    { name: "Referral Intake Normalizer", model: small },
+    { name: "Completeness Extractor", model: small },
+    { name: "Risk Reviewer", model: small },
+    { name: "Therapist Matching Planner", model: medium || small },
+    { name: "Communication Drafter", model: communication || medium },
+    { name: "Intake Collector", model: small },
+    { name: "Prep Brief Generator", model: medium || communication },
+  ];
+  agentRegistryList.replaceChildren(
+    ...agents.map((agent) =>
+      recordItem({
+        title: agent.name,
+        status: agent.model?.status || "configured",
+        body: agent.model?.message || "Enabled for the local demo workflow.",
+        meta: [
+          agent.model?.model ? `model ${agent.model.model}` : "model configured by environment",
+          agent.model?.provider,
+        ],
+      }),
+    ),
+  );
 }
 
 async function refreshProductWorkspace() {
@@ -520,10 +588,14 @@ async function loadReferrals() {
   const data = await readResponseBody(response);
   latestReferrals = data.referrals || [];
   metricReferrals.textContent = latestReferrals.length;
+  if (metricNewReferrals) {
+    metricNewReferrals.textContent = countRecentReferrals(latestReferrals);
+  }
 
   renderReferralLists();
   renderSchedulingList();
   renderOverviewActionQueue();
+  renderSelectedTherapist();
 }
 
 async function loadReferralJourney() {
@@ -536,6 +608,7 @@ async function loadReferralJourney() {
   if (metricBlocked) metricBlocked.textContent = metrics.blocked_referrals ?? "-";
   if (metricActionQueue) metricActionQueue.textContent = metrics.needs_action ?? "-";
   if (metricReady) metricReady.textContent = `${metrics.first_session_ready ?? 0} ready`;
+  if (metricReadyCount) metricReadyCount.textContent = metrics.first_session_ready ?? "-";
   renderReferralJourneyBoard(latestJourney);
   renderOverviewActionQueue();
   renderJourneyReferralFocus();
@@ -634,7 +707,7 @@ function renderJourneyReferralFocus() {
 function renderReferralLists() {
   const filtered = filterReferrals(latestReferrals);
   renderCollection(referralList, filtered, "No referrals match these filters.", (referral) => referralCard(referral, false));
-  renderCollection(overviewReferralList, latestReferrals.slice(0, 4), "No referrals yet.", (referral) =>
+  renderCollection(overviewReferralList, latestReferrals.slice(0, 8), "No referrals yet.", (referral) =>
     referralCard(referral, true),
   );
 }
@@ -656,16 +729,62 @@ function renderOverviewActionQueue() {
   ]);
 
   const sourceReferrals = journeyReferralCards().length ? journeyReferralCards() : latestReferrals || [];
-  const actionable = sourceReferrals
+  const actionableReferrals = sourceReferrals
     .filter((referral) => actionableNextActions.has(referral.next_action))
     .sort((a, b) => new Date(b.updated_at || 0).getTime() - new Date(a.updated_at || 0).getTime())
-    .slice(0, 10);
+    .slice(0, 6);
+  const reviewItems = (latestReviewTasks || []).slice(0, 6);
+  const combined = [
+    ...reviewItems.map((task) => ({ kind: "task", item: task })),
+    ...actionableReferrals.map((referral) => ({ kind: "referral", item: referral })),
+  ].slice(0, 10);
 
   if (metricActionQueue) {
-    metricActionQueue.textContent = latestJourney?.metrics?.needs_action ?? actionable.length;
+    metricActionQueue.textContent = latestJourney?.metrics?.needs_action ?? combined.length;
   }
 
-  renderCollection(overviewActionList, actionable, "No items need action right now.", (referral) => referralCard(referral, true));
+  renderCollection(overviewActionList, combined, "No items need attention right now.", (entry) => {
+    if (entry.kind === "task") return needsAttentionTaskCard(entry.item);
+    return needsAttentionReferralCard(entry.item);
+  });
+}
+
+function needsAttentionTaskCard(task) {
+  const item = recordItem({
+    title: friendlyTaskType(task.task_type),
+    status: task.status,
+    body: task.reason,
+    meta: [
+      "human gate",
+      task.referral_id ? `referral ${shortId(task.referral_id)}` : "no referral",
+      task.payload_key,
+    ],
+  });
+  if (task.referral_id) {
+    item.classList.add("clickable");
+    item.addEventListener("click", () => openReferralWorkbench(task.referral_id));
+  }
+  return item;
+}
+
+function needsAttentionReferralCard(referral) {
+  const item = referralCard(referral, true);
+  item.appendChild(
+    keyValue(
+      "Consequence",
+      referral.next_action_label || referral.next_action || "Admin action is needed before this referral can progress.",
+    ),
+  );
+  return item;
+}
+
+function countRecentReferrals(referrals) {
+  const now = new Date();
+  const sevenDaysAgo = now.getTime() - 7 * 24 * 60 * 60 * 1000;
+  return referrals.filter((referral) => {
+    const created = new Date(referral.created_at || referral.updated_at || 0).getTime();
+    return Number.isFinite(created) && created >= sevenDaysAgo;
+  }).length;
 }
 
 function filterReferrals(referrals) {
@@ -705,7 +824,7 @@ function referralCard(referral, jumpToDetail) {
 }
 
 async function openReferralWorkbench(referralId, jumpToDetail = true) {
-  if (jumpToDetail) navigate("/referrals");
+  if (jumpToDetail) navigate("/workbench");
   await loadReferralDetail(referralId);
 }
 
@@ -718,6 +837,7 @@ async function loadReferralDetail(referralId) {
 
   const workbenchState = referral.workbench_state || {};
   const header = renderWorkbenchSummary(referral, workbenchState);
+  const progress = renderReferralProgress(referral.status);
 
   const readinessSection = operationSection("First-session readiness");
   renderSimpleList(
@@ -771,12 +891,8 @@ async function loadReferralDetail(referralId) {
   intakeSection.section.id = "referral-intake";
   const briefSection = operationSection("Prep briefs");
   briefSection.section.id = "referral-prep";
-  const draftSection = operationSection("Communication drafts");
-  renderCommunicationDrafts(draftSection.body, referral.communication_drafts || []);
-  const missingReplySection = operationSection("Missing-info replies");
-  renderDocuments(missingReplySection.body, referral.missing_info_replies || [], "No missing-information replies recorded.");
-  const patientReplySection = operationSection("Patient reply history");
-  renderDocuments(patientReplySection.body, referral.patient_replies || [], "No patient replies recorded.");
+  const communicationSection = operationSection("Communication thread");
+  renderCommunicationThread(communicationSection.body, referral);
 
   const raw = document.createElement("details");
   raw.className = "handoff";
@@ -791,6 +907,7 @@ async function loadReferralDetail(referralId) {
 
   referralDetail.append(
     header,
+    progress,
     readinessSection.section,
     fieldsSection.section,
     missingSection.section,
@@ -799,9 +916,7 @@ async function loadReferralDetail(referralId) {
     outputSection.section,
     matchSection.section,
     appointmentSection.section,
-    draftSection.section,
-    missingReplySection.section,
-    patientReplySection.section,
+    communicationSection.section,
     intakeSection.section,
     briefSection.section,
     raw,
@@ -817,6 +932,8 @@ async function loadScheduling() {
   const data = await readResponseBody(response);
   latestAppointments = data.appointments || [];
   renderSchedulingList();
+  renderTherapistList();
+  renderSelectedTherapist();
 }
 
 function renderSchedulingList() {
@@ -836,7 +953,7 @@ function appointmentCard(appointment, referralsById) {
   const title = referral?.patient_name || (appointment.referral_id ? `Referral ${shortId(appointment.referral_id)}` : "Appointment");
   const starts = appointment.starts_at ? formatDate(appointment.starts_at) : "Time pending";
   const ends = appointment.ends_at ? formatDate(appointment.ends_at) : "";
-  const body = ends ? `${starts} → ${ends}` : starts;
+  const body = ends ? `${starts} to ${ends}` : starts;
   const item = recordItem({
     title,
     status: appointment.status,
@@ -851,7 +968,7 @@ function appointmentCard(appointment, referralsById) {
   if (appointment.referral_id) {
     item.classList.add("clickable");
     item.addEventListener("click", async () => {
-      navigate("/referrals");
+      navigate("/workbench");
       await loadReferralDetail(appointment.referral_id);
     });
   }
@@ -897,6 +1014,8 @@ function renderWorkbenchSummary(referral, state) {
     keyValue("Blocker", state.primary_blocker?.label || "No active blocker"),
     keyValue("Owner", state.owner || "Admin"),
     keyValue("Next action", state.primary_action_label || referral.next_action_label || "Review referral"),
+    keyValue("Risk", referral.risk_category || (referral.risk_present ? "Review needed" : "Not flagged")),
+    keyValue("Open gates", String((referral.review_tasks || []).filter((task) => task.status === "open").length)),
   );
 
   const primary = workbenchPrimaryButton(referral, state);
@@ -928,6 +1047,37 @@ function renderWorkbenchSummary(referral, state) {
     header.appendChild(outcome);
   }
   return header;
+}
+
+function renderReferralProgress(status) {
+  const steps = [
+    { id: "new_referral", label: "Captured", statuses: ["new_referral", "normalising", "needs_admin_review", "waiting_for_missing_info"] },
+    { id: "reviewed", label: "Reviewed", statuses: ["needs_clinical_review", "clinical_escalation_review", "ready_for_matching"] },
+    { id: "matched", label: "Matched", statuses: ["match_recommended", "match_approved"] },
+    { id: "contacted", label: "Contacted", statuses: ["slot_options_ready", "awaiting_patient_contact", "contact_sent", "awaiting_patient_reply"] },
+    { id: "appointment_confirmed", label: "Appointment confirmed", statuses: ["appointment_confirmed"] },
+    { id: "intake_complete", label: "Intake complete", statuses: ["intake_packet_sent", "intake_incomplete", "intake_complete"] },
+    { id: "prep_brief_ready", label: "Prep brief ready", statuses: ["prep_brief_ready", "first_session_ready"] },
+  ];
+  const currentIndex = Math.max(
+    0,
+    steps.findIndex((step) => step.statuses.includes(status)),
+  );
+  const wrapper = document.createElement("section");
+  wrapper.className = "progress-path";
+  steps.forEach((step, index) => {
+    const item = document.createElement("div");
+    item.className = "progress-step";
+    item.dataset.state = index < currentIndex ? "complete" : index === currentIndex ? "current" : "pending";
+    const marker = document.createElement("span");
+    marker.className = "progress-marker";
+    marker.textContent = index < currentIndex ? "OK" : String(index + 1);
+    const label = document.createElement("strong");
+    label.textContent = step.label;
+    item.append(marker, label);
+    wrapper.appendChild(item);
+  });
+  return wrapper;
 }
 
 function workbenchPrimaryButton(referral, state) {
@@ -1204,7 +1354,6 @@ async function startReferralIntake(referralId) {
     window.alert(body.detail || "Could not start intake.");
     return;
   }
-  navigate("/intake");
   renderIntakeWorkspace(intakeWorkspace, body, true);
   await loadReferralDetail(referralId);
 }
@@ -1369,14 +1518,16 @@ async function loadReviewTasks() {
   metricReviews.textContent = latestReviewTasks.length;
 
   renderCollection(reviewTaskList, latestReviewTasks, "No open review tasks.", reviewTaskCard);
-  renderCollection(overviewReviewList, latestReviewTasks.slice(0, 4), "No open review tasks.", (task) =>
-    recordItem({
-      title: friendlyTaskType(task.task_type),
-      status: task.status,
-      body: task.reason,
-      meta: [task.payload_key, task.referral_id ? `referral ${shortId(task.referral_id)}` : "no referral"],
-    }),
-  );
+  if (overviewReviewList) {
+    renderCollection(overviewReviewList, latestReviewTasks.slice(0, 4), "No open review tasks.", (task) =>
+      recordItem({
+        title: friendlyTaskType(task.task_type),
+        status: task.status,
+        body: task.reason,
+        meta: [task.payload_key, task.referral_id ? `referral ${shortId(task.referral_id)}` : "no referral"],
+      }),
+    );
+  }
 
   renderOverviewActionQueue();
 }
@@ -1396,7 +1547,7 @@ async function loadIntakeTracker() {
     });
     item.classList.add("clickable");
     item.addEventListener("click", async () => {
-      navigate("/referrals");
+      navigate("/workbench");
       await loadReferralDetail(referral.id);
     });
     return item;
@@ -1480,14 +1631,14 @@ async function submitReviewAction(taskId, action, extra = {}) {
   await refreshProductWorkspace();
   const detailReferralId = body.referral?.id || selectedReferralId;
   if (detailReferralId) {
-    if (body.referral?.id && window.location.pathname === "/review") navigate("/referrals");
+    if (body.referral?.id && window.location.pathname === "/review") navigate("/workbench");
     await loadReferralDetail(detailReferralId);
   }
   if (body.resumed_job) {
     resetRunState();
     jobIdLabel.textContent = body.resumed_job.job_id;
     setActiveJob(body.resumed_job.job_id);
-    setStatus(body.resumed_job.status, `${statusLabel(body.resumed_job.status)} · ${shortId(body.resumed_job.job_id)}`);
+    setStatus(body.resumed_job.status, `${statusLabel(body.resumed_job.status)} - ${shortId(body.resumed_job.job_id)}`);
     openEventStream(body.resumed_job.job_id, `/api/events/${body.resumed_job.job_id}`);
     startPolling(`/api/status/${body.resumed_job.job_id}`);
   }
@@ -1498,20 +1649,234 @@ async function loadTherapists() {
   if (!response.ok) return;
   const data = await readResponseBody(response);
   latestTherapists = data.therapists || [];
-  metricTherapists.textContent = latestTherapists.filter((therapist) => therapist.active).length;
+  if (!selectedTherapistId && latestTherapists.length) {
+    selectedTherapistId = latestTherapists[0].id;
+  }
+  renderTherapistMetrics();
+  renderTherapistList();
+  renderSelectedTherapist();
+}
 
-  renderCollection(therapistList, latestTherapists, "No therapist profiles found.", (therapist) =>
-    recordItem({
+function buildAvailabilityBlocks(formData) {
+  const blocks = [];
+  for (const index of [1, 2]) {
+    const weekday = String(formData.get(`availability_weekday_${index}`) || "");
+    const start = String(formData.get(`availability_start_${index}`) || "");
+    const end = String(formData.get(`availability_end_${index}`) || "");
+    const modality = String(formData.get(`availability_modality_${index}`) || "online");
+    if (weekday && start && end) {
+      blocks.push({ weekday, start, end, modality });
+    }
+  }
+  return blocks;
+}
+
+function renderTherapistMetrics() {
+  const activeTherapists = latestTherapists.filter((therapist) => therapist.active);
+  const summaries = latestTherapists.map(therapistCapacitySummary);
+  const remaining = summaries.reduce((total, summary) => total + Math.max(0, summary.remaining), 0);
+  const fullyBooked = summaries.filter((summary) => summary.active && summary.capacity > 0 && summary.remaining <= 0).length;
+  const missingAvailability = activeTherapists.filter((therapist) => !(therapist.availability_blocks || []).length).length;
+  const incomplete = activeTherapists.filter((therapist) => therapistMatchingDataIncomplete(therapist)).length;
+
+  if (metricTherapists) metricTherapists.textContent = activeTherapists.length;
+  if (metricTherapistActive) metricTherapistActive.textContent = activeTherapists.length;
+  if (metricTherapistCapacity) metricTherapistCapacity.textContent = remaining;
+  if (metricTherapistFull) metricTherapistFull.textContent = fullyBooked;
+  if (metricTherapistMissing) metricTherapistMissing.textContent = missingAvailability;
+  if (metricTherapistIncomplete) metricTherapistIncomplete.textContent = incomplete;
+}
+
+function renderTherapistList() {
+  if (!therapistList) return;
+  renderCollection(therapistList, latestTherapists, "No therapist profiles found.", (therapist) => {
+    const summary = therapistCapacitySummary(therapist);
+    const nextSlot = nextAvailabilityLabel(therapist);
+    const item = recordItem({
       title: therapist.name,
       status: therapist.active ? "active" : "inactive",
       body: therapist.specialties.join(", ") || "No specialties recorded",
       meta: [
-        `${therapist.capacity_per_week}/week`,
+        `${summary.capacity}/week capacity`,
+        `${summary.assigned} assigned`,
+        nextSlot,
         therapist.languages.join(", "),
         therapist.modalities.join(", "),
       ],
+    });
+    item.classList.add("clickable", "therapist-card");
+    item.classList.toggle("is-selected", therapist.id === selectedTherapistId);
+    item.addEventListener("click", () => {
+      selectedTherapistId = therapist.id;
+      renderTherapistList();
+      renderSelectedTherapist();
+    });
+    return item;
+  });
+}
+
+function renderSelectedTherapist() {
+  if (!therapistDetail) return;
+  const therapist = latestTherapists.find((item) => item.id === selectedTherapistId) || latestTherapists[0];
+  therapistDetail.replaceChildren();
+  if (!therapist) {
+    therapistDetail.appendChild(emptyState("Select a therapist to review capacity, availability, assigned referrals, and matching history."));
+    return;
+  }
+  selectedTherapistId = therapist.id;
+  const summary = therapistCapacitySummary(therapist);
+  const assignedReferrals = referralsForTherapist(therapist.id);
+  const bookings = appointmentsForTherapist(therapist.id);
+
+  const header = document.createElement("div");
+  header.className = "therapist-profile-header";
+  header.append(
+    heading(therapist.name),
+    metaRow([therapist.active ? "active" : "inactive", therapist.email, `${summary.remaining} remaining`]),
+  );
+
+  const profileGrid = document.createElement("div");
+  profileGrid.className = "detail-card-grid";
+  profileGrid.append(
+    detailCard("Profile", [
+      keyValue("Email", therapist.email || "Not recorded"),
+      keyValue("Status", therapist.active ? "Active" : "Inactive"),
+      keyValue("Default mode", therapist.modalities.join(", ") || "Not recorded"),
+    ]),
+    detailCard("Matching criteria", [
+      keyValue("Specialties", therapist.specialties.join(", ") || "Missing"),
+      keyValue("Languages", therapist.languages.join(", ") || "Missing"),
+      keyValue("Insurers", therapist.insurers.join(", ") || "Missing"),
+    ]),
+    detailCard("Capacity", [
+      keyValue("Weekly capacity", `${summary.capacity} sessions`),
+      keyValue("Currently assigned", `${summary.assigned} referrals`),
+      keyValue("Remaining", `${summary.remaining} sessions`),
+    ]),
+  );
+
+  const availabilitySection = operationSection("Weekly availability");
+  renderAvailabilityGrid(availabilitySection.body, therapist.availability_blocks || []);
+
+  const bookingsSection = operationSection("Manual bookings / blocked time");
+  renderSimpleList(
+    bookingsSection.body,
+    bookings,
+    "No local proposed, confirmed, or blocked appointments recorded.",
+    (appointment) => appointmentCard(appointment, new Map(latestReferrals.map((referral) => [referral.id, referral]))),
+  );
+
+  const assignedSection = operationSection("Assigned patients and referrals");
+  renderSimpleList(
+    assignedSection.body,
+    assignedReferrals,
+    "No assigned referrals found for this therapist.",
+    (referral) => {
+      const item = referralCard(referral, true);
+      item.appendChild(keyValue("First session", firstSessionForReferral(referral.id, therapist.id)));
+      return item;
+    },
+  );
+
+  const historySection = operationSection("Recent matching history");
+  const recommended = latestReferrals.filter((referral) => topMatchTherapistId(referral) === therapist.id).length;
+  const approved = latestReferrals.filter((referral) => topMatchTherapistId(referral) === therapist.id && ["match_approved", "slot_options_ready", "awaiting_patient_contact", "contact_sent", "awaiting_patient_reply", "appointment_confirmed", "intake_packet_sent", "intake_incomplete", "intake_complete", "prep_brief_ready", "first_session_ready"].includes(referral.status)).length;
+  historySection.body.append(
+    recordItem({
+      title: "Matching outcomes",
+      status: recommended ? "active" : "configured",
+      body: `${recommended} recommendations, ${approved} approved or progressed.`,
+      meta: ["derived from referral match summaries"],
     }),
   );
+
+  therapistDetail.append(header, profileGrid, availabilitySection.section, bookingsSection.section, assignedSection.section, historySection.section);
+}
+
+function therapistCapacitySummary(therapist) {
+  const capacity = Number(therapist.capacity_per_week || 0);
+  const assigned = referralsForTherapist(therapist.id).length;
+  return {
+    active: therapist.active,
+    capacity,
+    assigned,
+    remaining: capacity - assigned,
+  };
+}
+
+function therapistMatchingDataIncomplete(therapist) {
+  return !therapist.capacity_per_week
+    || !(therapist.specialties || []).length
+    || !(therapist.languages || []).length
+    || !(therapist.modalities || []).length
+    || !(therapist.availability_blocks || []).length;
+}
+
+function referralsForTherapist(therapistId) {
+  const appointmentReferralIds = new Set(
+    (latestAppointments || [])
+      .filter((appointment) => appointment.therapist_id === therapistId && appointment.referral_id && appointment.status !== "cancelled")
+      .map((appointment) => appointment.referral_id),
+  );
+  return (latestReferrals || []).filter((referral) => appointmentReferralIds.has(referral.id) || topMatchTherapistId(referral) === therapistId);
+}
+
+function appointmentsForTherapist(therapistId) {
+  return (latestAppointments || []).filter(
+    (appointment) => appointment.therapist_id === therapistId && appointment.status !== "cancelled",
+  );
+}
+
+function topMatchTherapistId(referral) {
+  return (referral.match_summary?.ranked_matches || [])[0]?.therapist_id || null;
+}
+
+function firstSessionForReferral(referralId, therapistId) {
+  const appointment = (latestAppointments || []).find(
+    (item) => item.referral_id === referralId && item.therapist_id === therapistId && item.status === "confirmed",
+  );
+  return appointment?.starts_at ? formatDate(appointment.starts_at) : "Not confirmed";
+}
+
+function nextAvailabilityLabel(therapist) {
+  const block = (therapist.availability_blocks || [])[0];
+  if (!block) return "No availability set";
+  return `Next: ${block.weekday || "manual"} ${block.start || ""}`;
+}
+
+function renderAvailabilityGrid(container, blocks) {
+  container.replaceChildren();
+  const weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+  const grid = document.createElement("div");
+  grid.className = "availability-grid";
+  weekdays.forEach((weekday) => {
+    const cell = document.createElement("div");
+    cell.className = "availability-cell";
+    const label = document.createElement("strong");
+    label.textContent = weekday.slice(0, 3);
+    cell.appendChild(label);
+    const dayBlocks = blocks.filter((block) => String(block.weekday || "").toLowerCase() === weekday.toLowerCase());
+    if (!dayBlocks.length) {
+      cell.appendChild(pill("Unavailable"));
+    } else {
+      dayBlocks.forEach((block) => cell.appendChild(pill(`${block.start}-${block.end} ${formatModality(block.modality)}`)));
+    }
+    grid.appendChild(cell);
+  });
+  container.appendChild(grid);
+  container.appendChild(emptyState("All times use the clinic timezone configured for this demo environment."));
+}
+
+function detailCard(title, children) {
+  const card = document.createElement("article");
+  card.className = "detail-card";
+  card.appendChild(heading(title));
+  children.forEach((child) => card.appendChild(child));
+  return card;
+}
+
+function formatModality(value) {
+  return String(value || "online").replaceAll("_", " ");
 }
 
 async function loadClinicalLibrary() {
@@ -1532,14 +1897,26 @@ async function loadIntegrationHealth() {
   const response = await fetch("/api/integrations/health");
   if (!response.ok) return;
   const data = await readResponseBody(response);
-  renderCollection(integrationHealthList, data.checks || [], "No integration checks yet.", (check) =>
-    recordItem({
-      title: check.name,
-      status: check.status,
-      body: check.message,
-      meta: [check.last_seen ? formatDate(check.last_seen) : null],
-    }),
-  );
+  const checks = data.checks || [];
+  renderCollection(integrationHealthList, checks, "No integration checks yet.", integrationHealthCard);
+  if (overviewHealthStrip) {
+    overviewHealthStrip.replaceChildren(...checks.map(integrationHealthCard));
+  }
+  if (metricLastSync) {
+    metricLastSync.textContent = new Intl.DateTimeFormat(undefined, {
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(new Date());
+  }
+}
+
+function integrationHealthCard(check) {
+  return recordItem({
+    title: check.name,
+    status: check.status,
+    body: check.message,
+    meta: [check.last_seen ? formatDate(check.last_seen) : null],
+  });
 }
 
 async function loadImportBatches() {
@@ -1765,6 +2142,34 @@ function renderCommunicationDrafts(container, drafts) {
       meta: [draft.channel, draft.requires_human_send ? "requires approval" : "no approval required"],
     });
     return item;
+  });
+}
+
+function renderCommunicationThread(container, referral) {
+  const entries = [
+    ...(referral.communication_drafts || []).map((draft) => ({ type: "draft", item: draft })),
+    ...(referral.missing_info_replies || []).map((reply) => ({ type: "missing_reply", item: reply })),
+    ...(referral.patient_replies || []).map((reply) => ({ type: "patient_reply", item: reply })),
+  ].sort((a, b) => new Date(b.item.created_at || b.item.updated_at || 0) - new Date(a.item.created_at || a.item.updated_at || 0));
+
+  renderSimpleList(container, entries, "No referral-specific communication recorded yet.", (entry) => {
+    if (entry.type === "draft") {
+      const draft = entry.item;
+      return recordItem({
+        title: draft.subject || "Agent-drafted message",
+        status: draft.status,
+        body: draft.body,
+        meta: [draft.channel, draft.requires_human_send ? "approval required" : "no approval required", formatDate(draft.created_at)],
+      });
+    }
+    const documentRecord = entry.item;
+    const metadata = documentRecord.metadata || {};
+    return recordItem({
+      title: entry.type === "missing_reply" ? "Missing-information reply" : "Patient reply",
+      status: documentRecord.document_type,
+      body: metadata.notes || metadata.reply_type || documentRecord.title,
+      meta: [metadata.source, metadata.reply_type, formatDate(documentRecord.created_at)],
+    });
   });
 }
 
@@ -2076,6 +2481,9 @@ function resetRunState() {
   exportButton.disabled = true;
   jobIdLabel.textContent = "No job";
   setActiveJob(null);
+  if (newReferralResultList) {
+    newReferralResultList.replaceChildren(emptyState("Run a referral workflow to see captured status, missing items, risk, and the Workbench link."));
+  }
 }
 
 function closeEventStream() {
