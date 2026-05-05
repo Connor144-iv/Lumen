@@ -207,6 +207,12 @@ class CommunicationDraft(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(40), default="draft_pending_review", nullable=False, index=True)
     proposed_slots: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     requires_human_send: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    recipient_email: Mapped[str | None] = mapped_column(String(255))
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    provider: Mapped[str | None] = mapped_column(String(80))
+    gmail_message_id: Mapped[str | None] = mapped_column(String(255))
+    gmail_thread_id: Mapped[str | None] = mapped_column(String(255))
+    last_provider_error: Mapped[str | None] = mapped_column(Text)
 
 
 class Appointment(Base, TimestampMixin):
@@ -221,6 +227,11 @@ class Appointment(Base, TimestampMixin):
     ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(40), default="proposed", nullable=False, index=True)
     source: Mapped[str] = mapped_column(String(80), default="manual", nullable=False)
+    google_calendar_id: Mapped[str | None] = mapped_column(String(255))
+    google_calendar_event_id: Mapped[str | None] = mapped_column(String(255))
+    google_calendar_event_link: Mapped[str | None] = mapped_column(String(500))
+    google_calendar_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_provider_error: Mapped[str | None] = mapped_column(Text)
 
 
 class ConsentRecord(Base, TimestampMixin):

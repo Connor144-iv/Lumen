@@ -47,6 +47,7 @@ const clinicalLibraryList = document.querySelector("#clinical-library-list");
 const referralImportForm = document.querySelector("#referral-import-form");
 const importBatchList = document.querySelector("#import-batch-list");
 const integrationHealthList = document.querySelector("#integration-health-list");
+const googleWorkspaceList = document.querySelector("#google-workspace-list");
 const securityPostureList = document.querySelector("#security-posture-list");
 const feedbackMetricsList = document.querySelector("#feedback-metrics-list");
 const pageTitle = document.querySelector("#page-title");
@@ -1569,6 +1570,9 @@ function reviewTaskCard(task) {
   if (task.rejection_reason) {
     item.appendChild(keyValue(task.status === "changes_requested" ? "Requested change" : "Decision note", task.rejection_reason));
   }
+  if (task.provider_error) {
+    item.appendChild(keyValue("Provider error", task.provider_error));
+  }
 
   if (task.draft_text) {
     const editor = document.createElement("textarea");
@@ -1899,6 +1903,7 @@ async function loadIntegrationHealth() {
   const data = await readResponseBody(response);
   const checks = data.checks || [];
   renderCollection(integrationHealthList, checks, "No integration checks yet.", integrationHealthCard);
+  await loadGoogleWorkspaceStatus();
   if (overviewHealthStrip) {
     overviewHealthStrip.replaceChildren(...checks.map(integrationHealthCard));
   }
@@ -1917,6 +1922,52 @@ function integrationHealthCard(check) {
     body: check.message,
     meta: [check.last_seen ? formatDate(check.last_seen) : null],
   });
+}
+
+async function loadGoogleWorkspaceStatus() {
+  if (!googleWorkspaceList) return;
+  const response = await fetch("/api/integrations/google/status");
+  if (!response.ok) {
+    googleWorkspaceList.replaceChildren(
+      recordItem({
+        title: "Google Workspace",
+        status: "failed",
+        body: "Google Workspace status is unavailable.",
+        meta: [],
+      }),
+    );
+    return;
+  }
+  const status = await readResponseBody(response);
+  const connectionStatus = status.enabled
+    ? status.authorized
+      ? "ready"
+      : status.last_provider_error
+        ? "failed"
+        : "not_authorized"
+    : "manual";
+  googleWorkspaceList.replaceChildren(
+    recordItem({
+      title: "Gmail send",
+      status: connectionStatus,
+      body: status.enabled
+        ? status.authorized
+          ? "Approved patient-facing drafts send through Gmail."
+          : "Run the local Google authorization script before enabling live send."
+        : "Google Workspace is disabled; approvals use the local/manual workflow.",
+      meta: [status.token_present ? "token present" : "no token", status.configured_scopes?.includes("gmail.send") ? "gmail.send" : null],
+    }),
+    recordItem({
+      title: "Google Calendar",
+      status: connectionStatus,
+      body: status.enabled
+        ? status.authorized
+          ? "Slot proposals check free/busy and approved appointments create Calendar events."
+          : "Calendar free/busy and event creation are blocked until authorization succeeds."
+        : "Therapist availability blocks and local appointments are the current source of truth.",
+      meta: [status.calendar_id ? `calendar ${status.calendar_id}` : null, status.timezone, status.enabled ? status.last_provider_error : null],
+    }),
+  );
 }
 
 async function loadImportBatches() {
@@ -2139,7 +2190,13 @@ function renderCommunicationDrafts(container, drafts) {
       title: draft.subject || "Draft message",
       status: draft.status,
       body: draft.body,
-      meta: [draft.channel, draft.requires_human_send ? "requires approval" : "no approval required"],
+      meta: [
+        draft.channel,
+        draft.requires_human_send ? "requires approval" : "no approval required",
+        draft.sent_at ? `sent ${formatDate(draft.sent_at)}` : null,
+        draft.gmail_message_id ? `gmail ${shortId(draft.gmail_message_id)}` : null,
+        draft.last_provider_error,
+      ],
     });
     return item;
   });
@@ -2159,7 +2216,13 @@ function renderCommunicationThread(container, referral) {
         title: draft.subject || "Agent-drafted message",
         status: draft.status,
         body: draft.body,
-        meta: [draft.channel, draft.requires_human_send ? "approval required" : "no approval required", formatDate(draft.created_at)],
+        meta: [
+          draft.channel,
+          draft.requires_human_send ? "approval required" : "no approval required",
+          draft.sent_at ? `sent ${formatDate(draft.sent_at)}` : formatDate(draft.created_at),
+          draft.gmail_message_id ? `gmail ${shortId(draft.gmail_message_id)}` : null,
+          draft.last_provider_error,
+        ],
       });
     }
     const documentRecord = entry.item;
@@ -2234,8 +2297,22 @@ function renderAppointments(container, appointments) {
       title: appointment.starts_at ? new Date(appointment.starts_at).toLocaleString() : "Unscheduled proposal",
       status: appointment.status,
       body: appointment.therapist_id ? `Therapist ${shortId(appointment.therapist_id)}` : "No therapist assigned",
-      meta: [appointment.source, appointment.ends_at ? `ends ${new Date(appointment.ends_at).toLocaleTimeString()}` : null],
+      meta: [
+        appointment.source,
+        appointment.ends_at ? `ends ${new Date(appointment.ends_at).toLocaleTimeString()}` : null,
+        appointment.google_calendar_event_id ? `calendar ${shortId(appointment.google_calendar_event_id)}` : null,
+        appointment.google_calendar_synced_at ? `synced ${formatDate(appointment.google_calendar_synced_at)}` : null,
+        appointment.last_provider_error,
+      ],
     });
+    if (appointment.google_calendar_event_link) {
+      const link = document.createElement("a");
+      link.href = appointment.google_calendar_event_link;
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      link.textContent = "Open Calendar event";
+      item.appendChild(link);
+    }
     if (appointment.status === "proposed") {
       const actions = document.createElement("div");
       actions.className = "actions tight";

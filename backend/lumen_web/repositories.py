@@ -41,6 +41,7 @@ from .models import (
     WorkflowRun,
     new_id,
 )
+from . import google_workspace
 from .seed import DEMO_THERAPIST_USER_ID, DEMO_USER_ID
 from .workflow_state import (
     canonical_referral_status,
@@ -1143,6 +1144,8 @@ def integration_health(session: Session, tenant_id: str | None = None) -> dict[s
         .order_by(ReferralImportBatch.created_at.desc())
         .limit(1)
     )
+    google_status = google_workspace.google_workspace_status(refresh=False)
+    google_check_status = _google_integration_check_status(google_status)
     return {
         "checks": [
             {
@@ -1159,18 +1162,40 @@ def integration_health(session: Session, tenant_id: str | None = None) -> dict[s
             },
             {
                 "name": "Google Calendar availability",
-                "status": "manual",
-                "message": "Google Calendar is not connected yet; Lumen is using therapist availability blocks and local appointments.",
+                "status": google_check_status,
+                "message": _google_integration_message("Google Calendar", google_status),
                 "last_seen": None,
             },
             {
-                "name": "Outbound email",
-                "status": "configured" if os.getenv("SMTP_HOST") else "not_configured",
-                "message": "Outbound sending remains disabled until SMTP is configured and send approval is recorded.",
+                "name": "Gmail send",
+                "status": google_check_status,
+                "message": _google_integration_message("Gmail send", google_status),
                 "last_seen": None,
             },
         ]
     }
+
+
+def _google_integration_check_status(status: dict[str, Any]) -> str:
+    if not status.get("enabled"):
+        return "manual"
+    if status.get("last_provider_error"):
+        return "failed"
+    if status.get("authorized"):
+        return "ready"
+    return "not_authorized"
+
+
+def _google_integration_message(name: str, status: dict[str, Any]) -> str:
+    if not status.get("enabled"):
+        return f"{name} is not connected yet; Lumen is using the local/manual workflow."
+    if status.get("authorized"):
+        return f"{name} is connected to the configured Google Workspace account."
+    if status.get("last_provider_error"):
+        return f"{name} failed: {status['last_provider_error']}"
+    if not status.get("token_present"):
+        return f"{name} is not authorized. Run scripts/google_workspace_auth.py to create the local token."
+    return f"{name} is not authorized for the configured scopes."
 
 
 def security_context(session: Session, user_id: str | None = DEMO_USER_ID) -> dict[str, Any]:
@@ -1331,6 +1356,7 @@ def draft_missing_info_request(
         status="draft_pending_review",
         proposed_slots=[],
         requires_human_send=True,
+        recipient_email=_recipient_email_for_referral(referral, patient),
     )
     session.add(draft)
     session.flush()
@@ -1717,6 +1743,7 @@ def draft_first_contact_message(
         status="draft_pending_review",
         proposed_slots=[appointment.id for appointment in appointments[:3]],
         requires_human_send=True,
+        recipient_email=_recipient_email_for_referral(referral, patient),
     )
     session.add(draft)
     session.flush()
@@ -1803,6 +1830,7 @@ def draft_intake_packet(
         status="draft_pending_review",
         proposed_slots=[],
         requires_human_send=True,
+        recipient_email=_recipient_email_for_referral(referral, patient),
     )
     session.add(draft)
     session.flush()
@@ -1895,6 +1923,15 @@ def apply_review_action(
     task.reviewed_at = utc_now()
     task.updated_at = utc_now()
 
+    referral = session.get(Referral, task.referral_id) if task.referral_id else None
+    if action == "approve" and referral and google_workspace.is_enabled():
+        if task.task_type == "send_approval":
+            if not _prepare_google_send_approval(session, task, referral, final_text or task.draft_text):
+                return task
+        elif task.task_type == "appointment_confirmation_approval":
+            if not _prepare_google_appointment_confirmation(session, task, referral):
+                return task
+
     if action == "approve":
         task.status = "approved"
         task.final_text = final_text or task.draft_text
@@ -1914,7 +1951,7 @@ def apply_review_action(
         _update_reviewed_draft(session, task, action)
 
     if task.referral_id:
-        referral = session.get(Referral, task.referral_id)
+        referral = referral or session.get(Referral, task.referral_id)
         if referral:
             if action == "approve" and task.task_type == "send_approval":
                 _approve_send_task(session, task, referral)
@@ -2014,6 +2051,11 @@ def _update_reviewed_draft(session: Session, task: HumanReviewTask, action: str)
     draft = session.get(CommunicationDraft, draft_id) if draft_id else None
     if draft is None:
         return
+    if action == "approve" and draft.status == "sent" and draft.gmail_message_id:
+        if task.final_text:
+            draft.body = task.final_text
+        draft.updated_at = utc_now()
+        return
     draft.status = "approved_pending_send" if action == "approve" else task.status
     if action == "approve" and task.final_text:
         draft.body = task.final_text
@@ -2021,13 +2063,18 @@ def _update_reviewed_draft(session: Session, task: HumanReviewTask, action: str)
 
 
 def _approve_send_task(session: Session, task: HumanReviewTask, referral: Referral) -> None:
+    send_reason = (
+        "approved and sent through Gmail."
+        if google_workspace.is_enabled()
+        else "approved for simulated/manual send."
+    )
     if task.payload_key.startswith("intake_packet_draft"):
         transition_referral_status(
             session,
             referral,
             "intake_packet_sent",
             actor_user_id=task.reviewer_id,
-            reason="Intake packet approved for simulated/manual send.",
+            reason=f"Intake packet {send_reason}",
         )
         return
     transition_referral_status(
@@ -2035,7 +2082,7 @@ def _approve_send_task(session: Session, task: HumanReviewTask, referral: Referr
         referral,
         "contact_sent",
         actor_user_id=task.reviewer_id,
-        reason="Patient-facing contact draft approved for simulated/manual send.",
+        reason=f"Patient-facing contact draft {send_reason}",
     )
 
 
@@ -2053,6 +2100,201 @@ def _approve_appointment_confirmation(session: Session, task: HumanReviewTask, r
         reason="Appointment confirmation approved.",
     )
     _maybe_mark_first_session_ready(session, referral)
+
+
+def _prepare_google_send_approval(
+    session: Session,
+    task: HumanReviewTask,
+    referral: Referral,
+    final_text: str | None,
+) -> bool:
+    draft = _draft_for_review_task(session, task)
+    if draft is None:
+        _record_task_provider_failure(
+            session,
+            task,
+            "Review task is not linked to a communication draft.",
+        )
+        return False
+
+    patient = session.get(Patient, referral.patient_id or "") if referral.patient_id else None
+    recipient_email = (draft.recipient_email or _recipient_email_for_referral(referral, patient) or "").strip()
+    if not _is_valid_email(recipient_email):
+        error = "Recipient email is missing or invalid; Gmail send was not attempted."
+        draft.last_provider_error = error
+        _record_task_provider_failure(session, task, error)
+        return False
+
+    if final_text:
+        draft.body = final_text
+        task.draft_text = final_text
+    draft.recipient_email = recipient_email
+    draft.provider = "gmail"
+    draft.updated_at = utc_now()
+
+    if draft.gmail_message_id:
+        draft.status = "sent"
+        draft.sent_at = draft.sent_at or utc_now()
+        draft.last_provider_error = None
+        _clear_task_provider_error(task)
+        return True
+
+    before = communication_draft_to_dict(draft)
+    try:
+        result = google_workspace.send_approved_draft(
+            recipient_email=recipient_email,
+            subject=draft.subject,
+            body=draft.body,
+        )
+        message_id = str(result.get("message_id") or "").strip()
+        if not message_id:
+            raise google_workspace.GoogleWorkspaceError("Gmail did not return a message ID.")
+    except Exception as exc:
+        error = google_workspace.provider_error_message(exc)
+        draft.last_provider_error = error
+        _record_task_provider_failure(session, task, error, entity_type="communication_draft", entity_id=draft.id)
+        return False
+
+    draft.status = "sent"
+    draft.sent_at = utc_now()
+    draft.provider = "gmail"
+    draft.gmail_message_id = message_id
+    draft.gmail_thread_id = str(result.get("thread_id") or "").strip() or None
+    draft.last_provider_error = None
+    _clear_task_provider_error(task)
+    write_audit(
+        session,
+        tenant_id=draft.tenant_id,
+        actor_user_id=task.reviewer_id,
+        action="provider_send",
+        entity_type="communication_draft",
+        entity_id=draft.id,
+        before=before,
+        after=communication_draft_to_dict(draft),
+    )
+    return True
+
+
+def _prepare_google_appointment_confirmation(session: Session, task: HumanReviewTask, referral: Referral) -> bool:
+    appointment = _appointment_for_confirmation_task(session, task)
+    if appointment is None:
+        _record_task_provider_failure(session, task, "Review task is not linked to an appointment.")
+        return False
+    if not appointment.starts_at or not appointment.ends_at:
+        error = "Appointment has no proposed time; Google Calendar event was not created."
+        appointment.last_provider_error = error
+        _record_task_provider_failure(session, task, error, entity_type="appointment", entity_id=appointment.id)
+        return False
+    if _appointment_conflicts(
+        session,
+        appointment.therapist_id or "",
+        appointment.starts_at,
+        appointment.ends_at,
+        exclude_appointment_id=appointment.id,
+    ):
+        error = "Appointment conflicts with an existing proposed or confirmed slot."
+        appointment.last_provider_error = error
+        _record_task_provider_failure(session, task, error, entity_type="appointment", entity_id=appointment.id)
+        return False
+    if appointment.google_calendar_event_id:
+        appointment.last_provider_error = None
+        _clear_task_provider_error(task)
+        return True
+
+    patient = session.get(Patient, appointment.patient_id or "") if appointment.patient_id else None
+    therapist = session.get(Therapist, appointment.therapist_id or "") if appointment.therapist_id else None
+    patient_email = _recipient_email_for_referral(referral, patient)
+    therapist_email = therapist.email.strip() if therapist and therapist.email else None
+    if patient_email and not _is_valid_email(patient_email):
+        patient_email = None
+    if therapist_email and not _is_valid_email(therapist_email):
+        therapist_email = None
+
+    before = appointment_to_dict(appointment)
+    try:
+        result = google_workspace.create_appointment_event(
+            appointment_id=appointment.id,
+            tenant_id=appointment.tenant_id,
+            referral_id=appointment.referral_id,
+            starts_at=appointment.starts_at,
+            ends_at=appointment.ends_at,
+            patient_email=patient_email,
+            therapist_email=therapist_email,
+            calendar_id=appointment.google_calendar_id,
+        )
+        event_id = str(result.get("event_id") or "").strip()
+        if not event_id:
+            raise google_workspace.GoogleWorkspaceError("Google Calendar did not return an event ID.")
+    except Exception as exc:
+        error = google_workspace.provider_error_message(exc)
+        appointment.last_provider_error = error
+        _record_task_provider_failure(session, task, error, entity_type="appointment", entity_id=appointment.id)
+        return False
+
+    appointment.google_calendar_id = str(result.get("calendar_id") or google_workspace.settings().calendar_id)
+    appointment.google_calendar_event_id = event_id
+    appointment.google_calendar_event_link = str(result.get("event_link") or "").strip() or None
+    appointment.google_calendar_synced_at = utc_now()
+    appointment.last_provider_error = None
+    _clear_task_provider_error(task)
+    write_audit(
+        session,
+        tenant_id=appointment.tenant_id,
+        actor_user_id=task.reviewer_id,
+        action="provider_calendar_event_create",
+        entity_type="appointment",
+        entity_id=appointment.id,
+        before=before,
+        after=appointment_to_dict(appointment),
+    )
+    return True
+
+
+def _draft_for_review_task(session: Session, task: HumanReviewTask) -> CommunicationDraft | None:
+    draft_id = (task.source_payload or {}).get("id") if isinstance(task.source_payload, dict) else None
+    return session.get(CommunicationDraft, draft_id) if draft_id else None
+
+
+def _appointment_for_confirmation_task(session: Session, task: HumanReviewTask) -> Appointment | None:
+    payload = task.source_payload if isinstance(task.source_payload, dict) else {}
+    appointment_id = str(payload.get("appointment_id") or "").strip()
+    return session.get(Appointment, appointment_id) if appointment_id else None
+
+
+def _record_task_provider_failure(
+    session: Session,
+    task: HumanReviewTask,
+    error: str,
+    *,
+    entity_type: str = "human_review_task",
+    entity_id: str | None = None,
+) -> None:
+    task.status = "open"
+    task.reviewed_at = None
+    task.rejection_reason = None
+    task.source_payload = {
+        **(task.source_payload if isinstance(task.source_payload, dict) else {}),
+        "provider_error": error,
+    }
+    task.updated_at = utc_now()
+    write_audit(
+        session,
+        tenant_id=task.tenant_id,
+        actor_user_id=task.reviewer_id,
+        action="provider_failure",
+        entity_type=entity_type,
+        entity_id=entity_id or task.id,
+        before=None,
+        after={"task_id": task.id, "provider_error": error},
+    )
+
+
+def _clear_task_provider_error(task: HumanReviewTask) -> None:
+    if not isinstance(task.source_payload, dict) or "provider_error" not in task.source_payload:
+        return
+    payload = dict(task.source_payload)
+    payload.pop("provider_error", None)
+    task.source_payload = payload
 
 
 def _approve_intake_exception(session: Session, task: HumanReviewTask) -> None:
@@ -2315,6 +2557,7 @@ def propose_appointment_slots(
     if therapist.tenant_id != referral.tenant_id:
         raise ValueError("Therapist and referral tenants do not match.")
 
+    google_busy = _google_busy_intervals_for_slot_proposal() if google_workspace.is_enabled() else []
     proposals = []
     existing = list(
         session.scalars(
@@ -2327,6 +2570,8 @@ def propose_appointment_slots(
         )
     )
     for appointment in existing:
+        if appointment.starts_at and appointment.ends_at and _overlaps_busy(appointment.starts_at, appointment.ends_at, google_busy):
+            continue
         proposals.append(appointment_to_dict(appointment))
         if len(proposals) >= limit:
             break
@@ -2336,6 +2581,8 @@ def propose_appointment_slots(
             if len(proposals) >= limit:
                 break
             if _appointment_conflicts(session, therapist.id, starts_at, ends_at):
+                continue
+            if _overlaps_busy(starts_at, ends_at, google_busy):
                 continue
             appointment = Appointment(
                 tenant_id=referral.tenant_id,
@@ -2401,6 +2648,8 @@ def confirm_appointment(session: Session, appointment_id: str) -> dict[str, Any]
         raise KeyError(f"Unknown appointment: {appointment_id}")
     if not appointment.starts_at or not appointment.ends_at:
         raise ValueError("Appointment has no proposed time.")
+    if google_workspace.is_enabled() and not appointment.google_calendar_event_id:
+        raise ValueError("Google Calendar event creation is required before local appointment confirmation.")
     if _appointment_conflicts(
         session,
         appointment.therapist_id or "",
@@ -2699,6 +2948,7 @@ def generate_missing_intake_reminder(session: Session, referral_id: str) -> dict
         status="draft_pending_review",
         proposed_slots=[],
         requires_human_send=True,
+        recipient_email=_recipient_email_for_referral(referral, patient),
     )
     session.add(draft)
     session.flush()
@@ -3472,6 +3722,7 @@ def update_referral_from_result(session: Session, run: WorkflowRun) -> None:
             body=draft_data.get("body") or "",
             proposed_slots=draft_data.get("proposed_slots") or [],
             requires_human_send=bool(draft_data.get("requires_human_send", True)),
+            recipient_email=_recipient_email_for_referral(referral, session.get(Patient, run.patient_id or "") if run.patient_id else None),
         )
         session.add(draft)
         session.flush()
@@ -3857,6 +4108,7 @@ def review_task_to_dict(task: HumanReviewTask) -> dict[str, Any]:
         "draft_text": task.draft_text,
         "final_text": task.final_text,
         "rejection_reason": task.rejection_reason,
+        "provider_error": (task.source_payload or {}).get("provider_error") if isinstance(task.source_payload, dict) else None,
         "reviewer_id": task.reviewer_id,
         "reviewed_at": iso_or_none(task.reviewed_at),
         "created_at": iso_or_none(task.created_at),
@@ -3877,6 +4129,12 @@ def communication_draft_to_dict(draft: CommunicationDraft) -> dict[str, Any]:
         "status": draft.status,
         "proposed_slots": draft.proposed_slots,
         "requires_human_send": draft.requires_human_send,
+        "recipient_email": draft.recipient_email,
+        "sent_at": iso_or_none(draft.sent_at),
+        "provider": draft.provider,
+        "gmail_message_id": draft.gmail_message_id,
+        "gmail_thread_id": draft.gmail_thread_id,
+        "last_provider_error": draft.last_provider_error,
         "created_at": iso_or_none(draft.created_at),
         "updated_at": iso_or_none(draft.updated_at),
     }
@@ -4064,6 +4322,11 @@ def appointment_to_dict(appointment: Appointment) -> dict[str, Any]:
         "ends_at": iso_or_none(appointment.ends_at),
         "status": appointment.status,
         "source": appointment.source,
+        "google_calendar_id": appointment.google_calendar_id,
+        "google_calendar_event_id": appointment.google_calendar_event_id,
+        "google_calendar_event_link": appointment.google_calendar_event_link,
+        "google_calendar_synced_at": iso_or_none(appointment.google_calendar_synced_at),
+        "last_provider_error": appointment.last_provider_error,
         "created_at": iso_or_none(appointment.created_at),
         "updated_at": iso_or_none(appointment.updated_at),
     }
@@ -4471,6 +4734,26 @@ def _appointment_conflicts(
     return session.scalar(query.limit(1)) is not None
 
 
+def _google_busy_intervals_for_slot_proposal() -> list[dict[str, datetime]]:
+    start = utc_now()
+    end = start + timedelta(days=29)
+    try:
+        return google_workspace.query_calendar_busy(time_min=start, time_max=end)
+    except Exception as exc:
+        raise ValueError(
+            f"Google Calendar availability could not be checked: {google_workspace.provider_error_message(exc)}"
+        ) from exc
+
+
+def _overlaps_busy(starts_at: datetime, ends_at: datetime, busy_intervals: list[dict[str, datetime]]) -> bool:
+    for interval in busy_intervals or []:
+        busy_start = interval.get("start")
+        busy_end = interval.get("end")
+        if busy_start and busy_end and starts_at < busy_end and ends_at > busy_start:
+            return True
+    return False
+
+
 def _parse_time(value: Any) -> time | None:
     if not value:
         return None
@@ -4479,6 +4762,14 @@ def _parse_time(value: Any) -> time | None:
         return time(int(hour), int(minute[:2]))
     except (ValueError, TypeError):
         return None
+
+
+def _recipient_email_for_referral(referral: Referral, patient: Patient | None = None) -> str | None:
+    return (referral.contact_email or (patient.contact_email if patient else None) or "").strip() or None
+
+
+def _is_valid_email(value: str | None) -> bool:
+    return bool(value and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value.strip()))
 
 
 def _list_value(value: Any) -> list[str]:

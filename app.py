@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from backend.lumen_web.db import session_scope
+from backend.lumen_web import google_workspace
 from backend.lumen_web.model_health import check_configured_models
 from backend.lumen_web.repositories import (
     apply_review_action,
@@ -501,7 +502,9 @@ def review_task_action(task_id: str, body: ReviewActionRequest) -> dict[str, Any
             task_payload = review_task_to_dict(task)
             resume_payload = (
                 approval_payload_for_task(session, task)
-                if body.action == "approve" and task.task_type in {"match_approval", "send_approval", "therapist_signoff"}
+                if body.action == "approve"
+                and task.status == "approved"
+                and task.task_type in {"match_approval", "send_approval", "therapist_signoff"}
                 else None
             )
             referral_payload = referral_detail(session, task.referral_id) if task.referral_id else None
@@ -531,6 +534,8 @@ def review_task_action(task_id: str, body: ReviewActionRequest) -> dict[str, Any
 
 
 def _review_action_message(action: str, task: dict[str, Any], referral: dict[str, Any] | None) -> str:
+    if action == "approve" and task.get("status") == "open" and task.get("provider_error"):
+        return f"{str(task.get('task_type') or 'Review task').replace('_', ' ').title()} could not complete: {task['provider_error']}"
     action_labels = {
         "approve": "approved",
         "reject": "rejected",
@@ -908,6 +913,19 @@ def feedback_metrics(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
 def integrations_health(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
     with session_scope() as session:
         return integration_health(session, tenant_id=tenant_id)
+
+
+@app.get("/api/integrations/google/status")
+def google_integration_status() -> dict[str, Any]:
+    return google_workspace.google_workspace_status(refresh=True)
+
+
+@app.post("/api/integrations/google/test-calendar-read")
+def google_test_calendar_read() -> dict[str, Any]:
+    try:
+        return google_workspace.test_calendar_read()
+    except google_workspace.GoogleWorkspaceError as exc:
+        raise HTTPException(status_code=400, detail=google_workspace.provider_error_message(exc)) from exc
 
 
 @app.get("/api/integrations/referral-batches")
