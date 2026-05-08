@@ -10,7 +10,7 @@ import re
 from datetime import datetime, time, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, selectinload
 
 from .models import (
@@ -42,7 +42,7 @@ from .models import (
     new_id,
 )
 from . import google_workspace
-from .seed import DEMO_THERAPIST_USER_ID, DEMO_USER_ID
+from .seed import DEMO_TENANT_ID, DEMO_THERAPIST_USER_ID, DEMO_USER_ID, seed_demo_data
 from .workflow_state import (
     canonical_referral_status,
     next_action_for_referral,
@@ -149,15 +149,19 @@ REVIEW_TASK_NEXT_ACTIONS = {
     "slot_offer_approval": ("approve_slots", "Approve slot options"),
     "send_approval": ("approve_contact", "Approve patient contact"),
     "appointment_confirmation_approval": ("confirm_appointment", "Confirm appointment"),
+    "appointment_reschedule_approval": ("confirm_appointment", "Approve reschedule"),
     "intake_reminder_approval": ("complete_intake", "Approve intake reminder"),
     "intake_exception_approval": ("complete_intake", "Review intake exception"),
+    "inbound_reply_review": ("review_gate", "Review inbound reply"),
 }
 
 REVIEW_TASK_PRIORITY = (
     "clinical_risk_review",
     "suitability_review",
     "appointment_confirmation_approval",
+    "appointment_reschedule_approval",
     "intake_exception_approval",
+    "inbound_reply_review",
     "admin_missing_info_review",
     "duplicate_resolution",
     "missing_info_message_approval",
@@ -206,12 +210,40 @@ NEXT_ACTION_ALLOWED_ACTIONS = {
 }
 
 REQUEST_CHANGES_ACTIONS = {
+    "admin_missing_info_review": ("draft_missing_info", "record_missing_reply"),
     "missing_info_message_approval": ("draft_missing_info",),
+    "duplicate_resolution": ("duplicate_review",),
+    "clinical_risk_review": ("clinical_review",),
+    "suitability_review": ("suitability_review",),
     "send_approval": ("draft_first_contact", "draft_intake_packet", "draft_intake_reminder"),
     "match_approval": ("run_match",),
     "slot_offer_approval": ("propose_slots",),
+    "appointment_confirmation_approval": ("record_patient_reply", "propose_slots"),
+    "appointment_reschedule_approval": ("review_gate",),
     "intake_reminder_approval": ("draft_intake_reminder",),
+    "intake_exception_approval": ("complete_intake",),
 }
+
+GMAIL_APPROVAL_TASK_TYPES = {
+    "missing_info_message_approval",
+    "send_approval",
+    "intake_reminder_approval",
+}
+
+INBOUND_GMAIL_STORAGE_PREFIX = "gmail:message:"
+
+DEMO_OUTBOUND_PATIENT_EMAIL = "lumenpatientdemo@gmail.com"
+DEMO_CLEAN_REFERRAL_ID = "demo-clean-referral-001"
+DEMO_CLEAN_PATIENT_ID = "demo-clean-patient-001"
+DEMO_CLEAN_THERAPIST_ID = "demo-clean-therapist-001"
+DEMO_CLEAN_INTAKE_TEMPLATE_ID = "demo-clean-intake-template"
+SESSION_LENGTH_MINUTES = 60
+SESSION_BUFFER_MINUTES = 10
+THERAPIST_WEEKLY_PATIENT_CONTACT_CAP_HOURS = 20
+DEFAULT_AVAILABILITY_BLOCKS = [
+    {"weekday": day, "start": "08:00", "end": "21:00", "modality": "online"}
+    for day in ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+]
 
 
 def utc_now() -> datetime:
@@ -543,6 +575,7 @@ def referral_detail(session: Session, referral_id: str) -> dict[str, Any]:
             "communication_drafts": [communication_draft_to_dict(draft) for draft in drafts],
             "review_tasks": [review_task_to_dict(task) for task in tasks],
             "workflow_runs": [workflow_run_to_dict(run, include_events=False) for run in workflows],
+            "documents": _referral_all_documents(session, referral),
             "patient_replies": _referral_documents(session, referral, "patient_reply"),
             "missing_info_replies": _referral_documents(session, referral, "missing_info_reply"),
             "readiness_blockers": _first_session_readiness_blockers(session, referral),
@@ -639,6 +672,7 @@ def _referral_workbench_state(
         "allowed_actions": allowed_actions,
         "open_review_gate": review_task_to_dict(open_gate) if open_gate else None,
         "changes_requested_gate": review_task_to_dict(changed_gate) if changed_gate else None,
+        "progress": _workbench_progress_facts(session, referral, tasks=tasks, drafts=drafts),
         "agent_outputs": _agent_outputs_for_referral(session, referral, tasks=tasks, drafts=drafts),
         "activity": _referral_activity(session, referral, tasks=tasks, drafts=drafts, workflows=workflows),
     }
@@ -694,6 +728,77 @@ def _actions_for_changes_task(task: HumanReviewTask) -> list[str]:
             return ["draft_intake_reminder"]
         return ["draft_first_contact"]
     return list(REQUEST_CHANGES_ACTIONS.get(task.task_type, ("review_gate",)))
+
+
+def _workbench_progress_facts(
+    session: Session,
+    referral: Referral,
+    *,
+    tasks: list[HumanReviewTask],
+    drafts: list[CommunicationDraft],
+) -> dict[str, bool]:
+    google_enabled = google_workspace.is_enabled()
+    status = canonical_referral_status(referral.status)
+    open_task_types = {task.task_type for task in tasks if task.status == "open"}
+    approved_task_types = {task.task_type for task in tasks if task.status == "approved"}
+    sent_contact = any(
+        draft.status == "sent" and (not google_enabled or bool(draft.gmail_message_id))
+        for draft in drafts
+        if draft.proposed_slots
+    )
+    confirmed_appointments = list(
+        session.scalars(
+            select(Appointment).where(
+                Appointment.referral_id == referral.id,
+                Appointment.status == "confirmed",
+            )
+        )
+    )
+    appointment_confirmed = bool(confirmed_appointments) and (
+        not google_enabled or any(appointment.google_calendar_event_id for appointment in confirmed_appointments)
+    )
+    items, consents = _intake_requirements_for_referral(session, referral)
+    intake_complete = _intake_status(items, consents) == "complete"
+    prep_brief_generated = bool(
+        session.scalar(
+            select(func.count(TherapistPrepBrief.id)).where(TherapistPrepBrief.referral_id == referral.id)
+        )
+    )
+    reviewed = (
+        not referral.missing_fields
+        and "admin_missing_info_review" not in open_task_types
+        and "clinical_risk_review" not in open_task_types
+        and "suitability_review" not in open_task_types
+        and status not in {"needs_admin_review", "waiting_for_missing_info", "needs_clinical_review", "clinical_escalation_review"}
+    )
+    matched = (
+        bool((referral.match_summary or {}).get("ranked_matches"))
+        and ("match_approval" in approved_task_types or status not in {"ready_for_matching", "match_recommended"})
+    )
+    slots_approved = "slot_offer_approval" in approved_task_types or status in {
+        "awaiting_patient_contact",
+        "contact_sent",
+        "awaiting_patient_reply",
+        "appointment_confirmed",
+        "intake_packet_sent",
+        "intake_incomplete",
+        "intake_complete",
+        "prep_brief_ready",
+        "first_session_ready",
+    }
+    prep_brief_ready = prep_brief_generated and appointment_confirmed and intake_complete
+    first_session_ready = not _first_session_readiness_blockers(session, referral)
+    return {
+        "captured": True,
+        "reviewed": reviewed,
+        "matched": matched,
+        "slots_approved": slots_approved,
+        "contacted": sent_contact,
+        "appointment_confirmed": appointment_confirmed,
+        "intake_complete": intake_complete,
+        "prep_brief_ready": prep_brief_ready,
+        "first_session_ready": first_session_ready,
+    }
 
 
 def _agent_outputs_for_referral(
@@ -876,18 +981,21 @@ def _referral_activity(
             {
                 "type": "review",
                 "status": task.status,
-                "title": f"Human review opened: {task.task_type.replace('_', ' ')}",
+                "title": f"Review opened: {task.task_type.replace('_', ' ')}",
                 "body": task.reason,
+                "meta": [task.payload_key, "opened"],
             },
         )
         if task.reviewed_at:
+            decision = task.status.replace("_", " ")
             add(
                 task.reviewed_at,
                 {
                     "type": "review",
                     "status": task.status,
-                    "title": f"Human review {task.status.replace('_', ' ')}",
+                    "title": f"Review {decision}: {task.task_type.replace('_', ' ')}",
                     "body": task.rejection_reason or task.reason,
+                    "meta": [task.payload_key, decision],
                 },
             )
 
@@ -1258,6 +1366,205 @@ def list_review_tasks(session: Session, tenant_id: str | None = None, status: st
     return [review_task_to_dict(task) for task in session.scalars(query)]
 
 
+def list_escalation_queue(session: Session, tenant_id: str | None = None) -> list[dict[str, Any]]:
+    task_query = select(HumanReviewTask).where(HumanReviewTask.status == "escalated").order_by(HumanReviewTask.updated_at.desc())
+    referral_query = select(Referral).where(Referral.status == "clinical_escalation_review").order_by(Referral.updated_at.desc())
+    if tenant_id:
+        task_query = task_query.where(HumanReviewTask.tenant_id == tenant_id)
+        referral_query = referral_query.where(Referral.tenant_id == tenant_id)
+
+    items: list[dict[str, Any]] = []
+    seen_referrals: set[str] = set()
+    for task in session.scalars(task_query):
+        referral = session.get(Referral, task.referral_id) if task.referral_id else None
+        if referral:
+            seen_referrals.add(referral.id)
+        items.append(
+            {
+                "type": "review_task",
+                "status": task.status,
+                "created_at": iso_or_none(task.created_at),
+                "updated_at": iso_or_none(task.updated_at),
+                "task": review_task_to_dict(task),
+                "referral": referral_summary(referral) if referral else None,
+                "reason": task.rejection_reason or task.reason,
+            }
+        )
+
+    for referral in session.scalars(referral_query):
+        if referral.id in seen_referrals:
+            continue
+        items.append(
+            {
+                "type": "referral",
+                "status": referral.status,
+                "created_at": iso_or_none(referral.created_at),
+                "updated_at": iso_or_none(referral.updated_at),
+                "task": None,
+                "referral": referral_summary(referral),
+                "reason": "Referral is in clinical escalation review.",
+            }
+        )
+
+    items.sort(key=lambda item: item.get("updated_at") or item.get("created_at") or "", reverse=True)
+    return items
+
+
+def reset_clean_demo_referral(session: Session, tenant_id: str = DEMO_TENANT_ID) -> dict[str, Any]:
+    seed_demo_data(session)
+    therapist = session.get(Therapist, DEMO_CLEAN_THERAPIST_ID)
+    if therapist is None:
+        therapist = Therapist(
+            id=DEMO_CLEAN_THERAPIST_ID,
+            tenant_id=tenant_id,
+            name="Dr. Clara Demo",
+            email="clara.demo@demo-clinic.local",
+            specialties=["anxiety", "work stress", "adjustment"],
+            age_groups=["adult"],
+            languages=["Portuguese", "English"],
+            modalities=["online"],
+            insurers=["Multicare", "self-pay"],
+            capacity_per_week=6,
+            availability_blocks=[
+                {"weekday": "Tuesday", "start": "10:00", "end": "16:00", "modality": "online"},
+                {"weekday": "Thursday", "start": "09:00", "end": "13:00", "modality": "online"},
+            ],
+        )
+        session.add(therapist)
+    else:
+        therapist.tenant_id = tenant_id
+        therapist.active = True
+        therapist.email = therapist.email or "clara.demo@demo-clinic.local"
+        therapist.specialties = ["anxiety", "work stress", "adjustment"]
+        therapist.age_groups = ["adult"]
+        therapist.languages = ["Portuguese", "English"]
+        therapist.modalities = ["online"]
+        therapist.insurers = ["Multicare", "self-pay"]
+        therapist.capacity_per_week = 6
+        therapist.availability_blocks = [
+            {"weekday": "Tuesday", "start": "10:00", "end": "16:00", "modality": "online"},
+            {"weekday": "Thursday", "start": "09:00", "end": "13:00", "modality": "online"},
+        ]
+
+    template = session.get(IntakeTemplate, DEMO_CLEAN_INTAKE_TEMPLATE_ID)
+    required_items = [
+        {"key": "privacy_notice", "label": "Privacy notice acknowledged", "type": "consent", "consent_scope": "privacy_notice"},
+        {"key": "intake_form", "label": "Clinical intake form", "type": "form"},
+    ]
+    if template is None:
+        session.add(
+            IntakeTemplate(
+                id=DEMO_CLEAN_INTAKE_TEMPLATE_ID,
+                tenant_id=tenant_id,
+                name="Clean referral demo intake",
+                patient_type="standard",
+                insurer="Multicare",
+                modality="online",
+                required_items=required_items,
+                questionnaire_schema={"name": "clean_demo_screening", "questions": []},
+                active=True,
+            )
+        )
+    else:
+        template.active = True
+        template.required_items = required_items
+        template.insurer = "Multicare"
+        template.modality = "online"
+
+    _delete_clean_demo_referral_rows(session)
+
+    patient = session.get(Patient, DEMO_CLEAN_PATIENT_ID)
+    if patient is None:
+        patient = Patient(id=DEMO_CLEAN_PATIENT_ID, tenant_id=tenant_id)
+        session.add(patient)
+    patient.display_name = "Clean Demo Patient"
+    patient.contact_email = DEMO_OUTBOUND_PATIENT_EMAIL
+    patient.language = "Portuguese"
+
+    referral = Referral(
+        id=DEMO_CLEAN_REFERRAL_ID,
+        tenant_id=tenant_id,
+        patient_id=patient.id,
+        source_channel="webform",
+        raw_text=(
+            "Adult referral for anxiety and work stress. Portuguese online therapy requested. "
+            "Insurance: Multicare. Patient can attend Tuesday or Thursday mornings. Date of birth is missing."
+        ),
+        status="needs_admin_review",
+        patient_name=patient.display_name,
+        contact_email=DEMO_OUTBOUND_PATIENT_EMAIL,
+        insurer="Multicare",
+        language_preference="Portuguese",
+        modality_preference="online",
+        missing_fields=["date_of_birth"],
+        risk_category="standard",
+        urgency="routine",
+        risk_present=False,
+    )
+    session.add(referral)
+    session.flush()
+    source_document = Document(
+        tenant_id=tenant_id,
+        patient_id=patient.id,
+        document_type="source_referral",
+        title="Clean referral demo source",
+        storage_uri=None,
+        metadata_json={"referral_id": referral.id, "scope": "clean_demo", "source": "demo_reset"},
+    )
+    session.add(source_document)
+    session.flush()
+    _ensure_admin_missing_info_task(session, referral)
+    write_audit(
+        session,
+        tenant_id=tenant_id,
+        action="demo_reset",
+        entity_type="referral",
+        entity_id=referral.id,
+        after=referral_summary(referral),
+    )
+    return {
+        "referral": referral_detail(session, referral.id),
+        "therapist": therapist_to_dict(therapist),
+        "intake_template": intake_template_to_dict(session.get(IntakeTemplate, DEMO_CLEAN_INTAKE_TEMPLATE_ID)),
+    }
+
+
+def _delete_clean_demo_referral_rows(session: Session) -> None:
+    workflow_ids = [
+        item
+        for item in session.scalars(select(WorkflowRun.id).where(WorkflowRun.referral_id == DEMO_CLEAN_REFERRAL_ID))
+    ]
+    document_ids = [
+        document.id
+        for document in session.scalars(
+            select(Document).where(
+                Document.patient_id == DEMO_CLEAN_PATIENT_ID,
+            )
+        )
+        if (document.metadata_json or {}).get("referral_id") == DEMO_CLEAN_REFERRAL_ID
+    ]
+    if workflow_ids:
+        session.execute(delete(WorkflowEvent).where(WorkflowEvent.workflow_run_id.in_(workflow_ids)))
+        session.execute(delete(WorkflowRun).where(WorkflowRun.id.in_(workflow_ids)))
+    if document_ids:
+        session.execute(delete(DocumentChunk).where(DocumentChunk.document_id.in_(document_ids)))
+    session.execute(delete(HumanReviewTask).where(HumanReviewTask.referral_id == DEMO_CLEAN_REFERRAL_ID))
+    session.execute(delete(CommunicationDraft).where(CommunicationDraft.referral_id == DEMO_CLEAN_REFERRAL_ID))
+    session.execute(delete(Appointment).where(Appointment.referral_id == DEMO_CLEAN_REFERRAL_ID))
+    session.execute(delete(IntakeChecklistItem).where(IntakeChecklistItem.referral_id == DEMO_CLEAN_REFERRAL_ID))
+    session.execute(delete(QuestionnaireResponse).where(QuestionnaireResponse.referral_id == DEMO_CLEAN_REFERRAL_ID))
+    session.execute(delete(TherapistPrepBrief).where(TherapistPrepBrief.referral_id == DEMO_CLEAN_REFERRAL_ID))
+    session.execute(delete(SessionNote).where(SessionNote.referral_id == DEMO_CLEAN_REFERRAL_ID))
+    session.execute(delete(ReportDraft).where(ReportDraft.referral_id == DEMO_CLEAN_REFERRAL_ID))
+    session.execute(delete(ScoreRecord).where(ScoreRecord.referral_id == DEMO_CLEAN_REFERRAL_ID))
+    session.execute(delete(DraftFeedback).where(DraftFeedback.referral_id == DEMO_CLEAN_REFERRAL_ID))
+    session.execute(delete(ConsentRecord).where(ConsentRecord.patient_id == DEMO_CLEAN_PATIENT_ID))
+    if document_ids:
+        session.execute(delete(Document).where(Document.id.in_(document_ids)))
+    session.execute(delete(Referral).where(Referral.id == DEMO_CLEAN_REFERRAL_ID))
+    session.flush()
+
+
 def create_review_task(
     session: Session,
     *,
@@ -1283,6 +1590,12 @@ def create_review_task(
         query = query.where(HumanReviewTask.workflow_run_id == workflow_run_id)
     existing = session.scalar(query)
     if existing is not None:
+        if source_payload is not None and isinstance(source_payload, dict):
+            current_payload = existing.source_payload if isinstance(existing.source_payload, dict) else {}
+            if source_payload.get("id") and not current_payload.get("id"):
+                existing.source_payload = json_safe({**current_payload, **source_payload})
+                existing.draft_text = draft_text if draft_text is not None else existing.draft_text
+                existing.updated_at = utc_now()
         return existing
 
     task = HumanReviewTask(
@@ -1307,6 +1620,43 @@ def create_review_task(
         after=review_task_to_dict(task),
     )
     return task
+
+
+def _close_open_review_tasks(
+    session: Session,
+    referral: Referral,
+    *,
+    task_types: tuple[str, ...],
+    status: str,
+    reason: str,
+) -> None:
+    tasks = list(
+        session.scalars(
+            select(HumanReviewTask).where(
+                HumanReviewTask.referral_id == referral.id,
+                HumanReviewTask.task_type.in_(list(task_types)),
+                HumanReviewTask.status == "open",
+            )
+        )
+    )
+    for task in tasks:
+        before = review_task_to_dict(task)
+        task.status = status
+        task.rejection_reason = reason
+        task.reviewed_at = utc_now()
+        task.updated_at = utc_now()
+        write_audit(
+            session,
+            tenant_id=task.tenant_id,
+            actor_user_id=task.reviewer_id,
+            action=f"review_{status}",
+            entity_type="human_review_task",
+            entity_id=task.id,
+            before=before,
+            after=review_task_to_dict(task),
+        )
+    if tasks:
+        session.flush()
 
 
 def draft_missing_info_request(
@@ -1356,7 +1706,7 @@ def draft_missing_info_request(
         status="draft_pending_review",
         proposed_slots=[],
         requires_human_send=True,
-        recipient_email=_recipient_email_for_referral(referral, patient),
+        recipient_email=_outbound_patient_email(referral, patient),
     )
     session.add(draft)
     session.flush()
@@ -1580,6 +1930,8 @@ def record_missing_info_reply(
     source: str = "patient",
     updates: dict[str, Any] | None = None,
     notes: str = "",
+    source_metadata: dict[str, Any] | None = None,
+    storage_uri: str | None = None,
 ) -> dict[str, Any]:
     referral = session.get(Referral, referral_id)
     if referral is None:
@@ -1592,18 +1944,22 @@ def record_missing_info_reply(
     referral.missing_fields = _remaining_missing_fields(referral.missing_fields, clean_updates)
     referral.updated_at = utc_now()
     patient = _ensure_patient_for_referral(session, referral)
+    metadata = {
+        "referral_id": referral.id,
+        "source": source,
+        "updates": json_safe(clean_updates),
+        "notes": notes.strip(),
+        "remaining_missing_fields": list(referral.missing_fields or []),
+    }
+    if source_metadata:
+        metadata["source_metadata"] = json_safe(source_metadata)
     document = Document(
         tenant_id=referral.tenant_id,
         patient_id=patient.id,
         document_type="missing_info_reply",
         title=f"Missing information reply from {source}",
-        metadata_json={
-            "referral_id": referral.id,
-            "source": source,
-            "updates": json_safe(clean_updates),
-            "notes": notes.strip(),
-            "remaining_missing_fields": list(referral.missing_fields or []),
-        },
+        storage_uri=storage_uri,
+        metadata_json=metadata,
     )
     session.add(document)
     session.flush()
@@ -1613,6 +1969,23 @@ def record_missing_info_reply(
         _next_admin_gate_status(referral),
         reason="Missing-information reply recorded.",
     )
+    _close_open_review_tasks(
+        session,
+        referral,
+        task_types=("missing_info_message_approval",),
+        status="superseded",
+        reason="Missing-information reply was recorded; previous message approval is no longer actionable.",
+    )
+    if not referral.missing_fields:
+        _close_open_review_tasks(
+            session,
+            referral,
+            task_types=("admin_missing_info_review",),
+            status="completed",
+            reason="Missing information has been resolved.",
+        )
+    else:
+        _ensure_admin_missing_info_task(session, referral)
     write_audit(
         session,
         tenant_id=referral.tenant_id,
@@ -1631,6 +2004,262 @@ def record_missing_info_reply(
         after=document_to_dict(document),
     )
     return {"reply": document_to_dict(document), "referral": referral_summary(referral)}
+
+
+def record_patient_reply(
+    session: Session,
+    referral_id: str,
+    *,
+    source: str = "patient",
+    notes: str = "",
+    reply_type: str = "unclassified",
+    source_metadata: dict[str, Any] | None = None,
+    storage_uri: str | None = None,
+) -> dict[str, Any]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    clean_notes = notes.strip()
+    if not clean_notes:
+        raise ValueError("Patient reply requires notes.")
+    before = referral_summary(referral)
+    patient = _ensure_patient_for_referral(session, referral)
+    metadata = {
+        "referral_id": referral.id,
+        "source": source,
+        "reply_type": reply_type,
+        "notes": clean_notes,
+    }
+    if source_metadata:
+        metadata["source_metadata"] = json_safe(source_metadata)
+    document = Document(
+        tenant_id=referral.tenant_id,
+        patient_id=patient.id,
+        document_type="patient_reply",
+        title=f"Patient reply from {source}",
+        storage_uri=storage_uri,
+        metadata_json=metadata,
+    )
+    session.add(document)
+    session.flush()
+    transition_referral_status(
+        session,
+        referral,
+        "needs_admin_review",
+        reason="Patient reply recorded; admin review required.",
+    )
+    task = create_review_task(
+        session,
+        tenant_id=referral.tenant_id,
+        workflow_run_id=referral.workflow_run_id,
+        referral_id=referral.id,
+        patient_id=patient.id,
+        task_type="inbound_reply_review",
+        reason="Inbound patient reply requires admin review.",
+        payload_key=f"inbound_reply:{document.id[:8]}",
+        source_payload={
+            "document_id": document.id,
+            "reply_type": reply_type,
+            "source": source,
+        },
+    )
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="record_patient_reply",
+        entity_type="referral",
+        entity_id=referral.id,
+        before=before,
+        after=referral_summary(referral),
+    )
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="create",
+        entity_type="document",
+        entity_id=document.id,
+        after=document_to_dict(document),
+    )
+    return {
+        "reply": document_to_dict(document),
+        "task": review_task_to_dict(task),
+        "referral": referral_summary(referral),
+    }
+
+
+def ingest_gmail_message(
+    session: Session,
+    *,
+    tenant_id: str,
+    message: dict[str, Any],
+) -> dict[str, Any]:
+    message_id = str(message.get("message_id") or "").strip()
+    if not message_id:
+        raise ValueError("Gmail message is missing an id.")
+    if _gmail_message_processed(session, message_id):
+        return {"status": "skipped", "message_id": message_id, "reason": "already_processed"}
+
+    thread_id = str(message.get("thread_id") or "").strip() or None
+    subject = str(message.get("subject") or "").strip()
+    body = str(message.get("body") or "").strip()
+    snippet = str(message.get("snippet") or "").strip()
+    sender_raw = str(message.get("from") or "").strip()
+    sender_email = _extract_email_address(sender_raw)
+    note = body or snippet or "No message body captured."
+
+    metadata = {
+        "gmail_message_id": message_id,
+        "gmail_thread_id": thread_id,
+        "from": sender_raw,
+        "sender_email": sender_email,
+        "subject": subject,
+        "snippet": snippet,
+        "date": str(message.get("date") or "").strip(),
+    }
+    storage_uri = _gmail_storage_uri(message_id)
+    referral, match_reason = _match_gmail_reply(session, thread_id, subject, note, sender_email)
+
+    if referral is not None:
+        if _is_missing_info_referral(referral):
+            record_missing_info_reply(
+                session,
+                referral.id,
+                source="patient",
+                updates={},
+                notes=note,
+                source_metadata={**metadata, "match_reason": match_reason},
+                storage_uri=storage_uri,
+            )
+            action = "missing_info_reply"
+        else:
+            record_patient_reply(
+                session,
+                referral.id,
+                source="patient",
+                notes=note,
+                reply_type="unclassified",
+                source_metadata={**metadata, "match_reason": match_reason},
+                storage_uri=storage_uri,
+            )
+            action = "patient_reply"
+        return {
+            "status": "processed",
+            "message_id": message_id,
+            "referral_id": referral.id,
+            "match_reason": match_reason,
+            "action": action,
+        }
+
+    document = Document(
+        tenant_id=tenant_id,
+        document_type="inbound_email_unmatched",
+        title=subject or "Inbound email reply",
+        storage_uri=storage_uri,
+        metadata_json={**metadata, "body": note, "match_reason": match_reason},
+    )
+    session.add(document)
+    session.flush()
+    task = create_review_task(
+        session,
+        tenant_id=tenant_id,
+        task_type="inbound_reply_review",
+        reason="Unmatched inbound email reply requires routing.",
+        payload_key=f"inbound_unmatched:{document.id[:8]}",
+        source_payload={
+            "document_id": document.id,
+            "message_id": message_id,
+            "match_reason": match_reason,
+        },
+    )
+    write_audit(
+        session,
+        tenant_id=tenant_id,
+        action="create",
+        entity_type="document",
+        entity_id=document.id,
+        after=document_to_dict(document),
+    )
+    return {
+        "status": "processed",
+        "message_id": message_id,
+        "action": "unmatched",
+        "task_id": task.id,
+        "match_reason": match_reason,
+    }
+
+
+def _gmail_storage_uri(message_id: str) -> str:
+    return f"{INBOUND_GMAIL_STORAGE_PREFIX}{message_id}"
+
+
+def _gmail_message_processed(session: Session, message_id: str) -> bool:
+    storage_uri = _gmail_storage_uri(message_id)
+    return bool(session.scalar(select(Document.id).where(Document.storage_uri == storage_uri)))
+
+
+def _match_gmail_reply(
+    session: Session,
+    thread_id: str | None,
+    subject: str,
+    body: str,
+    sender_email: str | None,
+) -> tuple[Referral | None, str]:
+    if thread_id:
+        draft = session.scalar(
+            select(CommunicationDraft)
+            .where(CommunicationDraft.gmail_thread_id == thread_id)
+            .order_by(CommunicationDraft.created_at.desc())
+            .limit(1)
+        )
+        if draft and draft.referral_id:
+            referral = session.get(Referral, draft.referral_id)
+            if referral is not None:
+                return referral, "thread_id"
+
+    referral_id = _extract_referral_id(f"{subject}\n{body}")
+    if referral_id:
+        referral = session.get(Referral, referral_id)
+        if referral is not None:
+            return referral, "referral_id"
+
+    if sender_email and _is_valid_email(sender_email):
+        active_statuses = {
+            "waiting_for_missing_info",
+            "needs_admin_review",
+            "awaiting_patient_contact",
+            "contact_sent",
+            "awaiting_patient_reply",
+        }
+        referral = session.scalar(
+            select(Referral)
+            .where(func.lower(Referral.contact_email) == sender_email.lower())
+            .where(Referral.status.in_(active_statuses))
+            .order_by(Referral.updated_at.desc())
+            .limit(1)
+        )
+        if referral is not None:
+            return referral, "sender_email"
+
+    return None, "unmatched"
+
+
+def _extract_referral_id(text: str) -> str | None:
+    if not text:
+        return None
+    match = re.search(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", text, re.I)
+    return match.group(0) if match else None
+
+
+def _extract_email_address(value: str) -> str | None:
+    if not value:
+        return None
+    match = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", value)
+    return match.group(0).lower() if match else None
+
+
+def _is_missing_info_referral(referral: Referral) -> bool:
+    status = canonical_referral_status(referral.status)
+    return status in {"waiting_for_missing_info", "needs_admin_review"} or bool(referral.missing_fields)
 
 
 def create_duplicate_resolution_review(
@@ -1743,7 +2372,7 @@ def draft_first_contact_message(
         status="draft_pending_review",
         proposed_slots=[appointment.id for appointment in appointments[:3]],
         requires_human_send=True,
-        recipient_email=_recipient_email_for_referral(referral, patient),
+        recipient_email=_outbound_patient_email(referral, patient),
     )
     session.add(draft)
     session.flush()
@@ -1830,7 +2459,7 @@ def draft_intake_packet(
         status="draft_pending_review",
         proposed_slots=[],
         requires_human_send=True,
-        recipient_email=_recipient_email_for_referral(referral, patient),
+        recipient_email=_outbound_patient_email(referral, patient),
     )
     session.add(draft)
     session.flush()
@@ -1925,11 +2554,14 @@ def apply_review_action(
 
     referral = session.get(Referral, task.referral_id) if task.referral_id else None
     if action == "approve" and referral and google_workspace.is_enabled():
-        if task.task_type == "send_approval":
+        if task.task_type in GMAIL_APPROVAL_TASK_TYPES:
             if not _prepare_google_send_approval(session, task, referral, final_text or task.draft_text):
                 return task
         elif task.task_type == "appointment_confirmation_approval":
             if not _prepare_google_appointment_confirmation(session, task, referral):
+                return task
+        elif task.task_type == "appointment_reschedule_approval":
+            if not _prepare_google_appointment_reschedule(session, task, referral):
                 return task
 
     if action == "approve":
@@ -1953,8 +2585,8 @@ def apply_review_action(
     if task.referral_id:
         referral = referral or session.get(Referral, task.referral_id)
         if referral:
-            if action == "approve" and task.task_type == "send_approval":
-                _approve_send_task(session, task, referral)
+            if action == "approve" and task.task_type in GMAIL_APPROVAL_TASK_TYPES:
+                _approve_patient_message_task(session, task, referral)
             elif action == "approve" and task.task_type == "match_approval":
                 transition_referral_status(
                     session,
@@ -1998,14 +2630,8 @@ def apply_review_action(
                 )
             elif action == "approve" and task.task_type == "appointment_confirmation_approval":
                 _approve_appointment_confirmation(session, task, referral)
-            elif action == "approve" and task.task_type == "missing_info_message_approval":
-                transition_referral_status(
-                    session,
-                    referral,
-                    "waiting_for_missing_info",
-                    actor_user_id=task.reviewer_id,
-                    reason="Missing-information message approved for simulated manual send.",
-                )
+            elif action == "approve" and task.task_type == "appointment_reschedule_approval":
+                _approve_appointment_reschedule(session, task, referral)
             elif action == "approve" and task.task_type == "intake_exception_approval":
                 _approve_intake_exception(session, task)
             elif action == "escalate":
@@ -2043,31 +2669,72 @@ def apply_review_action(
         before=before,
         after=review_task_to_dict(task),
     )
+    session.flush()
     return task
 
 
 def _update_reviewed_draft(session: Session, task: HumanReviewTask, action: str) -> None:
-    draft_id = (task.source_payload or {}).get("id") if isinstance(task.source_payload, dict) else None
-    draft = session.get(CommunicationDraft, draft_id) if draft_id else None
+    draft = _draft_for_review_task(session, task)
     if draft is None:
         return
+    before = communication_draft_to_dict(draft)
     if action == "approve" and draft.status == "sent" and draft.gmail_message_id:
         if task.final_text:
             draft.body = task.final_text
         draft.updated_at = utc_now()
+        write_audit(
+            session,
+            tenant_id=draft.tenant_id,
+            actor_user_id=task.reviewer_id,
+            action="draft_review_approve",
+            entity_type="communication_draft",
+            entity_id=draft.id,
+            before=before,
+            after=communication_draft_to_dict(draft),
+        )
         return
     draft.status = "approved_pending_send" if action == "approve" else task.status
     if action == "approve" and task.final_text:
         draft.body = task.final_text
     draft.updated_at = utc_now()
+    write_audit(
+        session,
+        tenant_id=draft.tenant_id,
+        actor_user_id=task.reviewer_id,
+        action=f"draft_review_{action}",
+        entity_type="communication_draft",
+        entity_id=draft.id,
+        before=before,
+        after=communication_draft_to_dict(draft),
+    )
 
 
-def _approve_send_task(session: Session, task: HumanReviewTask, referral: Referral) -> None:
+def _approve_patient_message_task(session: Session, task: HumanReviewTask, referral: Referral) -> None:
     send_reason = (
         "approved and sent through Gmail."
         if google_workspace.is_enabled()
         else "approved for simulated/manual send."
     )
+    if task.task_type == "missing_info_message_approval":
+        transition_referral_status(
+            session,
+            referral,
+            "waiting_for_missing_info",
+            actor_user_id=task.reviewer_id,
+            reason=f"Missing-information message {send_reason}",
+        )
+        return
+    if task.task_type == "intake_reminder_approval":
+        write_audit(
+            session,
+            tenant_id=task.tenant_id,
+            actor_user_id=task.reviewer_id,
+            action="intake_reminder_sent",
+            entity_type="referral",
+            entity_id=referral.id,
+            after={"task_id": task.id, "reason": f"Intake reminder {send_reason}"},
+        )
+        return
     if task.payload_key.startswith("intake_packet_draft"):
         transition_referral_status(
             session,
@@ -2102,6 +2769,55 @@ def _approve_appointment_confirmation(session: Session, task: HumanReviewTask, r
     _maybe_mark_first_session_ready(session, referral)
 
 
+def _approve_appointment_reschedule(session: Session, task: HumanReviewTask, referral: Referral) -> None:
+    appointment = _appointment_for_confirmation_task(session, task)
+    if appointment is None:
+        raise ValueError("Review task is not linked to an appointment.")
+    starts_at, ends_at = _reschedule_window_from_task(task)
+    if starts_at is None or ends_at is None:
+        raise ValueError("Reschedule task is missing a valid proposed time.")
+    if int((ends_at - starts_at).total_seconds() // 60) != SESSION_LENGTH_MINUTES:
+        raise ValueError("Appointments must use the 60-minute Lumen session length.")
+    if _appointment_conflicts(
+        session,
+        appointment.therapist_id or "",
+        starts_at,
+        ends_at,
+        exclude_appointment_id=appointment.id,
+    ):
+        raise ValueError("Appointment reschedule conflicts with an existing proposed or confirmed slot.")
+    if not _therapist_has_weekly_capacity(
+        session,
+        appointment.therapist_id,
+        starts_at,
+        ends_at,
+        exclude_appointment_id=appointment.id,
+    ):
+        raise ValueError("Therapist weekly patient-contact cap would be exceeded.")
+    before = appointment_to_dict(appointment)
+    appointment.starts_at = starts_at
+    appointment.ends_at = ends_at
+    appointment.last_provider_error = None
+    appointment.updated_at = utc_now()
+    write_audit(
+        session,
+        tenant_id=appointment.tenant_id,
+        actor_user_id=task.reviewer_id,
+        action="reschedule",
+        entity_type="appointment",
+        entity_id=appointment.id,
+        before=before,
+        after=appointment_to_dict(appointment),
+    )
+    transition_referral_status(
+        session,
+        referral,
+        "appointment_confirmed",
+        actor_user_id=task.reviewer_id,
+        reason="Appointment reschedule approved.",
+    )
+
+
 def _prepare_google_send_approval(
     session: Session,
     task: HumanReviewTask,
@@ -2118,7 +2834,7 @@ def _prepare_google_send_approval(
         return False
 
     patient = session.get(Patient, referral.patient_id or "") if referral.patient_id else None
-    recipient_email = (draft.recipient_email or _recipient_email_for_referral(referral, patient) or "").strip()
+    recipient_email = (_outbound_patient_email(referral, patient) or "").strip()
     if not _is_valid_email(recipient_email):
         error = "Recipient email is missing or invalid; Gmail send was not attempted."
         draft.last_provider_error = error
@@ -2151,7 +2867,12 @@ def _prepare_google_send_approval(
             raise google_workspace.GoogleWorkspaceError("Gmail did not return a message ID.")
     except Exception as exc:
         error = google_workspace.provider_error_message(exc)
+        draft.status = "draft_pending_review"
+        draft.sent_at = None
+        draft.gmail_message_id = None
+        draft.gmail_thread_id = None
         draft.last_provider_error = error
+        draft.updated_at = utc_now()
         _record_task_provider_failure(session, task, error, entity_type="communication_draft", entity_id=draft.id)
         return False
 
@@ -2185,6 +2906,11 @@ def _prepare_google_appointment_confirmation(session: Session, task: HumanReview
         appointment.last_provider_error = error
         _record_task_provider_failure(session, task, error, entity_type="appointment", entity_id=appointment.id)
         return False
+    if int((appointment.ends_at - appointment.starts_at).total_seconds() // 60) != SESSION_LENGTH_MINUTES:
+        error = "Appointments must use the 60-minute Lumen session length."
+        appointment.last_provider_error = error
+        _record_task_provider_failure(session, task, error, entity_type="appointment", entity_id=appointment.id)
+        return False
     if _appointment_conflicts(
         session,
         appointment.therapist_id or "",
@@ -2200,10 +2926,27 @@ def _prepare_google_appointment_confirmation(session: Session, task: HumanReview
         appointment.last_provider_error = None
         _clear_task_provider_error(task)
         return True
+    if not _therapist_has_weekly_capacity(session, appointment.therapist_id, appointment.starts_at, appointment.ends_at, exclude_appointment_id=appointment.id):
+        error = "Therapist weekly patient-contact cap would be exceeded."
+        appointment.last_provider_error = error
+        _record_task_provider_failure(session, task, error, entity_type="appointment", entity_id=appointment.id)
+        return False
+    try:
+        google_busy = _google_busy_window(appointment.starts_at, _with_session_buffer(appointment.ends_at))
+    except Exception as exc:
+        error = google_workspace.provider_error_message(exc)
+        appointment.last_provider_error = error
+        _record_task_provider_failure(session, task, error, entity_type="appointment", entity_id=appointment.id)
+        return False
+    if _overlaps_busy(appointment.starts_at, _with_session_buffer(appointment.ends_at), google_busy):
+        error = "Appointment conflicts with Google Calendar busy time."
+        appointment.last_provider_error = error
+        _record_task_provider_failure(session, task, error, entity_type="appointment", entity_id=appointment.id)
+        return False
 
     patient = session.get(Patient, appointment.patient_id or "") if appointment.patient_id else None
     therapist = session.get(Therapist, appointment.therapist_id or "") if appointment.therapist_id else None
-    patient_email = _recipient_email_for_referral(referral, patient)
+    patient_email = _outbound_patient_email(referral, patient)
     therapist_email = therapist.email.strip() if therapist and therapist.email else None
     if patient_email and not _is_valid_email(patient_email):
         patient_email = None
@@ -2218,6 +2961,9 @@ def _prepare_google_appointment_confirmation(session: Session, task: HumanReview
             referral_id=appointment.referral_id,
             starts_at=appointment.starts_at,
             ends_at=appointment.ends_at,
+            patient_name=referral.patient_name or (patient.display_name if patient else None),
+            therapist_name=therapist.name if therapist else None,
+            therapist_id=therapist.id if therapist else None,
             patient_email=patient_email,
             therapist_email=therapist_email,
             calendar_id=appointment.google_calendar_id,
@@ -2250,9 +2996,125 @@ def _prepare_google_appointment_confirmation(session: Session, task: HumanReview
     return True
 
 
+def _prepare_google_appointment_reschedule(session: Session, task: HumanReviewTask, referral: Referral) -> bool:
+    appointment = _appointment_for_confirmation_task(session, task)
+    if appointment is None:
+        _record_task_provider_failure(session, task, "Review task is not linked to an appointment.")
+        return False
+    starts_at, ends_at = _reschedule_window_from_task(task)
+    if starts_at is None or ends_at is None:
+        error = "Reschedule task is missing a valid proposed time."
+        appointment.last_provider_error = error
+        _record_task_provider_failure(session, task, error, entity_type="appointment", entity_id=appointment.id)
+        return False
+    if int((ends_at - starts_at).total_seconds() // 60) != SESSION_LENGTH_MINUTES:
+        error = "Appointments must use the 60-minute Lumen session length."
+        appointment.last_provider_error = error
+        _record_task_provider_failure(session, task, error, entity_type="appointment", entity_id=appointment.id)
+        return False
+    if not appointment.google_calendar_event_id:
+        error = "Appointment is missing its Google Calendar event ID; reschedule cannot sync."
+        appointment.last_provider_error = error
+        _record_task_provider_failure(session, task, error, entity_type="appointment", entity_id=appointment.id)
+        return False
+    if _appointment_conflicts(
+        session,
+        appointment.therapist_id or "",
+        starts_at,
+        ends_at,
+        exclude_appointment_id=appointment.id,
+    ):
+        error = "Appointment reschedule conflicts with an existing proposed or confirmed slot."
+        appointment.last_provider_error = error
+        _record_task_provider_failure(session, task, error, entity_type="appointment", entity_id=appointment.id)
+        return False
+    if not _therapist_has_weekly_capacity(session, appointment.therapist_id, starts_at, ends_at, exclude_appointment_id=appointment.id):
+        error = "Therapist weekly patient-contact cap would be exceeded."
+        appointment.last_provider_error = error
+        _record_task_provider_failure(session, task, error, entity_type="appointment", entity_id=appointment.id)
+        return False
+    try:
+        google_busy = _google_busy_window(starts_at, _with_session_buffer(ends_at))
+    except Exception as exc:
+        error = google_workspace.provider_error_message(exc)
+        appointment.last_provider_error = error
+        _record_task_provider_failure(session, task, error, entity_type="appointment", entity_id=appointment.id)
+        return False
+    if _overlaps_busy(starts_at, _with_session_buffer(ends_at), google_busy):
+        error = "Reschedule conflicts with Google Calendar busy time."
+        appointment.last_provider_error = error
+        _record_task_provider_failure(session, task, error, entity_type="appointment", entity_id=appointment.id)
+        return False
+
+    patient = session.get(Patient, appointment.patient_id or "") if appointment.patient_id else None
+    therapist = session.get(Therapist, appointment.therapist_id or "") if appointment.therapist_id else None
+    patient_email = _outbound_patient_email(referral, patient)
+    therapist_email = therapist.email.strip() if therapist and therapist.email else None
+    if patient_email and not _is_valid_email(patient_email):
+        patient_email = None
+    if therapist_email and not _is_valid_email(therapist_email):
+        therapist_email = None
+
+    before = appointment_to_dict(appointment)
+    try:
+        result = google_workspace.update_appointment_event(
+            event_id=appointment.google_calendar_event_id,
+            appointment_id=appointment.id,
+            tenant_id=appointment.tenant_id,
+            referral_id=appointment.referral_id,
+            starts_at=starts_at,
+            ends_at=ends_at,
+            patient_name=referral.patient_name or (patient.display_name if patient else None),
+            therapist_name=therapist.name if therapist else None,
+            therapist_id=therapist.id if therapist else None,
+            patient_email=patient_email,
+            therapist_email=therapist_email,
+            calendar_id=appointment.google_calendar_id,
+        )
+    except Exception as exc:
+        error = google_workspace.provider_error_message(exc)
+        appointment.last_provider_error = error
+        _record_task_provider_failure(session, task, error, entity_type="appointment", entity_id=appointment.id)
+        return False
+
+    appointment.google_calendar_id = str(result.get("calendar_id") or google_workspace.settings().calendar_id)
+    appointment.google_calendar_event_id = str(result.get("event_id") or appointment.google_calendar_event_id)
+    appointment.google_calendar_event_link = str(result.get("event_link") or appointment.google_calendar_event_link or "").strip() or None
+    appointment.google_calendar_synced_at = utc_now()
+    appointment.last_provider_error = None
+    _clear_task_provider_error(task)
+    write_audit(
+        session,
+        tenant_id=appointment.tenant_id,
+        actor_user_id=task.reviewer_id,
+        action="provider_calendar_event_update",
+        entity_type="appointment",
+        entity_id=appointment.id,
+        before=before,
+        after=appointment_to_dict(appointment),
+    )
+    return True
+
+
 def _draft_for_review_task(session: Session, task: HumanReviewTask) -> CommunicationDraft | None:
     draft_id = (task.source_payload or {}).get("id") if isinstance(task.source_payload, dict) else None
-    return session.get(CommunicationDraft, draft_id) if draft_id else None
+    if draft_id:
+        draft = session.get(CommunicationDraft, draft_id)
+        if draft is not None:
+            return draft
+    if not task.workflow_run_id and not task.referral_id:
+        return None
+    query = select(CommunicationDraft).order_by(CommunicationDraft.created_at.desc()).limit(1)
+    if task.workflow_run_id:
+        query = query.where(CommunicationDraft.workflow_run_id == task.workflow_run_id)
+    if task.referral_id:
+        query = query.where(CommunicationDraft.referral_id == task.referral_id)
+    draft = session.scalar(query)
+    if draft is not None:
+        payload = task.source_payload if isinstance(task.source_payload, dict) else {}
+        task.source_payload = json_safe({**payload, **communication_draft_to_dict(draft)})
+        task.updated_at = utc_now()
+    return draft
 
 
 def _appointment_for_confirmation_task(session: Session, task: HumanReviewTask) -> Appointment | None:
@@ -2557,7 +3419,9 @@ def propose_appointment_slots(
     if therapist.tenant_id != referral.tenant_id:
         raise ValueError("Therapist and referral tenants do not match.")
 
-    google_busy = _google_busy_intervals_for_slot_proposal() if google_workspace.is_enabled() else []
+    search_start = utc_now()
+    search_end = search_start + timedelta(days=29)
+    google_busy = _google_busy_intervals_for_slot_proposal(search_start, search_end) if google_workspace.is_enabled() else []
     proposals = []
     existing = list(
         session.scalars(
@@ -2570,19 +3434,29 @@ def propose_appointment_slots(
         )
     )
     for appointment in existing:
-        if appointment.starts_at and appointment.ends_at and _overlaps_busy(appointment.starts_at, appointment.ends_at, google_busy):
+        if appointment.starts_at and appointment.ends_at and _overlaps_busy(appointment.starts_at, _with_session_buffer(appointment.ends_at), google_busy):
+            continue
+        if appointment.starts_at and appointment.ends_at and not _therapist_has_weekly_capacity(
+            session,
+            therapist.id,
+            appointment.starts_at,
+            appointment.ends_at,
+            exclude_appointment_id=appointment.id,
+        ):
             continue
         proposals.append(appointment_to_dict(appointment))
         if len(proposals) >= limit:
             break
 
     if len(proposals) < limit:
-        for starts_at, ends_at, block in _generate_slots(therapist.availability_blocks, limit * 4):
+        for starts_at, ends_at, block in _generate_slots(therapist.availability_blocks, limit * 16):
             if len(proposals) >= limit:
                 break
             if _appointment_conflicts(session, therapist.id, starts_at, ends_at):
                 continue
-            if _overlaps_busy(starts_at, ends_at, google_busy):
+            if _overlaps_busy(starts_at, _with_session_buffer(ends_at), google_busy):
+                continue
+            if not _therapist_has_weekly_capacity(session, therapist.id, starts_at, ends_at):
                 continue
             appointment = Appointment(
                 tenant_id=referral.tenant_id,
@@ -2642,12 +3516,189 @@ def list_appointments(
     return [appointment_to_dict(item) for item in session.scalars(query)]
 
 
+def therapist_calendar_capacity(session: Session, tenant_id: str | None = None) -> dict[str, Any]:
+    therapists = list(session.scalars(select(Therapist).where(Therapist.tenant_id == tenant_id).order_by(Therapist.name))) if tenant_id else list(
+        session.scalars(select(Therapist).order_by(Therapist.name))
+    )
+    window_start = utc_now()
+    window_end = window_start + timedelta(days=14)
+    google_enabled = google_workspace.is_enabled()
+    busy_periods: list[dict[str, Any]] = []
+    lumen_events: list[dict[str, Any]] = []
+    provider_error: str | None = None
+
+    if google_enabled:
+        try:
+            busy_periods = [
+                {
+                    "start": iso_or_none(item.get("start")),
+                    "end": iso_or_none(item.get("end")),
+                    "source": "google_calendar",
+                    "summary": "Google Calendar busy block",
+                }
+                for item in google_workspace.query_calendar_busy(time_min=window_start, time_max=window_end)
+            ]
+            try:
+                lumen_events = google_workspace.list_lumen_appointment_events(time_min=window_start, time_max=window_end)
+            except Exception:
+                lumen_events = []
+        except Exception as exc:
+            provider_error = google_workspace.provider_error_message(exc)
+
+    event_appointment_ids = {
+        str(event.get("lumen_appointment_id"))
+        for event in lumen_events
+        if event.get("lumen_appointment_id")
+    }
+    local_query = select(Appointment).where(Appointment.status.in_(["proposed", "confirmed"]))
+    if tenant_id:
+        local_query = local_query.where(Appointment.tenant_id == tenant_id)
+    local_appointment_ids = {appointment.id for appointment in session.scalars(local_query)}
+    unmatched_events = [
+        _calendar_event_to_dict(event)
+        for event in lumen_events
+        if event.get("lumen_appointment_id") and str(event.get("lumen_appointment_id")) not in local_appointment_ids
+    ]
+    malformed_events = [
+        _calendar_event_to_dict(event)
+        for event in lumen_events
+        if not event.get("lumen_appointment_id") or not event.get("lumen_therapist_id")
+    ]
+
+    return {
+        "tenant_id": tenant_id,
+        "window_start": iso_or_none(window_start),
+        "window_end": iso_or_none(window_end),
+        "google_enabled": google_enabled,
+        "provider_error": provider_error,
+        "therapists": [
+            _therapist_calendar_capacity_summary(
+                session,
+                therapist,
+                busy_periods=busy_periods,
+                google_enabled=google_enabled,
+                provider_error=provider_error,
+                event_appointment_ids=event_appointment_ids,
+            )
+            for therapist in therapists
+        ],
+        "unmatched_calendar_events": unmatched_events,
+        "malformed_calendar_events": malformed_events,
+    }
+
+
+def create_manual_appointment_proposal(
+    session: Session,
+    *,
+    referral_id: str,
+    therapist_id: str,
+    starts_at: datetime,
+    ends_at: datetime | None = None,
+) -> dict[str, Any]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    therapist = session.get(Therapist, therapist_id)
+    if therapist is None:
+        raise KeyError(f"Unknown therapist: {therapist_id}")
+    if therapist.tenant_id != referral.tenant_id:
+        raise ValueError("Therapist and referral tenants do not match.")
+    starts_at = _aware_utc(starts_at)
+    ends_at = _aware_utc(ends_at) if ends_at else starts_at + timedelta(minutes=SESSION_LENGTH_MINUTES)
+    _validate_appointment_window(session, therapist.id, starts_at, ends_at)
+
+    appointment = Appointment(
+        tenant_id=referral.tenant_id,
+        patient_id=referral.patient_id,
+        therapist_id=therapist.id,
+        referral_id=referral.id,
+        starts_at=starts_at,
+        ends_at=ends_at,
+        status="proposed",
+        source="therapist_calendar_drag_drop",
+    )
+    session.add(appointment)
+    session.flush()
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="create",
+        entity_type="appointment",
+        entity_id=appointment.id,
+        after=appointment_to_dict(appointment),
+    )
+    transition_referral_status(
+        session,
+        referral,
+        "slot_options_ready",
+        reason="Appointment slot proposed from therapist calendar.",
+    )
+    task = create_review_task(
+        session,
+        tenant_id=referral.tenant_id,
+        workflow_run_id=referral.workflow_run_id,
+        referral_id=referral.id,
+        patient_id=referral.patient_id,
+        task_type="slot_offer_approval",
+        reason="Proposed appointment slot requires admin approval before being offered to the patient.",
+        payload_key=f"slot_option:{appointment.id[:8]}",
+        source_payload={"appointments": [appointment_to_dict(appointment)]},
+    )
+    return {"appointment": appointment_to_dict(appointment), "task": review_task_to_dict(task)}
+
+
+def request_appointment_reschedule(
+    session: Session,
+    *,
+    appointment_id: str,
+    starts_at: datetime,
+    ends_at: datetime | None = None,
+    reason: str = "Appointment reschedule requires admin approval.",
+) -> HumanReviewTask:
+    appointment = session.get(Appointment, appointment_id)
+    if appointment is None:
+        raise KeyError(f"Unknown appointment: {appointment_id}")
+    if not appointment.referral_id:
+        raise ValueError("Appointment is not linked to a referral.")
+    referral = session.get(Referral, appointment.referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {appointment.referral_id}")
+    starts_at = _aware_utc(starts_at)
+    ends_at = _aware_utc(ends_at) if ends_at else starts_at + timedelta(minutes=SESSION_LENGTH_MINUTES)
+    _validate_appointment_window(
+        session,
+        appointment.therapist_id,
+        starts_at,
+        ends_at,
+        exclude_appointment_id=appointment.id,
+    )
+    return create_review_task(
+        session,
+        tenant_id=appointment.tenant_id,
+        workflow_run_id=referral.workflow_run_id,
+        referral_id=appointment.referral_id,
+        patient_id=appointment.patient_id,
+        task_type="appointment_reschedule_approval",
+        reason=reason,
+        payload_key=f"appointment_reschedule:{appointment.id[:8]}",
+        source_payload={
+            "appointment_id": appointment.id,
+            "proposed_starts_at": iso_or_none(starts_at),
+            "proposed_ends_at": iso_or_none(ends_at),
+            "reason": reason,
+        },
+        draft_text=reason,
+    )
+
+
 def confirm_appointment(session: Session, appointment_id: str) -> dict[str, Any]:
     appointment = session.get(Appointment, appointment_id)
     if appointment is None:
         raise KeyError(f"Unknown appointment: {appointment_id}")
     if not appointment.starts_at or not appointment.ends_at:
         raise ValueError("Appointment has no proposed time.")
+    if int((appointment.ends_at - appointment.starts_at).total_seconds() // 60) != SESSION_LENGTH_MINUTES:
+        raise ValueError("Appointments must use the 60-minute Lumen session length.")
     if google_workspace.is_enabled() and not appointment.google_calendar_event_id:
         raise ValueError("Google Calendar event creation is required before local appointment confirmation.")
     if _appointment_conflicts(
@@ -2658,6 +3709,14 @@ def confirm_appointment(session: Session, appointment_id: str) -> dict[str, Any]
         exclude_appointment_id=appointment.id,
     ):
         raise ValueError("Appointment conflicts with an existing proposed or confirmed slot.")
+    if not _therapist_has_weekly_capacity(
+        session,
+        appointment.therapist_id,
+        appointment.starts_at,
+        appointment.ends_at,
+        exclude_appointment_id=appointment.id,
+    ):
+        raise ValueError("Therapist weekly patient-contact cap would be exceeded.")
     before = appointment_to_dict(appointment)
     appointment.status = "confirmed"
     appointment.updated_at = utc_now()
@@ -2948,7 +4007,7 @@ def generate_missing_intake_reminder(session: Session, referral_id: str) -> dict
         status="draft_pending_review",
         proposed_slots=[],
         requires_human_send=True,
-        recipient_email=_recipient_email_for_referral(referral, patient),
+        recipient_email=_outbound_patient_email(referral, patient),
     )
     session.add(draft)
     session.flush()
@@ -3158,12 +4217,14 @@ def generate_prep_brief(session: Session, referral_id: str, therapist_id: str | 
     session.add(brief)
     session.flush()
     if not _maybe_mark_first_session_ready(session, referral):
-        transition_referral_status(
-            session,
-            referral,
-            "prep_brief_ready",
-            reason="Therapist prep brief generated.",
-        )
+        prep_blockers = _pre_prep_readiness_blockers(session, referral)
+        if not prep_blockers:
+            transition_referral_status(
+                session,
+                referral,
+                "prep_brief_ready",
+                reason="Therapist prep brief generated.",
+            )
     write_audit(
         session,
         tenant_id=referral.tenant_id,
@@ -3722,7 +4783,7 @@ def update_referral_from_result(session: Session, run: WorkflowRun) -> None:
             body=draft_data.get("body") or "",
             proposed_slots=draft_data.get("proposed_slots") or [],
             requires_human_send=bool(draft_data.get("requires_human_send", True)),
-            recipient_email=_recipient_email_for_referral(referral, session.get(Patient, run.patient_id or "") if run.patient_id else None),
+            recipient_email=_outbound_patient_email(referral, session.get(Patient, run.patient_id or "") if run.patient_id else None),
         )
         session.add(draft)
         session.flush()
@@ -3756,6 +4817,8 @@ def persist_human_review_tasks(session: Session, run: WorkflowRun) -> None:
             task_type = "clinical_risk_review"
         payload_key = item.get("payload_key") or "workflow"
         source_payload = outputs.get(payload_key) or item
+        if task_type == "send_approval":
+            source_payload = _linked_communication_draft_payload(session, run, source_payload)
         create_review_task(
             session,
             tenant_id=run.tenant_id,
@@ -3768,6 +4831,31 @@ def persist_human_review_tasks(session: Session, run: WorkflowRun) -> None:
             source_payload=json_safe(source_payload),
             draft_text=_draft_text_for_payload(source_payload),
         )
+
+
+def _linked_communication_draft_payload(session: Session, run: WorkflowRun, source_payload: Any) -> Any:
+    if isinstance(source_payload, dict) and source_payload.get("id"):
+        return source_payload
+    draft = session.scalar(
+        select(CommunicationDraft)
+        .where(
+            CommunicationDraft.tenant_id == run.tenant_id,
+            CommunicationDraft.workflow_run_id == run.id,
+            CommunicationDraft.referral_id == run.referral_id,
+        )
+        .order_by(CommunicationDraft.created_at.desc())
+        .limit(1)
+    )
+    if draft is None and run.referral_id:
+        referral = session.get(Referral, run.referral_id)
+        if referral and referral.communication_draft_id:
+            draft = session.get(CommunicationDraft, referral.communication_draft_id)
+    if draft is None:
+        return source_payload
+    payload = communication_draft_to_dict(draft)
+    if isinstance(source_payload, dict):
+        payload.update({key: value for key, value in source_payload.items() if key not in payload or payload[key] in (None, "", [])})
+    return payload
 
 
 def approval_payload_for_task(session: Session, task: HumanReviewTask) -> dict[str, Any] | None:
@@ -3875,6 +4963,11 @@ def _journey_blockers(
 
     if _calendar_conflict_for_referral(session, referral):
         _append_blocker(blockers, "calendar_conflict", "Calendar conflict", "danger")
+    if _calendar_sync_issue_for_referral(session, referral):
+        _append_blocker(blockers, "calendar_sync_issue", "Calendar sync issue", "danger")
+    provider_error = _provider_error_for_referral(session, referral)
+    if provider_error:
+        _append_blocker(blockers, "provider_error", provider_error, "danger")
 
     for task in open_tasks:
         _append_blocker(blockers, f"review_{task.task_type}", f"Open review: {task.task_type.replace('_', ' ')}", "warning")
@@ -3954,6 +5047,47 @@ def _calendar_conflict_for_referral(session: Session, referral: Referral) -> boo
         if conflict is not None:
             return True
     return False
+
+
+def _calendar_sync_issue_for_referral(session: Session, referral: Referral) -> bool:
+    if not google_workspace.is_enabled():
+        return False
+    return (
+        session.scalar(
+            select(Appointment)
+            .where(
+                Appointment.referral_id == referral.id,
+                Appointment.status == "confirmed",
+                Appointment.google_calendar_event_id.is_(None),
+            )
+            .limit(1)
+        )
+        is not None
+    )
+
+
+def _provider_error_for_referral(session: Session, referral: Referral) -> str | None:
+    draft = session.scalar(
+        select(CommunicationDraft)
+        .where(
+            CommunicationDraft.referral_id == referral.id,
+            CommunicationDraft.last_provider_error.is_not(None),
+        )
+        .order_by(CommunicationDraft.updated_at.desc())
+        .limit(1)
+    )
+    if draft and draft.last_provider_error:
+        return draft.last_provider_error
+    appointment = session.scalar(
+        select(Appointment)
+        .where(
+            Appointment.referral_id == referral.id,
+            Appointment.last_provider_error.is_not(None),
+        )
+        .order_by(Appointment.updated_at.desc())
+        .limit(1)
+    )
+    return appointment.last_provider_error if appointment and appointment.last_provider_error else None
 
 
 def _journey_card_needs_action(card: dict[str, Any]) -> bool:
@@ -4312,6 +5446,11 @@ def therapist_to_dict(therapist: Therapist) -> dict[str, Any]:
 
 
 def appointment_to_dict(appointment: Appointment) -> dict[str, Any]:
+    calendar_sync_issue = bool(
+        google_workspace.is_enabled()
+        and appointment.status == "confirmed"
+        and not appointment.google_calendar_event_id
+    )
     return {
         "id": appointment.id,
         "tenant_id": appointment.tenant_id,
@@ -4327,6 +5466,7 @@ def appointment_to_dict(appointment: Appointment) -> dict[str, Any]:
         "google_calendar_event_link": appointment.google_calendar_event_link,
         "google_calendar_synced_at": iso_or_none(appointment.google_calendar_synced_at),
         "last_provider_error": appointment.last_provider_error,
+        "calendar_sync_issue": calendar_sync_issue,
         "created_at": iso_or_none(appointment.created_at),
         "updated_at": iso_or_none(appointment.updated_at),
     }
@@ -4605,9 +5745,17 @@ def _score_therapist_for_referral(session: Session, referral: Referral, therapis
 
     if not therapist.active:
         exclusions.append("inactive therapist profile")
-    active_count = _active_appointment_count_this_week(session, therapist.id)
-    if therapist.capacity_per_week and active_count >= therapist.capacity_per_week:
-        exclusions.append("weekly capacity is full")
+    week_start, week_end = _week_bounds(utc_now())
+    active_minutes = _therapist_patient_contact_minutes(
+        session,
+        therapist.id,
+        week_start,
+        week_end,
+        statuses=("proposed", "confirmed"),
+    )
+    active_hours = round(active_minutes / 60, 2)
+    if active_minutes >= THERAPIST_WEEKLY_PATIENT_CONTACT_CAP_HOURS * 60:
+        exclusions.append("weekly patient-contact cap is full")
 
     insurer = _normal(referral.insurer)
     if insurer and therapist.insurers:
@@ -4650,8 +5798,8 @@ def _score_therapist_for_referral(session: Session, referral: Referral, therapis
         "excluded": bool(exclusions),
         "reasons": reasons or ["no preference matches beyond baseline availability"],
         "exclusion_reasons": exclusions,
-        "capacity_used_this_week": active_count,
-        "capacity_per_week": therapist.capacity_per_week,
+        "capacity_used_this_week": active_hours,
+        "capacity_per_week": THERAPIST_WEEKLY_PATIENT_CONTACT_CAP_HOURS,
         "availability_blocks": therapist.availability_blocks,
     }
 
@@ -4693,24 +5841,22 @@ def _generate_slots(blocks: list[dict], max_candidates: int) -> list[tuple[datet
     }
     now = utc_now()
     slots = []
+    source_blocks = blocks or DEFAULT_AVAILABILITY_BLOCKS
     for day_offset in range(1, 29):
         candidate_date = (now + timedelta(days=day_offset)).date()
-        for block in blocks or []:
+        for block in source_blocks:
             weekday = weekday_map.get(str(block.get("weekday") or "").strip().lower())
             if weekday is None or candidate_date.weekday() != weekday:
                 continue
-            start_time = _parse_time(block.get("start")) or time(9, 0)
-            end_time = _parse_time(block.get("end")) or time(17, 0)
-            starts_at = datetime.combine(candidate_date, start_time, tzinfo=timezone.utc)
-            ends_at = min(
-                datetime.combine(candidate_date, end_time, tzinfo=timezone.utc),
-                starts_at + timedelta(minutes=50),
-            )
-            if ends_at <= starts_at:
-                ends_at = starts_at + timedelta(minutes=50)
-            slots.append((starts_at, ends_at, block))
-            if len(slots) >= max_candidates:
-                return slots
+            block_start = datetime.combine(candidate_date, _parse_time(block.get("start")) or time(8, 0), tzinfo=timezone.utc)
+            block_end = datetime.combine(candidate_date, _parse_time(block.get("end")) or time(21, 0), tzinfo=timezone.utc)
+            starts_at = block_start
+            while starts_at + timedelta(minutes=SESSION_LENGTH_MINUTES) <= block_end:
+                ends_at = starts_at + timedelta(minutes=SESSION_LENGTH_MINUTES)
+                slots.append((starts_at, ends_at, block))
+                if len(slots) >= max_candidates:
+                    return slots
+                starts_at = _with_session_buffer(ends_at)
     return slots
 
 
@@ -4723,20 +5869,25 @@ def _appointment_conflicts(
 ) -> bool:
     if not therapist_id:
         return False
+    conflict_start = starts_at
+    conflict_end = _with_session_buffer(ends_at)
     query = select(Appointment).where(
         Appointment.therapist_id == therapist_id,
         Appointment.status.in_(["proposed", "confirmed"]),
-        Appointment.starts_at < ends_at,
-        Appointment.ends_at > starts_at,
+        Appointment.starts_at < conflict_end,
+        Appointment.ends_at > conflict_start - timedelta(minutes=SESSION_BUFFER_MINUTES),
     )
     if exclude_appointment_id:
         query = query.where(Appointment.id != exclude_appointment_id)
     return session.scalar(query.limit(1)) is not None
 
 
-def _google_busy_intervals_for_slot_proposal() -> list[dict[str, datetime]]:
-    start = utc_now()
-    end = start + timedelta(days=29)
+def _google_busy_intervals_for_slot_proposal(
+    time_min: datetime | None = None,
+    time_max: datetime | None = None,
+) -> list[dict[str, datetime]]:
+    start = time_min or utc_now()
+    end = time_max or start + timedelta(days=29)
     try:
         return google_workspace.query_calendar_busy(time_min=start, time_max=end)
     except Exception as exc:
@@ -4752,6 +5903,255 @@ def _overlaps_busy(starts_at: datetime, ends_at: datetime, busy_intervals: list[
         if busy_start and busy_end and starts_at < busy_end and ends_at > busy_start:
             return True
     return False
+
+
+def _google_busy_window(starts_at: datetime, ends_at: datetime) -> list[dict[str, datetime]]:
+    if not google_workspace.is_enabled():
+        return []
+    return google_workspace.query_calendar_busy(time_min=starts_at, time_max=ends_at)
+
+
+def _with_session_buffer(ends_at: datetime) -> datetime:
+    return ends_at + timedelta(minutes=SESSION_BUFFER_MINUTES)
+
+
+def _aware_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _reschedule_window_from_task(task: HumanReviewTask) -> tuple[datetime | None, datetime | None]:
+    payload = task.source_payload if isinstance(task.source_payload, dict) else {}
+    starts_at = _parse_datetime(payload.get("proposed_starts_at"))
+    ends_at = _parse_datetime(payload.get("proposed_ends_at"))
+    if starts_at and not ends_at:
+        ends_at = starts_at + timedelta(minutes=SESSION_LENGTH_MINUTES)
+    return starts_at, ends_at
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return _aware_utc(value)
+    if not value:
+        return None
+    try:
+        return _aware_utc(datetime.fromisoformat(str(value).replace("Z", "+00:00")))
+    except ValueError:
+        return None
+
+
+def _outbound_patient_email(referral: Referral, patient: Patient | None = None) -> str | None:
+    override = os.getenv("LUMEN_OUTBOUND_PATIENT_EMAIL_OVERRIDE", "").strip()
+    return override or DEMO_OUTBOUND_PATIENT_EMAIL
+
+
+def _therapist_has_weekly_capacity(
+    session: Session,
+    therapist_id: str | None,
+    starts_at: datetime | None,
+    ends_at: datetime | None,
+    *,
+    exclude_appointment_id: str | None = None,
+) -> bool:
+    if not therapist_id or not starts_at or not ends_at:
+        return True
+    week_start, week_end = _week_bounds(starts_at)
+    used_minutes = _therapist_patient_contact_minutes(
+        session,
+        therapist_id,
+        week_start,
+        week_end,
+        statuses=("proposed", "confirmed"),
+        exclude_appointment_id=exclude_appointment_id,
+    )
+    candidate_minutes = max(0, int((ends_at - starts_at).total_seconds() // 60))
+    cap_minutes = THERAPIST_WEEKLY_PATIENT_CONTACT_CAP_HOURS * 60
+    return used_minutes + candidate_minutes <= cap_minutes
+
+
+def _therapist_patient_contact_minutes(
+    session: Session,
+    therapist_id: str,
+    week_start: datetime,
+    week_end: datetime,
+    *,
+    statuses: tuple[str, ...] = ("confirmed",),
+    exclude_appointment_id: str | None = None,
+) -> int:
+    query = select(Appointment).where(
+        Appointment.therapist_id == therapist_id,
+        Appointment.status.in_(list(statuses)),
+        Appointment.starts_at >= week_start,
+        Appointment.starts_at < week_end,
+    )
+    if exclude_appointment_id:
+        query = query.where(Appointment.id != exclude_appointment_id)
+    minutes = 0
+    for appointment in session.scalars(query):
+        if appointment.starts_at and appointment.ends_at:
+            minutes += max(0, int((appointment.ends_at - appointment.starts_at).total_seconds() // 60))
+    return minutes
+
+
+def _week_bounds(value: datetime) -> tuple[datetime, datetime]:
+    value = _aware_utc(value)
+    start = value - timedelta(days=value.weekday())
+    start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start, start + timedelta(days=7)
+
+
+def _validate_appointment_window(
+    session: Session,
+    therapist_id: str | None,
+    starts_at: datetime,
+    ends_at: datetime,
+    *,
+    exclude_appointment_id: str | None = None,
+) -> None:
+    if ends_at <= starts_at:
+        raise ValueError("Appointment end time must be after start time.")
+    if int((ends_at - starts_at).total_seconds() // 60) != SESSION_LENGTH_MINUTES:
+        raise ValueError("Appointments must use the 60-minute Lumen session length.")
+    if _appointment_conflicts(session, therapist_id or "", starts_at, ends_at, exclude_appointment_id=exclude_appointment_id):
+        raise ValueError("Appointment conflicts with an existing proposed or confirmed slot.")
+    if google_workspace.is_enabled():
+        try:
+            google_busy = _google_busy_window(starts_at, _with_session_buffer(ends_at))
+        except Exception as exc:
+            raise ValueError(
+                f"Google Calendar availability could not be checked: {google_workspace.provider_error_message(exc)}"
+            ) from exc
+        if _overlaps_busy(starts_at, _with_session_buffer(ends_at), google_busy):
+            raise ValueError("Appointment conflicts with Google Calendar busy time.")
+    if not _therapist_has_weekly_capacity(
+        session,
+        therapist_id,
+        starts_at,
+        ends_at,
+        exclude_appointment_id=exclude_appointment_id,
+    ):
+        raise ValueError("Therapist weekly patient-contact cap would be exceeded.")
+
+
+def _therapist_calendar_capacity_summary(
+    session: Session,
+    therapist: Therapist,
+    *,
+    busy_periods: list[dict[str, Any]],
+    google_enabled: bool,
+    provider_error: str | None,
+    event_appointment_ids: set[str],
+) -> dict[str, Any]:
+    week_start, week_end = _week_bounds(utc_now())
+    confirmed_minutes = _therapist_patient_contact_minutes(
+        session,
+        therapist.id,
+        week_start,
+        week_end,
+        statuses=("confirmed",),
+    )
+    used_hours = round(confirmed_minutes / 60, 2)
+    remaining_hours = max(0, THERAPIST_WEEKLY_PATIENT_CONTACT_CAP_HOURS - used_hours)
+    appointments = list(
+        session.scalars(
+            select(Appointment)
+            .where(Appointment.therapist_id == therapist.id, Appointment.status.in_(["proposed", "confirmed"]))
+            .order_by(Appointment.starts_at.asc())
+        )
+    )
+    sync_issues = []
+    for appointment in appointments:
+        if google_enabled and appointment.status == "confirmed" and not appointment.google_calendar_event_id:
+            sync_issues.append(
+                {
+                    "code": "calendar_sync_issue",
+                    "appointment_id": appointment.id,
+                    "message": "Confirmed local appointment is missing a Google Calendar event ID.",
+                }
+            )
+        if appointment.last_provider_error:
+            sync_issues.append(
+                {
+                    "code": "provider_error",
+                    "appointment_id": appointment.id,
+                    "message": appointment.last_provider_error,
+                }
+            )
+        if appointment.google_calendar_event_id and appointment.id not in event_appointment_ids and google_enabled:
+            sync_issues.append(
+                {
+                    "code": "calendar_event_not_seen",
+                    "appointment_id": appointment.id,
+                    "message": "Linked Google event was not returned in the current sync window.",
+                }
+            )
+
+    last_sync = max((appointment.google_calendar_synced_at for appointment in appointments if appointment.google_calendar_synced_at), default=None)
+    available_slots = _available_slots_for_therapist(session, therapist, busy_periods, limit=8)
+    status = "manual"
+    if google_enabled:
+        status = "failed" if provider_error else "sync_issue" if sync_issues else "ready"
+    return {
+        "therapist_id": therapist.id,
+        "therapist_name": therapist.name,
+        "sync_status": status,
+        "last_sync": iso_or_none(last_sync),
+        "sync_errors": sync_issues,
+        "busy_periods": busy_periods,
+        "next_available_slot": available_slots[0] if available_slots else None,
+        "available_slots": available_slots,
+        "weekly_patient_contact_hours_used": used_hours,
+        "weekly_patient_contact_hours_remaining": remaining_hours,
+        "weekly_patient_contact_cap_hours": THERAPIST_WEEKLY_PATIENT_CONTACT_CAP_HOURS,
+        "active_appointments": [appointment_to_dict(appointment) for appointment in appointments],
+    }
+
+
+def _available_slots_for_therapist(
+    session: Session,
+    therapist: Therapist,
+    busy_periods: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    parsed_busy = [
+        {"start": _parse_datetime(item.get("start")), "end": _parse_datetime(item.get("end"))}
+        for item in busy_periods
+    ]
+    slots = []
+    for starts_at, ends_at, block in _generate_slots(therapist.availability_blocks, limit * 10):
+        if _appointment_conflicts(session, therapist.id, starts_at, ends_at):
+            continue
+        if _overlaps_busy(starts_at, _with_session_buffer(ends_at), parsed_busy):
+            continue
+        if not _therapist_has_weekly_capacity(session, therapist.id, starts_at, ends_at):
+            continue
+        slots.append(
+            {
+                "starts_at": iso_or_none(starts_at),
+                "ends_at": iso_or_none(ends_at),
+                "buffer_until": iso_or_none(_with_session_buffer(ends_at)),
+                "weekday": block.get("weekday"),
+                "source": "google_backed_availability",
+            }
+        )
+        if len(slots) >= limit:
+            break
+    return slots
+
+
+def _calendar_event_to_dict(event: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": event.get("id"),
+        "summary": event.get("summary"),
+        "event_link": event.get("htmlLink"),
+        "start": iso_or_none(event.get("start")) if isinstance(event.get("start"), datetime) else event.get("start"),
+        "end": iso_or_none(event.get("end")) if isinstance(event.get("end"), datetime) else event.get("end"),
+        "lumen_appointment_id": event.get("lumen_appointment_id"),
+        "lumen_referral_id": event.get("lumen_referral_id"),
+        "lumen_therapist_id": event.get("lumen_therapist_id"),
+    }
 
 
 def _parse_time(value: Any) -> time | None:
@@ -4900,7 +6300,13 @@ def _ensure_admin_missing_info_task(session: Session, referral: Referral) -> Hum
     missing_fields = list(referral.missing_fields or [])
     if not missing_fields:
         return None
-    return create_review_task(
+    payload = {
+        "missing_fields": missing_fields,
+        "patient_name": referral.patient_name,
+        "contact_email": referral.contact_email,
+        "contact_phone": referral.contact_phone,
+    }
+    task = create_review_task(
         session,
         tenant_id=referral.tenant_id,
         workflow_run_id=referral.workflow_run_id,
@@ -4909,13 +6315,11 @@ def _ensure_admin_missing_info_task(session: Session, referral: Referral) -> Hum
         task_type="admin_missing_info_review",
         reason="Referral has missing information that must be resolved before the admin workflow can continue.",
         payload_key="missing_information",
-        source_payload={
-            "missing_fields": missing_fields,
-            "patient_name": referral.patient_name,
-            "contact_email": referral.contact_email,
-            "contact_phone": referral.contact_phone,
-        },
+        source_payload=payload,
     )
+    task.source_payload = json_safe(payload)
+    task.updated_at = utc_now()
+    return task
 
 
 def _referral_documents(session: Session, referral: Referral, document_type: str) -> list[dict[str, Any]]:
@@ -4930,6 +6334,21 @@ def _referral_documents(session: Session, referral: Referral, document_type: str
                 Document.patient_id == referral.patient_id,
                 Document.document_type == document_type,
             )
+            .order_by(Document.created_at.desc())
+        )
+        if (document.metadata_json or {}).get("referral_id") == referral.id
+    ]
+    return [document_to_dict(document) for document in documents]
+
+
+def _referral_all_documents(session: Session, referral: Referral) -> list[dict[str, Any]]:
+    if not referral.patient_id:
+        return []
+    documents = [
+        document
+        for document in session.scalars(
+            select(Document)
+            .where(Document.tenant_id == referral.tenant_id, Document.patient_id == referral.patient_id)
             .order_by(Document.created_at.desc())
         )
         if (document.metadata_json or {}).get("referral_id") == referral.id
@@ -5096,15 +6515,32 @@ def _first_session_readiness_blockers(session: Session, referral: Referral) -> l
     status = canonical_referral_status(referral.status)
     if status in {"closed_declined", "closed_no_response", "closed_not_suitable"}:
         return ["Referral is closed."]
+    blockers = _pre_prep_readiness_blockers(session, referral)
+
+    prep_briefs = session.scalar(
+        select(func.count(TherapistPrepBrief.id)).where(TherapistPrepBrief.referral_id == referral.id)
+    )
+    if not prep_briefs:
+        blockers.append("Therapist prep brief is not generated.")
+    return blockers
+
+
+def _pre_prep_readiness_blockers(session: Session, referral: Referral) -> list[str]:
     blockers: list[str] = []
-    confirmed = session.scalar(
-        select(func.count(Appointment.id)).where(
-            Appointment.referral_id == referral.id,
-            Appointment.status == "confirmed",
+    confirmed_appointments = list(
+        session.scalars(
+            select(Appointment).where(
+                Appointment.referral_id == referral.id,
+                Appointment.status == "confirmed",
+            )
         )
     )
-    if not confirmed:
+    if not confirmed_appointments:
         blockers.append("No confirmed appointment.")
+    elif google_workspace.is_enabled() and not any(
+        appointment.google_calendar_event_id for appointment in confirmed_appointments
+    ):
+        blockers.append("Confirmed appointment is missing a linked Google Calendar event.")
 
     items = list(session.scalars(select(IntakeChecklistItem).where(IntakeChecklistItem.referral_id == referral.id)))
     consents = []
@@ -5120,12 +6556,6 @@ def _first_session_readiness_blockers(session: Session, referral: Referral) -> l
     intake_status = _intake_status(items, consents)
     if intake_status != "complete":
         blockers.append("Required intake is not complete or waived.")
-
-    prep_briefs = session.scalar(
-        select(func.count(TherapistPrepBrief.id)).where(TherapistPrepBrief.referral_id == referral.id)
-    )
-    if not prep_briefs:
-        blockers.append("Therapist prep brief is not generated.")
     return blockers
 
 

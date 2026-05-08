@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from backend.lumen_web.db import SessionLocal
-from backend.lumen_web.models import CommunicationDraft, HumanReviewTask, Referral, Tenant
+from datetime import datetime, timedelta, timezone
+
+from backend.lumen_web.models import Appointment, CommunicationDraft, HumanReviewTask, IntakeChecklistItem, Referral, Tenant, Therapist, TherapistPrepBrief
 from backend.lumen_web.repositories import referral_detail
 
 
@@ -44,7 +46,7 @@ def test_referral_detail_includes_task_aware_workbench_state() -> None:
         assert state["primary_action_label"] == "Complete clinical review"
         assert state["open_review_gate"]["id"] == task.id
         assert state["primary_blocker"]["code"] == "risk_review"
-        assert any(item["title"] == "Human review opened: clinical risk review" for item in state["activity"])
+        assert any(item["title"] == "Review opened: clinical risk review" for item in state["activity"])
     finally:
         session.rollback()
         session.close()
@@ -100,6 +102,80 @@ def test_changes_requested_agent_output_becomes_visible_next_action() -> None:
         assert state["changes_requested_gate"]["id"] == task.id
         assert state["agent_outputs"][0]["status"] == "changes_requested"
         assert state["agent_outputs"][0]["review_reason"] == task.rejection_reason
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_workbench_progress_uses_underlying_facts_not_status_labels() -> None:
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id="test-workbench-progress", name="Workbench Progress", slug="test-workbench-progress")
+        session.add(tenant)
+        session.flush()
+        therapist = Therapist(id="progress-therapist", tenant_id=tenant.id, name="Progress Therapist")
+        referral = Referral(
+            id="workbench-progress-referral",
+            tenant_id=tenant.id,
+            source_channel="webform",
+            raw_text="Referral whose status should not imply completed facts.",
+            status="first_session_ready",
+            patient_name="Progress Patient",
+        )
+        session.add_all([therapist, referral])
+        session.flush()
+
+        progress = referral_detail(session, referral.id)["workbench_state"]["progress"]
+
+        assert progress["contacted"] is False
+        assert progress["appointment_confirmed"] is False
+        assert progress["intake_complete"] is False
+        assert progress["prep_brief_ready"] is False
+        assert progress["first_session_ready"] is False
+
+        draft = CommunicationDraft(
+            tenant_id=tenant.id,
+            referral_id=referral.id,
+            channel="email",
+            subject="First appointment options",
+            body="Please choose a slot.",
+            status="sent",
+            proposed_slots=["slot-1"],
+        )
+        starts_at = datetime.now(timezone.utc) + timedelta(days=2)
+        appointment = Appointment(
+            tenant_id=tenant.id,
+            referral_id=referral.id,
+            therapist_id=therapist.id,
+            starts_at=starts_at,
+            ends_at=starts_at + timedelta(minutes=60),
+            status="confirmed",
+        )
+        item = IntakeChecklistItem(
+            tenant_id=tenant.id,
+            referral_id=referral.id,
+            item_key="intake_form",
+            label="Intake form",
+            item_type="form",
+            status="completed",
+        )
+        brief = TherapistPrepBrief(
+            tenant_id=tenant.id,
+            referral_id=referral.id,
+            therapist_id=therapist.id,
+            title="Prep brief",
+            body="Prep notes.",
+        )
+        session.add_all([draft, appointment, item, brief])
+        session.flush()
+
+        progress = referral_detail(session, referral.id)["workbench_state"]["progress"]
+
+        assert progress["contacted"] is True
+        assert progress["appointment_confirmed"] is True
+        assert progress["intake_complete"] is True
+        assert progress["prep_brief_ready"] is True
+        assert progress["first_session_ready"] is True
     finally:
         session.rollback()
         session.close()

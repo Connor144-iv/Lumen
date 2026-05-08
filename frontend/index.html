@@ -45,6 +45,7 @@
           </div>
           <div class="topbar-actions">
             <a class="button-link primary-action" href="/new-referral" data-nav>New referral</a>
+            <button id="demo-reset-button" type="button" class="secondary compact">Reset demo path</button>
             <button id="refresh-product-button" type="button" class="secondary compact">Refresh data</button>
           </div>
         </header>
@@ -362,6 +363,10 @@
                     <h2 id="referral-detail-title">Referral workbench</h2>
                   </div>
                 </div>
+                <details class="workbench-escalations" open>
+                  <summary>Escalation queue</summary>
+                  <div id="escalation-list" class="record-list embedded-list"></div>
+                </details>
                 <div id="referral-detail" class="detail-view">
                   <p class="empty-state">Open a referral from Overview to review fields, gates, matching, scheduling, intake, and prep status.</p>
                 </div>
@@ -399,9 +404,9 @@
                 <small>At or over capacity</small>
               </article>
               <article class="metric-card">
-                <span>Missing availability</span>
+                <span>Calendar sync issues</span>
                 <strong id="metric-therapist-missing">-</strong>
-                <small>No weekly blocks</small>
+                <small>Errors or unmatched events</small>
               </article>
               <article class="metric-card">
                 <span>Matching data incomplete</span>

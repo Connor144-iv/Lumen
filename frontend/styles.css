@@ -914,15 +914,17 @@ textarea:focus {
 }
 
 .therapist-form {
-  position: absolute;
-  right: 0;
+  position: fixed;
+  top: 166px;
+  right: 28px;
+  left: max(306px, calc(100vw - 820px));
   z-index: 15;
-  width: min(720px, calc(100vw - 80px));
   grid-template-columns: repeat(4, minmax(0, 1fr));
+  max-height: calc(100vh - 190px);
+  overflow: auto;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: #fff;
-  margin-top: 8px;
   box-shadow: 0 24px 60px rgba(22, 31, 45, 0.16);
 }
 
@@ -1042,6 +1044,7 @@ textarea:focus {
 
 .record-item[data-status="ok"],
 .record-item[data-status="active"],
+.record-item[data-status="ready"],
 .record-item[data-status="completed"],
 .record-item[data-status="match_approved"],
 .record-item[data-status="contact_sent"],
@@ -1075,6 +1078,7 @@ textarea:focus {
 .record-item[data-status="pending_approval"],
 .record-item[data-status="pending_signoff"],
 .record-item[data-status="open"],
+.record-item[data-status="sync_issue"],
 .record-item[data-status="configured"],
 .record-item[data-status="draft_pending_review"] {
   border-left-color: var(--warning);
@@ -1128,6 +1132,211 @@ textarea:focus {
 .record-item .handoff,
 .record-item .actions {
   grid-column: 1 / -1;
+}
+
+.draggable-record {
+  cursor: grab;
+}
+
+.draggable-record.is-dragging {
+  opacity: 0.62;
+}
+
+.calendar-slot {
+  border-style: dashed;
+  background: #f8fbff;
+}
+
+.calendar-slot.is-drop-target {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: 0 14px 34px rgba(54, 91, 214, 0.16);
+}
+
+.calendar-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.calendar-toolbar strong {
+  margin-left: 4px;
+  margin-right: auto;
+}
+
+.calendar-filter {
+  min-width: 190px;
+}
+
+.calendar-legend {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.calendar-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-soft);
+  font-size: 0.78rem;
+  font-weight: 760;
+}
+
+.calendar-legend span::before {
+  content: "";
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  background: var(--muted);
+}
+
+.calendar-legend span[data-status="confirmed"]::before {
+  background: var(--success);
+}
+
+.calendar-legend span[data-status="proposed"]::before {
+  background: var(--warning);
+}
+
+.calendar-legend span[data-status="busy"]::before {
+  background: var(--muted);
+}
+
+.week-calendar {
+  display: grid;
+  grid-template-columns: 62px repeat(7, minmax(132px, 1fr));
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-x: auto;
+  background: #fff;
+}
+
+.week-time-column,
+.week-day-column {
+  display: grid;
+  border-right: 1px solid var(--border);
+}
+
+.week-day-column {
+  grid-template-rows: 58px 728px;
+}
+
+.week-day-column:last-child {
+  border-right: 0;
+}
+
+.week-time-column {
+  grid-template-rows: 58px repeat(13, 56px);
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 760;
+}
+
+.week-time-column span:not(:first-child) {
+  min-height: 56px;
+  border-top: 1px solid var(--border);
+  padding: 6px 8px 0 0;
+  text-align: right;
+}
+
+.week-day-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+  border-bottom: 1px solid var(--border);
+  background: #f8fafc;
+  padding: 9px 10px;
+}
+
+.week-day-header h4 {
+  margin: 0;
+  font-size: 0.86rem;
+}
+
+.week-day-body {
+  position: relative;
+  min-height: 728px;
+  background: #fff;
+}
+
+.week-day-body.is-drop-target {
+  background: #f8fbff;
+  box-shadow: inset 0 0 0 2px rgba(14, 116, 144, 0.18);
+}
+
+.week-hour-row {
+  min-height: 56px;
+  border-top: 1px solid var(--border);
+}
+
+.week-hour-row:first-child {
+  border-top: 0;
+}
+
+.week-calendar-event {
+  position: absolute;
+  min-height: 24px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  display: grid;
+  align-content: start;
+  gap: 1px;
+  padding: 5px 6px;
+  overflow: hidden;
+  background: var(--surface-soft);
+  color: var(--text);
+  box-shadow: 0 8px 18px rgba(22, 31, 45, 0.08);
+  text-align: left;
+  transform: none;
+}
+
+.week-calendar-event:hover {
+  transform: none;
+  box-shadow: 0 10px 24px rgba(22, 31, 45, 0.12);
+}
+
+.week-calendar-event strong,
+.week-calendar-event span,
+.week-calendar-event small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.week-calendar-event strong {
+  font-size: 0.76rem;
+  line-height: 1.15;
+}
+
+.week-calendar-event span,
+.week-calendar-event small {
+  font-size: 0.68rem;
+  color: var(--text-soft);
+}
+
+.week-calendar-event.is-busy {
+  border-color: #c6ceda;
+  background: #e8edf5;
+}
+
+.week-calendar-event.is-appointment[data-status="confirmed"] {
+  border-color: rgba(8, 127, 91, 0.34);
+  background: #e7f6f0;
+}
+
+.week-calendar-event.is-appointment[data-status="proposed"] {
+  border-color: rgba(177, 95, 0, 0.34);
+  background: #fff4df;
+}
+
+.week-calendar-event.is-drop-target {
+  border-color: var(--accent);
+  background: var(--accent-soft);
 }
 
 .meta-row {
@@ -1285,9 +1494,42 @@ textarea:focus {
   padding-top: 12px;
 }
 
+.operation-section.collapsible-section {
+  display: block;
+}
+
+.operation-section.collapsible-section summary {
+  display: flex;
+  align-items: center;
+  min-height: 34px;
+  cursor: pointer;
+}
+
 .operation-section h4 {
   margin: 0;
   font-size: 0.95rem;
+}
+
+.operation-section.collapsible-section .embedded-list {
+  margin-top: 10px;
+}
+
+.workbench-escalations {
+  margin-bottom: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.workbench-escalations summary {
+  cursor: pointer;
+  padding: 11px 13px;
+  font-size: 0.86rem;
+  font-weight: 820;
+}
+
+.workbench-escalations .record-list {
+  padding: 0 12px 12px;
 }
 
 .embedded-list {
@@ -1444,6 +1686,13 @@ pre {
     padding: 18px;
   }
 
+  .therapist-form {
+    top: 96px;
+    right: 18px;
+    left: 18px;
+    max-height: calc(100vh - 124px);
+  }
+
   .journey-board {
     grid-template-columns: repeat(2, minmax(230px, 1fr));
   }
@@ -1470,6 +1719,7 @@ pre {
   .therapist-form {
     position: static;
     width: auto;
+    max-height: none;
   }
 
   .inline-form textarea,

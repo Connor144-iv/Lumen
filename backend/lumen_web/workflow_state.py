@@ -48,6 +48,7 @@ REVIEW_TASK_TYPES = (
     "therapist_note_approval",
     "post_session_risk_review",
     "report_signoff",
+    "inbound_reply_review",
 )
 
 REVIEW_ACTIONS = ("approve", "reject", "request_changes", "escalate")

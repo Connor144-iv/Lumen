@@ -24,12 +24,12 @@ from backend.lumen_web.repositories import (
     approval_payload_for_task,
     complete_consent_record,
     complete_intake_item,
-    confirm_appointment,
     approve_session_note,
     create_clinical_library_record,
     create_email_referral,
     create_clinical_escalation_review,
     create_duplicate_resolution_review,
+    create_manual_appointment_proposal,
     create_referral_document,
     create_session_note,
     create_suitability_review,
@@ -47,12 +47,14 @@ from backend.lumen_web.repositories import (
     get_therapist,
     import_referral_batch,
     integration_health,
+    ingest_gmail_message,
     intake_workspace,
     list_intake_tracker,
     list_referral_import_batches,
     list_referral_import_errors,
     list_appointments,
     list_clinical_library_records,
+    list_escalation_queue,
     list_intake_templates,
     list_referrals,
     list_review_tasks,
@@ -66,6 +68,7 @@ from backend.lumen_web.repositories import (
     record_draft_feedback,
     record_missing_info_reply,
     record_simulated_patient_reply,
+    reset_clean_demo_referral,
     review_task_to_dict,
     request_consent_exception,
     request_intake_item_exception,
@@ -74,6 +77,8 @@ from backend.lumen_web.repositories import (
     security_context,
     sign_off_report_draft,
     start_intake_for_referral,
+    request_appointment_reschedule,
+    therapist_calendar_capacity,
     update_report_draft,
     update_therapist,
 )
@@ -130,6 +135,19 @@ class AppointmentProposalRequest(BaseModel):
     limit: int = 3
 
 
+class ManualAppointmentProposalRequest(BaseModel):
+    referral_id: str
+    therapist_id: str
+    starts_at: datetime
+    ends_at: datetime | None = None
+
+
+class AppointmentRescheduleRequest(BaseModel):
+    starts_at: datetime
+    ends_at: datetime | None = None
+    reason: str = "Appointment reschedule requires admin approval."
+
+
 class StartIntakeRequest(BaseModel):
     template_id: str | None = None
 
@@ -184,6 +202,12 @@ class PatientReplyRequest(BaseModel):
     reply_type: Literal["accepted_slot", "declined", "alternative_requested", "asked_question", "unclear", "no_response"]
     appointment_id: str | None = None
     notes: str = ""
+
+
+class GmailSyncRequest(BaseModel):
+    tenant_id: str | None = DEMO_TENANT_ID
+    sender: str | None = None
+    max_results: int = 10
 
 
 class SessionNoteRequest(BaseModel):
@@ -474,9 +498,39 @@ def appointments(
 
 @app.post("/api/appointments/{appointment_id}/confirm")
 def appointment_confirm(appointment_id: str) -> dict[str, Any]:
+    raise HTTPException(
+        status_code=400,
+        detail="Appointment confirmation must be completed by approving the appointment confirmation review task.",
+    )
+
+
+@app.post("/api/appointments/proposals", status_code=201)
+def appointment_manual_proposal(body: ManualAppointmentProposalRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
-            return {"appointment": confirm_appointment(session, appointment_id)}
+            return create_manual_appointment_proposal(
+                session,
+                referral_id=body.referral_id,
+                therapist_id=body.therapist_id,
+                starts_at=body.starts_at,
+                ends_at=body.ends_at,
+            )
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/appointments/{appointment_id}/reschedule-request", status_code=201)
+def appointment_reschedule_request(appointment_id: str, body: AppointmentRescheduleRequest) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            task = request_appointment_reschedule(
+                session,
+                appointment_id=appointment_id,
+                starts_at=body.starts_at,
+                ends_at=body.ends_at,
+                reason=body.reason,
+            )
+            return {"task": review_task_to_dict(task)}
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -485,6 +539,18 @@ def appointment_confirm(appointment_id: str) -> dict[str, Any]:
 def review_tasks(tenant_id: str | None = None, status: str | None = "open") -> dict[str, Any]:
     with session_scope() as session:
         return {"tasks": list_review_tasks(session, tenant_id=tenant_id, status=status)}
+
+
+@app.get("/api/escalations")
+def escalations(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
+    with session_scope() as session:
+        return {"items": list_escalation_queue(session, tenant_id=tenant_id)}
+
+
+@app.post("/api/demo/clean-referral/reset", status_code=201)
+def demo_clean_referral_reset(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
+    with session_scope() as session:
+        return reset_clean_demo_referral(session, tenant_id or DEMO_TENANT_ID)
 
 
 @app.post("/api/review-tasks/{task_id}/actions")
@@ -555,6 +621,12 @@ def _review_action_message(action: str, task: dict[str, Any], referral: dict[str
 def therapists(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
     with session_scope() as session:
         return {"therapists": list_therapists(session, tenant_id=tenant_id)}
+
+
+@app.get("/api/therapists/calendar-capacity")
+def therapists_calendar_capacity(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
+    with session_scope() as session:
+        return therapist_calendar_capacity(session, tenant_id=tenant_id)
 
 
 @app.post("/api/therapists", status_code=201)
@@ -986,6 +1058,72 @@ def email_referral_create(body: EmailReferralRequest, request: Request) -> dict[
             )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/integrations/gmail-sync")
+def gmail_sync(body: GmailSyncRequest) -> dict[str, Any]:
+    if not google_workspace.is_enabled():
+        raise HTTPException(status_code=400, detail="Google Workspace integration is not enabled.")
+
+    max_results = max(1, min(body.max_results, 50))
+    messages = google_workspace.list_unread_gmail_messages(
+        sender_email=body.sender,
+        max_results=max_results,
+    )
+    processed: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    for item in messages:
+        message_id = str(item.get("id") or "").strip()
+        if not message_id:
+            skipped.append({"status": "skipped", "reason": "missing_message_id"})
+            continue
+        try:
+            raw_message = google_workspace.get_gmail_message(message_id=message_id, format="full")
+            parsed = google_workspace.parse_gmail_message(raw_message)
+        except Exception as exc:
+            errors.append(
+                {
+                    "message_id": message_id,
+                    "error": google_workspace.provider_error_message(exc),
+                }
+            )
+            continue
+
+        try:
+            with session_scope() as session:
+                result = ingest_gmail_message(
+                    session,
+                    tenant_id=body.tenant_id or DEMO_TENANT_ID,
+                    message=parsed,
+                )
+        except Exception as exc:
+            errors.append({"message_id": message_id, "error": str(exc)})
+            continue
+
+        if result.get("status") == "processed":
+            try:
+                google_workspace.mark_gmail_message_read(message_id=message_id)
+            except Exception as exc:
+                errors.append(
+                    {
+                        "message_id": message_id,
+                        "error": google_workspace.provider_error_message(exc),
+                        "stage": "mark_read",
+                    }
+                )
+                continue
+            processed.append(result)
+        else:
+            skipped.append(result)
+
+    return {
+        "processed": processed,
+        "skipped": skipped,
+        "errors": errors,
+        "total_seen": len(messages),
+    }
 
 
 @app.get("/api/security/context")

@@ -50,7 +50,9 @@ The app also calls `create_all` on startup so local development works without a 
 ## Run
 
 ```powershell
-uvicorn app:app --reload --host 127.0.0.1 --port 8000
+cd <repo-root>\Lumen
+.\.venv\Scripts\Activate.ps1
+.\scripts\run_lumen_local.ps1
 ```
 
 Open `http://127.0.0.1:8000`.
@@ -85,10 +87,15 @@ The first admin-referral redesign patch keeps the existing backend services but 
 - `first_session_ready` is only reached after a confirmed appointment, complete-or-waived intake, and a generated therapist prep brief.
 - The main navigation emphasizes the Referral Queue and Admin Workbench. The previous Run Workflow page is preserved as a developer/demo workflow trace runner under System.
 
-Recommended next steps from the redesign master plan remain intentionally deferred until the admin gates are stable:
+The Gmail and Google Calendar MVP is now part of the admin-gated workflow:
 
-- Add provider-backed patient reply ingestion beyond the current simulated/manual reply capture.
-- Keep real email sending and calendar write-back deferred; current communication and scheduling behavior is simulated/manual.
+- Approved patient-facing communication drafts send through Gmail when Google Workspace is enabled. Demo patient email is restricted to `lumenpatientdemo@gmail.com` unless `LUMEN_OUTBOUND_PATIENT_EMAIL_OVERRIDE` is set.
+- Slot proposals use Google Calendar busy time, local appointments, 60-minute sessions, a 10-minute buffer, and the 20-hour weekly therapist patient-contact cap.
+- Approved appointment confirmations create Google Calendar events and store the event ID on the local appointment record.
+- Approved reschedule tasks update the linked Google Calendar event before the local appointment time changes.
+- The Therapists page shows Google-backed busy periods, next available slots, weekly contact capacity, active appointments, sync issues, and drag/drop scheduling targets.
+
+Provider-backed patient reply ingestion beyond the current simulated/manual reply capture remains a later enhancement.
 
 ## Smoke Test
 
@@ -110,6 +117,7 @@ GET /api/referrals/{referral_id}
 GET /api/review-tasks?status=open
 POST /api/review-tasks/{task_id}/actions
 GET /api/therapists
+GET /api/therapists/calendar-capacity
 POST /api/therapists
 POST /api/referrals/{referral_id}/match
 POST /api/referrals/{referral_id}/appointment-proposals
@@ -120,7 +128,8 @@ POST /api/referrals/{referral_id}/duplicate-review
 POST /api/referrals/{referral_id}/suitability-review
 POST /api/referrals/{referral_id}/contact-draft
 POST /api/referrals/{referral_id}/patient-replies
-POST /api/appointments/{appointment_id}/confirm
+POST /api/appointments/proposals
+POST /api/appointments/{appointment_id}/reschedule-request
 GET /api/intake/templates
 GET /api/intake/tracker
 POST /api/referrals/{referral_id}/intake

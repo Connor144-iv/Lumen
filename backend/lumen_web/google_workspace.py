@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import base64
+import importlib
+import logging
 import os
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -19,14 +22,20 @@ TOKEN_FILE_NAME = "google_token.json"
 GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
 CALENDAR_EVENTS_SCOPE = "https://www.googleapis.com/auth/calendar.events"
-GOOGLE_WORKSPACE_SCOPES = [GMAIL_SEND_SCOPE, CALENDAR_READONLY_SCOPE, CALENDAR_EVENTS_SCOPE]
-GOOGLE_WORKSPACE_SCOPE_LABELS = ["gmail.send", "calendar.readonly", "calendar.events"]
+GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
+GOOGLE_WORKSPACE_SCOPES = [GMAIL_SEND_SCOPE, CALENDAR_READONLY_SCOPE, CALENDAR_EVENTS_SCOPE, GMAIL_MODIFY_SCOPE]
+GOOGLE_WORKSPACE_SCOPE_LABELS = ["gmail.send", "calendar.readonly", "calendar.events", "gmail.modify"]
 
 _LAST_PROVIDER_ERROR: str | None = None
+logger = logging.getLogger(__name__)
 
 
 class GoogleWorkspaceError(RuntimeError):
     """Raised when the configured Google Workspace provider cannot complete an operation."""
+
+
+class GoogleDependencyError(GoogleWorkspaceError):
+    """Raised when a required Google package is not importable."""
 
 
 @dataclass(frozen=True)
@@ -66,21 +75,31 @@ def google_workspace_status(refresh: bool = True) -> dict[str, Any]:
     token_valid = False
     authorized = False
     dependency_available = True
-    error = _LAST_PROVIDER_ERROR
+    error: str | None = None
 
     try:
         _google_imports()
+    except GoogleDependencyError as exc:
+        dependency_available = False
+        error = provider_error_message(exc)
+        logger.warning("Google Workspace dependency check failed: %s", error)
     except GoogleWorkspaceError as exc:
         dependency_available = False
         error = provider_error_message(exc)
+        logger.warning("Google Workspace import check failed: %s", error)
 
     if token_present and dependency_available:
         try:
             credentials = _load_credentials(cfg, refresh=refresh)
             token_valid = bool(credentials.valid)
             authorized = token_valid and _credentials_have_scopes(credentials)
+            if authorized:
+                _clear_error()
         except GoogleWorkspaceError as exc:
             error = provider_error_message(exc)
+            logger.warning("Google Workspace authorization check failed: %s", error)
+    elif dependency_available:
+        _clear_error()
 
     return {
         "enabled": cfg.enabled,
@@ -126,6 +145,73 @@ def send_approved_draft(
     }
 
 
+def list_unread_gmail_messages(
+    *,
+    sender_email: str | None = None,
+    query: str | None = None,
+    max_results: int = 10,
+) -> list[dict[str, str]]:
+    gmail = _build_gmail_service()
+    terms = ["is:unread"]
+    if sender_email:
+        terms.append(f"from:{sender_email}")
+    if query:
+        terms.append(query)
+    try:
+        result = gmail.users().messages().list(
+            userId="me",
+            q=" ".join(terms),
+            maxResults=max(1, min(max_results, 50)),
+        ).execute()
+    except Exception as exc:  # pragma: no cover - exercised with mocked provider tests
+        _remember_error(exc)
+        raise GoogleWorkspaceError(f"Gmail list unread failed: {provider_error_message(exc)}") from exc
+
+    _clear_error()
+    return result.get("messages") or []
+
+
+def get_gmail_message(*, message_id: str, format: str = "full") -> dict[str, Any]:
+    gmail = _build_gmail_service()
+    try:
+        result = gmail.users().messages().get(userId="me", id=message_id, format=format).execute()
+    except Exception as exc:  # pragma: no cover - exercised with mocked provider tests
+        _remember_error(exc)
+        raise GoogleWorkspaceError(f"Gmail message fetch failed: {provider_error_message(exc)}") from exc
+
+    _clear_error()
+    return result
+
+
+def parse_gmail_message(message: dict[str, Any]) -> dict[str, Any]:
+    payload = message.get("payload") or {}
+    headers = _gmail_headers(payload)
+    return {
+        "message_id": message.get("id"),
+        "thread_id": message.get("threadId"),
+        "snippet": message.get("snippet") or "",
+        "subject": headers.get("Subject", ""),
+        "from": headers.get("From", ""),
+        "date": headers.get("Date", ""),
+        "body": _gmail_message_body(payload),
+    }
+
+
+def mark_gmail_message_read(*, message_id: str) -> None:
+    gmail = _build_gmail_service()
+    try:
+        gmail.users().messages().modify(
+            userId="me",
+            id=message_id,
+            body={"removeLabelIds": ["UNREAD"]},
+        ).execute()
+    except Exception as exc:  # pragma: no cover - exercised with mocked provider tests
+        _remember_error(exc)
+        raise GoogleWorkspaceError(f"Gmail mark read failed: {provider_error_message(exc)}") from exc
+
+    _clear_error()
+
+
 def query_calendar_busy(
     *,
     time_min: datetime,
@@ -163,6 +249,9 @@ def create_appointment_event(
     referral_id: str | None,
     starts_at: datetime,
     ends_at: datetime,
+    patient_name: str | None = None,
+    therapist_name: str | None = None,
+    therapist_id: str | None = None,
     patient_email: str | None = None,
     therapist_email: str | None = None,
     calendar_id: str | None = None,
@@ -172,7 +261,7 @@ def create_appointment_event(
     calendar_ref = calendar_id or cfg.calendar_id
     attendees = [{"email": email} for email in [patient_email, therapist_email] if email]
     body: dict[str, Any] = {
-        "summary": "Clinic appointment",
+        "summary": _appointment_summary(therapist_name=therapist_name, patient_name=patient_name, referral_id=referral_id),
         "description": "Appointment created from Lumen after human approval.",
         "start": {"dateTime": _google_datetime(starts_at), "timeZone": cfg.timezone},
         "end": {"dateTime": _google_datetime(ends_at), "timeZone": cfg.timezone},
@@ -181,6 +270,7 @@ def create_appointment_event(
                 "lumen_appointment_id": appointment_id,
                 "lumen_referral_id": referral_id or "",
                 "lumen_tenant_id": tenant_id,
+                "lumen_therapist_id": therapist_id or "",
             }
         },
     }
@@ -206,6 +296,106 @@ def create_appointment_event(
         "event_link": result.get("htmlLink"),
         "raw_response": _public_response(result),
     }
+
+
+def update_appointment_event(
+    *,
+    event_id: str,
+    appointment_id: str,
+    tenant_id: str,
+    referral_id: str | None,
+    starts_at: datetime,
+    ends_at: datetime,
+    patient_name: str | None = None,
+    therapist_name: str | None = None,
+    therapist_id: str | None = None,
+    patient_email: str | None = None,
+    therapist_email: str | None = None,
+    calendar_id: str | None = None,
+) -> dict[str, Any]:
+    cfg = settings()
+    calendar = _build_calendar_service()
+    calendar_ref = calendar_id or cfg.calendar_id
+    attendees = [{"email": email} for email in [patient_email, therapist_email] if email]
+    body: dict[str, Any] = {
+        "summary": _appointment_summary(therapist_name=therapist_name, patient_name=patient_name, referral_id=referral_id),
+        "description": "Appointment updated from Lumen after human approval.",
+        "start": {"dateTime": _google_datetime(starts_at), "timeZone": cfg.timezone},
+        "end": {"dateTime": _google_datetime(ends_at), "timeZone": cfg.timezone},
+        "extendedProperties": {
+            "private": {
+                "lumen_appointment_id": appointment_id,
+                "lumen_referral_id": referral_id or "",
+                "lumen_tenant_id": tenant_id,
+                "lumen_therapist_id": therapist_id or "",
+            }
+        },
+    }
+    if attendees:
+        body["attendees"] = attendees
+
+    try:
+        result = calendar.events().patch(
+            calendarId=calendar_ref,
+            eventId=event_id,
+            body=body,
+            sendUpdates="all" if attendees else "none",
+        ).execute()
+    except Exception as exc:  # pragma: no cover - exercised with mocked provider tests
+        _remember_error(exc)
+        raise GoogleWorkspaceError(f"Google Calendar event update failed: {provider_error_message(exc)}") from exc
+
+    _clear_error()
+    return {
+        "provider": "google_calendar",
+        "calendar_id": calendar_ref,
+        "event_id": result.get("id") or event_id,
+        "event_link": result.get("htmlLink"),
+        "raw_response": _public_response(result),
+    }
+
+
+def list_lumen_appointment_events(
+    *,
+    time_min: datetime,
+    time_max: datetime,
+    calendar_id: str | None = None,
+) -> list[dict[str, Any]]:
+    cfg = settings()
+    calendar = _build_calendar_service()
+    calendar_ref = calendar_id or cfg.calendar_id
+    try:
+        result = calendar.events().list(
+            calendarId=calendar_ref,
+            timeMin=_google_datetime(time_min),
+            timeMax=_google_datetime(time_max),
+            singleEvents=True,
+        ).execute()
+    except Exception as exc:  # pragma: no cover - exercised with mocked provider tests
+        _remember_error(exc)
+        raise GoogleWorkspaceError(f"Google Calendar event list failed: {provider_error_message(exc)}") from exc
+
+    _clear_error()
+    events = []
+    for item in result.get("items") or []:
+        private = ((item.get("extendedProperties") or {}).get("private") or {})
+        if not private and not str(item.get("summary") or "").startswith("[Lumen]"):
+            continue
+        start_value = (item.get("start") or {}).get("dateTime")
+        end_value = (item.get("end") or {}).get("dateTime")
+        events.append(
+            {
+                "id": item.get("id"),
+                "summary": item.get("summary"),
+                "htmlLink": item.get("htmlLink"),
+                "start": _parse_google_datetime(start_value) if start_value else None,
+                "end": _parse_google_datetime(end_value) if end_value else None,
+                "lumen_appointment_id": private.get("lumen_appointment_id"),
+                "lumen_referral_id": private.get("lumen_referral_id"),
+                "lumen_therapist_id": private.get("lumen_therapist_id"),
+            }
+        )
+    return events
 
 
 def test_calendar_read(window_minutes: int = 30) -> dict[str, Any]:
@@ -234,38 +424,119 @@ def _configured_client_secret_path() -> Path:
 def _load_credentials(cfg: GoogleWorkspaceSettings, *, refresh: bool):
     Credentials, GoogleAuthRequest, _ = _google_imports()
     if not cfg.token_path.exists():
-        raise GoogleWorkspaceError("Google token file is not present.")
-    credentials = Credentials.from_authorized_user_file(str(cfg.token_path), GOOGLE_WORKSPACE_SCOPES)
+        raise GoogleWorkspaceError(f"Google token file is not present at {cfg.token_path}.")
+    try:
+        credentials = Credentials.from_authorized_user_file(str(cfg.token_path), GOOGLE_WORKSPACE_SCOPES)
+    except Exception as exc:
+        raise GoogleWorkspaceError(
+            f"Google token could not be loaded from {cfg.token_path}: {provider_error_message(exc)}"
+        ) from exc
     if credentials.expired and credentials.refresh_token and refresh:
-        credentials.refresh(GoogleAuthRequest())
-        cfg.token_path.parent.mkdir(parents=True, exist_ok=True)
-        cfg.token_path.write_text(credentials.to_json(), encoding="utf-8")
+        try:
+            credentials.refresh(GoogleAuthRequest())
+            cfg.token_path.parent.mkdir(parents=True, exist_ok=True)
+            cfg.token_path.write_text(credentials.to_json(), encoding="utf-8")
+        except Exception as exc:
+            _remember_error(exc)
+            raise GoogleWorkspaceError(f"Google token refresh failed: {provider_error_message(exc)}") from exc
     if not credentials.valid:
-        raise GoogleWorkspaceError("Google token is not valid; run scripts/google_workspace_auth.py.")
+        raise GoogleWorkspaceError(
+            f"Google token at {cfg.token_path} is not valid; run scripts/google_workspace_auth.py."
+        )
     return credentials
 
 
 def _build_gmail_service():
     _, _, build = _google_imports()
-    return build("gmail", "v1", credentials=_load_credentials(settings(), refresh=True), cache_discovery=False)
+    try:
+        return build("gmail", "v1", credentials=_load_credentials(settings(), refresh=True), cache_discovery=False)
+    except GoogleWorkspaceError:
+        raise
+    except Exception as exc:
+        _remember_error(exc)
+        raise GoogleWorkspaceError(f"Gmail service build failed: {provider_error_message(exc)}") from exc
 
 
 def _build_calendar_service():
     _, _, build = _google_imports()
-    return build("calendar", "v3", credentials=_load_credentials(settings(), refresh=True), cache_discovery=False)
+    try:
+        return build("calendar", "v3", credentials=_load_credentials(settings(), refresh=True), cache_discovery=False)
+    except GoogleWorkspaceError:
+        raise
+    except Exception as exc:
+        _remember_error(exc)
+        raise GoogleWorkspaceError(f"Google Calendar service build failed: {provider_error_message(exc)}") from exc
 
 
 def _google_imports():
-    try:
-        from google.auth.transport.requests import Request as GoogleAuthRequest
-        from google.oauth2.credentials import Credentials
-        from googleapiclient.discovery import build
-    except ImportError as exc:  # pragma: no cover - depends on optional environment packages
-        raise GoogleWorkspaceError(
-            "Google API dependencies are not installed. Install google-api-python-client, "
-            "google-auth-httplib2, and google-auth-oauthlib."
-        ) from exc
-    return Credentials, GoogleAuthRequest, build
+    _ensure_google_import_path()
+    modules = {
+        "google.auth.transport.requests": "google-auth",
+        "google.oauth2.credentials": "google-auth",
+        "googleapiclient.discovery": "google-api-python-client",
+        "google_auth_httplib2": "google-auth-httplib2",
+        "google_auth_oauthlib.flow": "google-auth-oauthlib",
+    }
+    imported: dict[str, Any] = {}
+    for module_name, package_name in modules.items():
+        try:
+            imported[module_name] = importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            missing_name = str(exc.name or "")
+            requested_root = module_name.split(".", 1)[0]
+            if missing_name == requested_root or module_name.startswith(f"{missing_name}."):
+                raise GoogleDependencyError(
+                    f"Missing Google API dependency for module '{module_name}' "
+                    f"(install package '{package_name}'): {provider_error_message(exc)}"
+                ) from exc
+            raise GoogleWorkspaceError(
+                f"Google API import failed while loading '{module_name}' because transitive module "
+                f"'{missing_name}' could not be imported: {provider_error_message(exc)}"
+            ) from exc
+        except ImportError as exc:
+            raise GoogleWorkspaceError(
+                f"Google API import failed while loading '{module_name}': {provider_error_message(exc)}"
+            ) from exc
+        except Exception as exc:
+            raise GoogleWorkspaceError(
+                f"Google API import raised {exc.__class__.__name__} while loading '{module_name}': "
+                f"{provider_error_message(exc)}"
+            ) from exc
+    return (
+        imported["google.oauth2.credentials"].Credentials,
+        imported["google.auth.transport.requests"].Request,
+        imported["googleapiclient.discovery"].build,
+    )
+
+
+def _ensure_google_import_path() -> None:
+    candidates = []
+    virtual_env = os.getenv("VIRTUAL_ENV")
+    if virtual_env:
+        candidates.append(Path(virtual_env) / "Lib" / "site-packages")
+    candidates.append(Path(sys.prefix) / "Lib" / "site-packages")
+    candidates.append(REPO_ROOT / ".venv" / "Lib" / "site-packages")
+
+    promoted_paths: set[str] = set()
+    for site_packages in candidates:
+        if not site_packages.exists():
+            continue
+        site_path = str(site_packages)
+        normalized_site_path = os.path.normcase(os.path.abspath(site_path))
+        if normalized_site_path not in promoted_paths:
+            sys.path[:] = [
+                existing_path
+                for existing_path in sys.path
+                if os.path.normcase(os.path.abspath(existing_path or ".")) != normalized_site_path
+            ]
+            sys.path.insert(0, site_path)
+            promoted_paths.add(normalized_site_path)
+        google_path = site_packages / "google"
+        google_module = sys.modules.get("google")
+        google_module_path = getattr(google_module, "__path__", None)
+        if google_path.exists() and google_module_path is not None and str(google_path) not in google_module_path:
+            google_module_path.append(str(google_path))
+    importlib.invalidate_caches()
 
 
 def _credentials_have_scopes(credentials: Any) -> bool:
@@ -289,6 +560,66 @@ def _parse_google_datetime(value: str) -> datetime:
     return parsed
 
 
+def _gmail_headers(payload: dict[str, Any]) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for item in payload.get("headers") or []:
+        name = str(item.get("name") or "").strip()
+        value = str(item.get("value") or "").strip()
+        if name:
+            headers[name] = value
+    return headers
+
+
+def _gmail_message_body(payload: dict[str, Any]) -> str:
+    body = _gmail_message_body_plain(payload)
+    return body.strip()
+
+
+def _gmail_message_body_plain(payload: dict[str, Any]) -> str:
+    if not payload:
+        return ""
+    mime_type = str(payload.get("mimeType") or "")
+    data = (payload.get("body") or {}).get("data")
+    if data and mime_type.startswith("text/plain"):
+        return _decode_gmail_body(data)
+    parts = payload.get("parts") or []
+    if parts:
+        for part in parts:
+            part_type = str(part.get("mimeType") or "")
+            part_data = (part.get("body") or {}).get("data")
+            if part_data and part_type.startswith("text/plain"):
+                return _decode_gmail_body(part_data)
+        for part in parts:
+            nested = _gmail_message_body_plain(part)
+            if nested:
+                return nested
+        for part in parts:
+            part_type = str(part.get("mimeType") or "")
+            part_data = (part.get("body") or {}).get("data")
+            if part_data and part_type.startswith("text/html"):
+                return _decode_gmail_body(part_data)
+    if data:
+        return _decode_gmail_body(data)
+    return ""
+
+
+def _decode_gmail_body(value: str) -> str:
+    if not value:
+        return ""
+    try:
+        decoded = base64.urlsafe_b64decode(value.encode("ascii"))
+    except Exception:
+        return ""
+    return decoded.decode("utf-8", errors="replace")
+
+
+def _appointment_summary(*, therapist_name: str | None, patient_name: str | None, referral_id: str | None) -> str:
+    therapist = (therapist_name or "Unassigned").strip() or "Unassigned"
+    patient = (patient_name or "Sarah O'Connor").strip() or "Sarah O'Connor"
+    referral = (referral_id or "unlinked").strip() or "unlinked"
+    return f"[Lumen] Therapist: {therapist} | Patient: {patient} | Referral: {referral}"
+
+
 def _public_response(result: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in result.items() if key in {"id", "threadId", "htmlLink", "status"}}
 
@@ -296,6 +627,7 @@ def _public_response(result: dict[str, Any]) -> dict[str, Any]:
 def _remember_error(exc: BaseException) -> None:
     global _LAST_PROVIDER_ERROR
     _LAST_PROVIDER_ERROR = provider_error_message(exc)
+    logger.warning("Google Workspace provider error: %s", _LAST_PROVIDER_ERROR)
 
 
 def _clear_error() -> None:

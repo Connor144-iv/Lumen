@@ -101,6 +101,16 @@ def test_phase4_matching_and_phase5_intake_services() -> None:
         )
         assert missing_reply["reply"]["document_type"] == "missing_info_reply"
         assert missing_referral.status == "ready_for_matching"
+        assert session.query(HumanReviewTask).filter_by(
+            referral_id=missing_referral.id,
+            task_type="admin_missing_info_review",
+            status="open",
+        ).count() == 0
+        assert session.query(HumanReviewTask).filter_by(
+            referral_id=missing_referral.id,
+            task_type="admin_missing_info_review",
+            status="completed",
+        ).count() == 1
 
         duplicate_referral = Referral(
             tenant_id=tenant.id,
@@ -263,6 +273,31 @@ def test_phase4_matching_and_phase5_intake_services() -> None:
         assert referral.status == "first_session_ready"
         tracker = list_intake_tracker(session, tenant_id=tenant.id)
         assert any(row["referral"]["id"] == referral.id for row in tracker)
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_prep_brief_does_not_advance_without_appointment_and_intake() -> None:
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id="test-prep-guard", name="Prep Guard", slug="test-prep-guard")
+        session.add(tenant)
+        session.flush()
+        referral = Referral(
+            tenant_id=tenant.id,
+            source_channel="webform",
+            raw_text="Referral that is not ready for prep.",
+            status="ready_for_matching",
+            patient_name="Prep Guard Patient",
+        )
+        session.add(referral)
+        session.flush()
+
+        brief = generate_prep_brief(session, referral.id)
+
+        assert "Therapist Prep Brief" in brief["body"]
+        assert referral.status == "ready_for_matching"
     finally:
         session.rollback()
         session.close()

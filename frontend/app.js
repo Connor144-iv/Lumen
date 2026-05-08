@@ -16,6 +16,7 @@ const routes = {
 const form = document.querySelector("#workflow-form");
 const runButton = document.querySelector("#run-button");
 const resetButton = document.querySelector("#reset-button");
+const demoResetButton = document.querySelector("#demo-reset-button");
 const exportButton = document.querySelector("#export-button");
 const refreshHealthButton = document.querySelector("#refresh-health-button");
 const refreshProductButton = document.querySelector("#refresh-product-button");
@@ -34,6 +35,7 @@ const referralList = document.querySelector("#referral-list");
 const referralFilterForm = document.querySelector("#referral-filter-form");
 const referralDetail = document.querySelector("#referral-detail");
 const reviewTaskList = document.querySelector("#review-task-list");
+const escalationList = document.querySelector("#escalation-list");
 const therapistList = document.querySelector("#therapist-list");
 const therapistForm = document.querySelector("#therapist-form");
 const intakeWorkspace = document.querySelector("#intake-workspace");
@@ -84,10 +86,13 @@ let latestReferrals = [];
 let latestJourney = null;
 let latestReviewTasks = [];
 let latestTherapists = [];
+let latestTherapistCalendarCapacity = null;
 let latestWorkflows = [];
 let latestAppointments = [];
 let selectedReferralId = null;
 let selectedTherapistId = null;
+let selectedCalendarTherapistFilter = null;
+let therapistCalendarWeekStart = null;
 let lastReviewOutcome = null;
 
 document.querySelectorAll("[data-nav]").forEach((link) => {
@@ -145,6 +150,8 @@ resetButton.addEventListener("click", () => {
   resetRunState();
   setStatus("idle", "Idle");
 });
+
+demoResetButton?.addEventListener("click", resetCleanDemoPath);
 
 exportButton.addEventListener("click", () => {
   if (!currentResult) return;
@@ -554,6 +561,7 @@ async function refreshProductWorkspace() {
   await Promise.all([
     loadReferrals(),
     loadReviewTasks(),
+    loadEscalations(),
     loadIntakeTracker(),
     loadScheduling(),
     loadTherapists(),
@@ -838,9 +846,10 @@ async function loadReferralDetail(referralId) {
 
   const workbenchState = referral.workbench_state || {};
   const header = renderWorkbenchSummary(referral, workbenchState);
-  const progress = renderReferralProgress(referral.status);
+  const progress = renderReferralProgress(referral, workbenchState);
 
-  const readinessSection = operationSection("First-session readiness");
+  const disclosure = { collapsible: true, open: true };
+  const readinessSection = operationSection("First-session readiness", disclosure);
   renderSimpleList(
     readinessSection.body,
     referral.readiness_blockers || [],
@@ -848,7 +857,7 @@ async function loadReferralDetail(referralId) {
     (blocker) => recordItem({ title: blocker, status: "open", body: "Must be resolved before first session readiness.", meta: [] }),
   );
 
-  const fieldsSection = operationSection("Extracted fields");
+  const fieldsSection = operationSection("Extracted fields", disclosure);
   fieldsSection.body.append(
     keyValue("Patient", referral.patient_name || "Missing"),
     keyValue("Date of birth", referral.date_of_birth || "Missing"),
@@ -858,7 +867,7 @@ async function loadReferralDetail(referralId) {
     keyValue("Referrer", referral.referring_entity || "Not recorded"),
   );
 
-  const missingSection = operationSection("Missing information");
+  const missingSection = operationSection("Missing information", disclosure);
   renderSimpleList(
     missingSection.body,
     referral.missing_fields || [],
@@ -866,7 +875,7 @@ async function loadReferralDetail(referralId) {
     (field) => recordItem({ title: field.replaceAll("_", " "), status: "missing", body: "Admin review field", meta: [] }),
   );
 
-  const riskSection = operationSection("Risk and suitability");
+  const riskSection = operationSection("Risk and suitability", disclosure);
   riskSection.body.append(
     recordItem({
       title: referral.risk_category || "Risk pending",
@@ -876,23 +885,27 @@ async function loadReferralDetail(referralId) {
     }),
   );
 
-  const taskSection = operationSection("Review tasks");
+  const taskSection = operationSection("Review tasks", disclosure);
   taskSection.section.id = "referral-review-tasks";
-  renderSimpleList(taskSection.body, referral.review_tasks || [], "No review tasks for this referral.", reviewTaskCard);
+  const openReviewTasks = (referral.review_tasks || []).filter((task) => task.status === "open");
+  renderSimpleList(taskSection.body, openReviewTasks, "No open review tasks for this referral.", reviewTaskCard);
 
-  const outputSection = operationSection("Agent outputs");
+  const outputSection = operationSection("Agent outputs", { collapsible: true, open: false });
   renderAgentOutputs(outputSection.body, workbenchState.agent_outputs || []);
 
-  const matchSection = operationSection("Deterministic match");
+  const matchSection = operationSection("Deterministic match", disclosure);
   renderMatchSummary(matchSection.body, referral.match_summary);
 
-  const appointmentSection = operationSection("Appointment proposals");
+  const appointmentSection = operationSection("Appointment proposals", disclosure);
   appointmentSection.section.id = "referral-appointments";
-  const intakeSection = operationSection("Intake status");
+  const intakeSection = operationSection("Intake status", disclosure);
   intakeSection.section.id = "referral-intake";
-  const briefSection = operationSection("Prep briefs");
+  const briefSection = operationSection("Prep briefs", disclosure);
   briefSection.section.id = "referral-prep";
-  const communicationSection = operationSection("Communication thread");
+  const documentSection = operationSection("Documents", disclosure);
+  documentSection.section.id = "referral-documents";
+  renderReferralDocuments(documentSection.body, referral);
+  const communicationSection = operationSection("Communication thread", { collapsible: true, open: false });
   renderCommunicationThread(communicationSection.body, referral);
 
   const raw = document.createElement("details");
@@ -903,7 +916,7 @@ async function loadReferralDetail(referralId) {
   rawText.textContent = referral.raw_text || "";
   raw.append(rawSummary, rawText);
 
-  const activitySection = operationSection("Activity timeline");
+  const activitySection = operationSection("Activity timeline", { collapsible: true, open: false });
   renderActivityTimeline(activitySection.body, workbenchState.activity || []);
 
   referralDetail.append(
@@ -917,6 +930,7 @@ async function loadReferralDetail(referralId) {
     outputSection.section,
     matchSection.section,
     appointmentSection.section,
+    documentSection.section,
     communicationSection.section,
     intakeSection.section,
     briefSection.section,
@@ -976,6 +990,88 @@ function appointmentCard(appointment, referralsById) {
   return item;
 }
 
+function makeReferralDraggable(item, referral) {
+  if (!referral?.id) return;
+  item.draggable = true;
+  item.classList.add("draggable-record");
+  item.addEventListener("dragstart", (event) => {
+    setDragPayload(event, { type: "referral", referral_id: referral.id });
+  });
+  item.addEventListener("dragend", () => item.classList.remove("is-dragging"));
+}
+
+function makeAppointmentDraggable(item, appointment) {
+  if (!appointment?.id) return;
+  item.draggable = true;
+  item.classList.add("draggable-record");
+  item.addEventListener("dragstart", (event) => {
+    setDragPayload(event, { type: "appointment", appointment_id: appointment.id });
+  });
+  item.addEventListener("dragend", () => item.classList.remove("is-dragging"));
+}
+
+function setDragPayload(event, payload) {
+  const text = JSON.stringify(payload);
+  event.currentTarget.classList.add("is-dragging");
+  event.dataTransfer.effectAllowed = "move";
+  event.dataTransfer.setData("application/json", text);
+  event.dataTransfer.setData("text/plain", text);
+}
+
+function parseDragPayload(event) {
+  const raw = event.dataTransfer.getData("application/json") || event.dataTransfer.getData("text/plain");
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function createDraggedAppointmentProposal(referralId, therapistId, slot) {
+  const response = await fetch("/api/appointments/proposals", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      referral_id: referralId,
+      therapist_id: therapistId,
+      starts_at: slot.starts_at,
+      ends_at: slot.ends_at,
+    }),
+  });
+  const body = await readResponseBody(response);
+  if (!response.ok) {
+    window.alert(body.detail || "Could not create slot approval.");
+    return;
+  }
+  setStatus("completed", "Slot proposal created and queued for admin approval.");
+  await refreshProductWorkspace();
+  if (selectedReferralId === referralId) await loadReferralDetail(referralId);
+}
+
+async function requestDraggedAppointmentReschedule(appointmentId, slot) {
+  const response = await fetch(`/api/appointments/${encodeURIComponent(appointmentId)}/reschedule-request`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      starts_at: slot.starts_at,
+      ends_at: slot.ends_at,
+      reason: "Appointment reschedule requested from therapist calendar drag and drop.",
+    }),
+  });
+  const body = await readResponseBody(response);
+  if (!response.ok) {
+    window.alert(body.detail || "Could not request appointment reschedule.");
+    return;
+  }
+  setStatus("completed", "Reschedule request queued for admin approval.");
+  await refreshProductWorkspace();
+  const appointment = (latestAppointments || []).find((item) => item.id === appointmentId);
+  if (appointment?.referral_id && selectedReferralId === appointment.referral_id) {
+    await loadReferralDetail(appointment.referral_id);
+  }
+}
+
 async function loadReferralOperations(referralId, appointmentBody, intakeBody, briefBody) {
   const [appointmentResponse, intakeResponse] = await Promise.all([
     fetch(`/api/appointments?referral_id=${encodeURIComponent(referralId)}`),
@@ -1014,6 +1110,7 @@ function renderWorkbenchSummary(referral, state) {
     keyValue("Stage", state.stage_label || referral.status_label || referral.status || "Pending"),
     keyValue("Blocker", state.primary_blocker?.label || "No active blocker"),
     keyValue("Owner", state.owner || "Admin"),
+    keyValue("Matched therapist", matchedTherapistLabel(referral)),
     keyValue("Next action", state.primary_action_label || referral.next_action_label || "Review referral"),
     keyValue("Risk", referral.risk_category || (referral.risk_present ? "Review needed" : "Not flagged")),
     keyValue("Open gates", String((referral.review_tasks || []).filter((task) => task.status === "open").length)),
@@ -1050,29 +1147,35 @@ function renderWorkbenchSummary(referral, state) {
   return header;
 }
 
-function renderReferralProgress(status) {
+function matchedTherapistLabel(referral) {
+  const match = (referral.match_summary?.ranked_matches || [])[0];
+  if (!match) return "Not matched";
+  return match.name || (match.therapist_id ? `Therapist ${shortId(match.therapist_id)}` : "Not matched");
+}
+
+function renderReferralProgress(referral, state = {}) {
+  const facts = state.progress || {};
   const steps = [
-    { id: "new_referral", label: "Captured", statuses: ["new_referral", "normalising", "needs_admin_review", "waiting_for_missing_info"] },
-    { id: "reviewed", label: "Reviewed", statuses: ["needs_clinical_review", "clinical_escalation_review", "ready_for_matching"] },
-    { id: "matched", label: "Matched", statuses: ["match_recommended", "match_approved"] },
-    { id: "contacted", label: "Contacted", statuses: ["slot_options_ready", "awaiting_patient_contact", "contact_sent", "awaiting_patient_reply"] },
-    { id: "appointment_confirmed", label: "Appointment confirmed", statuses: ["appointment_confirmed"] },
-    { id: "intake_complete", label: "Intake complete", statuses: ["intake_packet_sent", "intake_incomplete", "intake_complete"] },
-    { id: "prep_brief_ready", label: "Prep brief ready", statuses: ["prep_brief_ready", "first_session_ready"] },
+    { id: "captured", label: "Captured", complete: facts.captured !== false },
+    { id: "reviewed", label: "Reviewed", complete: Boolean(facts.reviewed) },
+    { id: "matched", label: "Matched", complete: Boolean(facts.matched) },
+    { id: "contacted", label: "Contacted", complete: Boolean(facts.contacted) },
+    { id: "appointment_confirmed", label: "Appointment confirmed", complete: Boolean(facts.appointment_confirmed) },
+    { id: "intake_complete", label: "Intake complete", complete: Boolean(facts.intake_complete) },
+    { id: "prep_brief_ready", label: "Prep brief ready", complete: Boolean(facts.prep_brief_ready) },
   ];
-  const currentIndex = Math.max(
-    0,
-    steps.findIndex((step) => step.statuses.includes(status)),
-  );
+  const currentIndex = steps.findIndex((step) => !step.complete);
   const wrapper = document.createElement("section");
   wrapper.className = "progress-path";
+  wrapper.dataset.status = referral.status || "";
   steps.forEach((step, index) => {
     const item = document.createElement("div");
     item.className = "progress-step";
-    item.dataset.state = index < currentIndex ? "complete" : index === currentIndex ? "current" : "pending";
+    const isComplete = step.complete;
+    item.dataset.state = isComplete ? "complete" : index === currentIndex ? "current" : "pending";
     const marker = document.createElement("span");
     marker.className = "progress-marker";
-    marker.textContent = index < currentIndex ? "OK" : String(index + 1);
+    marker.textContent = isComplete ? "OK" : String(index + 1);
     const label = document.createElement("strong");
     label.textContent = step.label;
     item.append(marker, label);
@@ -1179,7 +1282,11 @@ function renderActivityTimeline(container, activity) {
       title: item.title,
       status: item.status || item.type,
       body: item.body,
-      meta: [item.type ? item.type.replaceAll("_", " ") : null, formatDate(item.created_at)],
+      meta: [
+        ...(item.meta || []),
+        item.type ? item.type.replaceAll("_", " ") : null,
+        formatDate(item.created_at),
+      ],
     }),
   );
 }
@@ -1332,16 +1439,6 @@ async function simulatePatientReply(referralId, appointmentId, replyType) {
   }
   await refreshProductWorkspace();
   await loadReferralDetail(referralId);
-}
-
-async function confirmAppointment(appointmentId) {
-  const response = await fetch(`/api/appointments/${appointmentId}/confirm`, { method: "POST" });
-  const body = await readResponseBody(response);
-  if (!response.ok) {
-    window.alert(body.detail || "Could not confirm appointment.");
-    return;
-  }
-  if (selectedReferralId) await loadReferralDetail(selectedReferralId);
 }
 
 async function startReferralIntake(referralId) {
@@ -1533,6 +1630,52 @@ async function loadReviewTasks() {
   renderOverviewActionQueue();
 }
 
+async function loadEscalations() {
+  if (!escalationList) return;
+  const response = await fetch("/api/escalations");
+  if (!response.ok) return;
+  const data = await readResponseBody(response);
+  renderCollection(escalationList, data.items || [], "No escalated referrals or tasks.", escalationCard);
+}
+
+function escalationCard(item) {
+  const referral = item.referral || {};
+  const task = item.task || {};
+  const card = recordItem({
+    title: referral.patient_name || friendlyTaskType(task.task_type) || "Escalation",
+    status: item.status || task.status || referral.status,
+    body: item.reason || task.reason || "Escalation requires admin recovery.",
+    meta: [
+      item.type === "review_task" ? friendlyTaskType(task.task_type) : "Referral escalation",
+      referral.id ? `referral ${shortId(referral.id)}` : null,
+      item.updated_at ? formatDate(item.updated_at) : null,
+    ],
+  });
+  if (referral.id) {
+    const actions = document.createElement("div");
+    actions.className = "actions tight";
+    actions.appendChild(actionButton("Open referral", () => openReferralWorkbench(referral.id)));
+    card.appendChild(actions);
+  }
+  return card;
+}
+
+async function resetCleanDemoPath() {
+  const response = await fetch("/api/demo/clean-referral/reset", { method: "POST" });
+  const body = await readResponseBody(response);
+  if (!response.ok) {
+    window.alert(body.detail || "Could not reset the clean demo path.");
+    return;
+  }
+  const referralId = body.referral?.id;
+  setStatus("completed", "Clean demo referral reset.");
+  await refreshProductWorkspace();
+  if (referralId) {
+    navigate("/workbench");
+    await loadReferralDetail(referralId);
+  }
+}
+
 async function loadIntakeTracker() {
   if (!intakeTrackerList) return;
   const response = await fetch("/api/intake/tracker");
@@ -1588,6 +1731,9 @@ function reviewTaskCard(task) {
     actions.appendChild(actionButton("Open referral", () => openReferralWorkbench(task.referral_id)));
   }
   if (task.status !== "open") {
+    if (task.status === "changes_requested" && task.referral_id === selectedReferralId) {
+      actions.appendChild(actionButton("Open revise path", () => scrollToDetailSection("referral-review-tasks")));
+    }
     item.appendChild(actions);
     return item;
   }
@@ -1649,9 +1795,13 @@ async function submitReviewAction(taskId, action, extra = {}) {
 }
 
 async function loadTherapists() {
-  const response = await fetch("/api/therapists");
+  const [response, capacityResponse] = await Promise.all([
+    fetch("/api/therapists"),
+    fetch("/api/therapists/calendar-capacity"),
+  ]);
   if (!response.ok) return;
   const data = await readResponseBody(response);
+  latestTherapistCalendarCapacity = capacityResponse.ok ? await readResponseBody(capacityResponse) : null;
   latestTherapists = data.therapists || [];
   if (!selectedTherapistId && latestTherapists.length) {
     selectedTherapistId = latestTherapists[0].id;
@@ -1677,17 +1827,19 @@ function buildAvailabilityBlocks(formData) {
 
 function renderTherapistMetrics() {
   const activeTherapists = latestTherapists.filter((therapist) => therapist.active);
-  const summaries = latestTherapists.map(therapistCapacitySummary);
-  const remaining = summaries.reduce((total, summary) => total + Math.max(0, summary.remaining), 0);
+  const summaries = activeTherapists.map(therapistCapacitySummary);
+  const remaining = roundHours(summaries.reduce((total, summary) => total + Math.max(0, summary.remaining), 0));
   const fullyBooked = summaries.filter((summary) => summary.active && summary.capacity > 0 && summary.remaining <= 0).length;
-  const missingAvailability = activeTherapists.filter((therapist) => !(therapist.availability_blocks || []).length).length;
+  const syncIssues = summaries.filter((summary) => ["failed", "sync_issue"].includes(summary.syncStatus)).length
+    + (latestTherapistCalendarCapacity?.unmatched_calendar_events || []).length
+    + (latestTherapistCalendarCapacity?.malformed_calendar_events || []).length;
   const incomplete = activeTherapists.filter((therapist) => therapistMatchingDataIncomplete(therapist)).length;
 
   if (metricTherapists) metricTherapists.textContent = activeTherapists.length;
   if (metricTherapistActive) metricTherapistActive.textContent = activeTherapists.length;
   if (metricTherapistCapacity) metricTherapistCapacity.textContent = remaining;
   if (metricTherapistFull) metricTherapistFull.textContent = fullyBooked;
-  if (metricTherapistMissing) metricTherapistMissing.textContent = missingAvailability;
+  if (metricTherapistMissing) metricTherapistMissing.textContent = syncIssues;
   if (metricTherapistIncomplete) metricTherapistIncomplete.textContent = incomplete;
 }
 
@@ -1698,12 +1850,13 @@ function renderTherapistList() {
     const nextSlot = nextAvailabilityLabel(therapist);
     const item = recordItem({
       title: therapist.name,
-      status: therapist.active ? "active" : "inactive",
+      status: therapist.active ? summary.syncStatus || "active" : "inactive",
       body: therapist.specialties.join(", ") || "No specialties recorded",
       meta: [
-        `${summary.capacity}/week capacity`,
-        `${summary.assigned} assigned`,
+        `${summary.used}/${summary.capacity}h contact`,
+        `${summary.remaining}h left`,
         nextSlot,
+        summary.syncStatus ? `sync ${summary.syncStatus.replaceAll("_", " ")}` : null,
         therapist.languages.join(", "),
         therapist.modalities.join(", "),
       ],
@@ -1712,6 +1865,7 @@ function renderTherapistList() {
     item.classList.toggle("is-selected", therapist.id === selectedTherapistId);
     item.addEventListener("click", () => {
       selectedTherapistId = therapist.id;
+      selectedCalendarTherapistFilter = therapist.id;
       renderTherapistList();
       renderSelectedTherapist();
     });
@@ -1728,15 +1882,22 @@ function renderSelectedTherapist() {
     return;
   }
   selectedTherapistId = therapist.id;
+  if (!selectedCalendarTherapistFilter) selectedCalendarTherapistFilter = therapist.id;
+  if (!therapistCalendarWeekStart) therapistCalendarWeekStart = startOfWeek(new Date());
   const summary = therapistCapacitySummary(therapist);
+  const calendarSummary = therapistCalendarSummary(therapist.id);
   const assignedReferrals = referralsForTherapist(therapist.id);
-  const bookings = appointmentsForTherapist(therapist.id);
 
   const header = document.createElement("div");
   header.className = "therapist-profile-header";
   header.append(
     heading(therapist.name),
-    metaRow([therapist.active ? "active" : "inactive", therapist.email, `${summary.remaining} remaining`]),
+    metaRow([
+      therapist.active ? "active" : "inactive",
+      therapist.email,
+      `${summary.remaining}h remaining`,
+      calendarSummary?.last_sync ? `synced ${formatDate(calendarSummary.last_sync)}` : null,
+    ]),
   );
 
   const profileGrid = document.createElement("div");
@@ -1752,23 +1913,16 @@ function renderSelectedTherapist() {
       keyValue("Languages", therapist.languages.join(", ") || "Missing"),
       keyValue("Insurers", therapist.insurers.join(", ") || "Missing"),
     ]),
-    detailCard("Capacity", [
-      keyValue("Weekly capacity", `${summary.capacity} sessions`),
-      keyValue("Currently assigned", `${summary.assigned} referrals`),
-      keyValue("Remaining", `${summary.remaining} sessions`),
+    detailCard("Calendar capacity", [
+      keyValue("Sync status", (calendarSummary?.sync_status || summary.syncStatus || "manual").replaceAll("_", " ")),
+      keyValue("Weekly cap", `${summary.capacity} hours`),
+      keyValue("Patient contact used", `${summary.used} hours`),
+      keyValue("Remaining", `${summary.remaining} hours`),
     ]),
   );
 
-  const availabilitySection = operationSection("Weekly availability");
-  renderAvailabilityGrid(availabilitySection.body, therapist.availability_blocks || []);
-
-  const bookingsSection = operationSection("Manual bookings / blocked time");
-  renderSimpleList(
-    bookingsSection.body,
-    bookings,
-    "No local proposed, confirmed, or blocked appointments recorded.",
-    (appointment) => appointmentCard(appointment, new Map(latestReferrals.map((referral) => [referral.id, referral]))),
-  );
+  const calendarSection = operationSection("Calendar capacity");
+  renderTherapistWeekCalendar(calendarSection.body, therapist);
 
   const assignedSection = operationSection("Assigned patients and referrals");
   renderSimpleList(
@@ -1777,9 +1931,18 @@ function renderSelectedTherapist() {
     "No assigned referrals found for this therapist.",
     (referral) => {
       const item = referralCard(referral, true);
+      makeReferralDraggable(item, referral);
       item.appendChild(keyValue("First session", firstSessionForReferral(referral.id, therapist.id)));
       return item;
     },
+  );
+
+  const syncSection = operationSection("Calendar sync issues");
+  renderSimpleList(
+    syncSection.body,
+    calendarIssuesForTherapist(therapist.id, calendarSummary),
+    "No calendar sync issues detected for this therapist.",
+    calendarIssueCard,
   );
 
   const historySection = operationSection("Recent matching history");
@@ -1794,26 +1957,40 @@ function renderSelectedTherapist() {
     }),
   );
 
-  therapistDetail.append(header, profileGrid, availabilitySection.section, bookingsSection.section, assignedSection.section, historySection.section);
+  therapistDetail.append(
+    header,
+    profileGrid,
+    calendarSection.section,
+    assignedSection.section,
+    syncSection.section,
+    historySection.section,
+  );
 }
 
 function therapistCapacitySummary(therapist) {
-  const capacity = Number(therapist.capacity_per_week || 0);
-  const assigned = referralsForTherapist(therapist.id).length;
+  const calendarSummary = therapistCalendarSummary(therapist.id);
+  const capacity = Number(calendarSummary?.weekly_patient_contact_cap_hours ?? 20);
+  const used = Number(calendarSummary?.weekly_patient_contact_hours_used ?? 0);
+  const remaining = Number(calendarSummary?.weekly_patient_contact_hours_remaining ?? Math.max(0, capacity - referralsForTherapist(therapist.id).length));
+  const assigned = Number(calendarSummary?.active_appointments?.length ?? referralsForTherapist(therapist.id).length);
   return {
     active: therapist.active,
     capacity,
+    used,
     assigned,
-    remaining: capacity - assigned,
+    remaining,
+    syncStatus: calendarSummary?.sync_status || (latestTherapistCalendarCapacity?.google_enabled ? "ready" : "manual"),
   };
 }
 
 function therapistMatchingDataIncomplete(therapist) {
-  return !therapist.capacity_per_week
-    || !(therapist.specialties || []).length
+  return !(therapist.specialties || []).length
     || !(therapist.languages || []).length
-    || !(therapist.modalities || []).length
-    || !(therapist.availability_blocks || []).length;
+    || !(therapist.modalities || []).length;
+}
+
+function therapistCalendarSummary(therapistId) {
+  return (latestTherapistCalendarCapacity?.therapists || []).find((item) => item.therapist_id === therapistId) || null;
 }
 
 function referralsForTherapist(therapistId) {
@@ -1843,9 +2020,416 @@ function firstSessionForReferral(referralId, therapistId) {
 }
 
 function nextAvailabilityLabel(therapist) {
+  const calendarSummary = therapistCalendarSummary(therapist.id);
+  if (calendarSummary?.next_available_slot?.starts_at) {
+    return `Next: ${formatDate(calendarSummary.next_available_slot.starts_at)}`;
+  }
+  if (latestTherapistCalendarCapacity?.provider_error) return "Calendar unavailable";
   const block = (therapist.availability_blocks || [])[0];
-  if (!block) return "No availability set";
+  if (!block) return "Next: default 08:00";
   return `Next: ${block.weekday || "manual"} ${block.start || ""}`;
+}
+
+function renderTherapistWeekCalendar(container, defaultTherapist) {
+  container.replaceChildren();
+  const weekStart = therapistCalendarWeekStart || startOfWeek(new Date());
+  therapistCalendarWeekStart = weekStart;
+  const weekEnd = addDays(weekStart, 7);
+  const filterValue = validCalendarTherapistFilter(selectedCalendarTherapistFilter || defaultTherapist.id);
+  selectedCalendarTherapistFilter = filterValue;
+
+  const toolbar = document.createElement("div");
+  toolbar.className = "calendar-toolbar";
+  const range = document.createElement("strong");
+  range.textContent = `${formatCalendarDay(weekStart)} - ${formatCalendarDay(addDays(weekStart, 6))}`;
+
+  const filter = document.createElement("select");
+  filter.className = "calendar-filter";
+  filter.appendChild(new Option("All therapists", "all"));
+  latestTherapists.forEach((therapist) => filter.appendChild(new Option(therapist.name, therapist.id)));
+  filter.value = filterValue;
+  filter.addEventListener("change", () => {
+    selectedCalendarTherapistFilter = filter.value;
+    if (filter.value !== "all") selectedTherapistId = filter.value;
+    renderTherapistList();
+    renderSelectedTherapist();
+  });
+
+  toolbar.append(
+    calendarToolbarButton("Previous week", () => {
+      therapistCalendarWeekStart = addDays(weekStart, -7);
+      renderSelectedTherapist();
+    }),
+    calendarToolbarButton("Today", () => {
+      therapistCalendarWeekStart = startOfWeek(new Date());
+      renderSelectedTherapist();
+    }),
+    calendarToolbarButton("Next week", () => {
+      therapistCalendarWeekStart = addDays(weekStart, 7);
+      renderSelectedTherapist();
+    }),
+    range,
+    filter,
+  );
+
+  const grid = document.createElement("div");
+  grid.className = "week-calendar";
+  const timeColumn = document.createElement("div");
+  timeColumn.className = "week-time-column";
+  timeColumn.appendChild(document.createElement("span"));
+  for (let hour = 8; hour < 21; hour += 1) {
+    const label = document.createElement("span");
+    label.textContent = `${String(hour).padStart(2, "0")}:00`;
+    timeColumn.appendChild(label);
+  }
+  grid.appendChild(timeColumn);
+
+  const events = calendarWeekEvents(filterValue, weekStart, weekEnd);
+  for (let offset = 0; offset < 7; offset += 1) {
+    const day = addDays(weekStart, offset);
+    grid.appendChild(calendarDayColumn(day, events, filterValue));
+  }
+
+  const legend = document.createElement("div");
+  legend.className = "calendar-legend";
+  [
+    ["confirmed", "Confirmed/local"],
+    ["proposed", "Proposed"],
+    ["busy", "Google busy"],
+  ].forEach(([status, label]) => {
+    const item = document.createElement("span");
+    item.dataset.status = status;
+    item.textContent = label;
+    legend.appendChild(item);
+  });
+
+  container.append(toolbar, legend, grid);
+  if (latestTherapistCalendarCapacity?.provider_error) {
+    container.appendChild(emptyState(latestTherapistCalendarCapacity.provider_error));
+  }
+}
+
+function validCalendarTherapistFilter(value) {
+  if (value === "all") return "all";
+  if (latestTherapists.some((therapist) => therapist.id === value)) return value;
+  return latestTherapists[0]?.id || "all";
+}
+
+function calendarToolbarButton(label, handler) {
+  const button = actionButton(label, handler);
+  button.classList.add("calendar-nav-button");
+  return button;
+}
+
+function calendarWeekEvents(filterValue, weekStart, weekEnd) {
+  const referralById = new Map((latestReferrals || []).map((referral) => [referral.id, referral]));
+  const therapists = filterValue === "all"
+    ? latestTherapists
+    : latestTherapists.filter((therapist) => therapist.id === filterValue);
+  const events = [];
+  const busySource = filterValue === "all"
+    ? (latestTherapistCalendarCapacity?.therapists || [])[0]
+    : therapistCalendarSummary(filterValue);
+
+  (busySource?.busy_periods || []).forEach((period) => {
+    const start = parseDate(period.start);
+    const end = parseDate(period.end);
+    if (!start || !end || !rangesOverlap(start, end, weekStart, weekEnd)) return;
+    events.push({
+      type: "busy",
+      status: "busy",
+      title: period.summary || "Google busy",
+      start,
+      end,
+      meta: filterValue === "all" ? "Shared Google Calendar" : therapistName(filterValue),
+      source: period.source || "google_calendar",
+    });
+  });
+
+  therapists.forEach((therapist) => {
+    const summary = therapistCalendarSummary(therapist.id);
+    (summary?.active_appointments || appointmentsForTherapist(therapist.id)).forEach((appointment) => {
+      const start = parseDate(appointment.starts_at);
+      const end = parseDate(appointment.ends_at);
+      if (!start || !end || !rangesOverlap(start, end, weekStart, weekEnd)) return;
+      const referral = appointment.referral_id ? referralById.get(appointment.referral_id) : null;
+      events.push({
+        type: "appointment",
+        status: appointment.status || "proposed",
+        title: appointment.status === "confirmed" ? "Confirmed appointment" : "Proposed slot",
+        start,
+        end,
+        therapistId: therapist.id,
+        therapistName: therapist.name,
+        referralId: appointment.referral_id,
+        appointment,
+        patientName: referral?.patient_name || (appointment.referral_id ? `Referral ${shortId(appointment.referral_id)}` : "Local appointment"),
+      });
+    });
+  });
+
+  return events.sort((a, b) => a.start - b.start || eventWeight(a) - eventWeight(b));
+}
+
+function calendarDayColumn(day, events, filterValue) {
+  const column = document.createElement("div");
+  column.className = "week-day-column";
+  const header = document.createElement("div");
+  header.className = "week-day-header";
+  header.append(heading(day.toLocaleDateString(undefined, { weekday: "short" })), pill(String(day.getDate())));
+
+  const body = document.createElement("div");
+  body.className = "week-day-body";
+  for (let hour = 8; hour < 21; hour += 1) {
+    const row = document.createElement("div");
+    row.className = "week-hour-row";
+    body.appendChild(row);
+  }
+  if (filterValue !== "all") {
+    attachBlankCalendarDropTarget(body, day, filterValue);
+  }
+  events.filter((event) => occursOnDay(event, day) && eventIntersectsCalendarHours(event, day)).forEach((event, index) => {
+    body.appendChild(calendarEventElement(event, day, index));
+  });
+  column.append(header, body);
+  return column;
+}
+
+function calendarEventElement(event, day, index) {
+  const element = document.createElement("button");
+  element.type = "button";
+  element.className = `week-calendar-event is-${event.type}`;
+  element.dataset.status = event.status;
+  const bounds = eventBoundsForDay(event, day);
+  element.style.top = `${bounds.top}%`;
+  element.style.height = `${bounds.height}%`;
+  element.style.left = `${6 + (index % 2) * 4}%`;
+  element.style.right = `${6 + (index % 3) * 3}%`;
+  element.title = calendarEventTooltip(event);
+  const title = document.createElement("strong");
+  title.textContent = event.type === "appointment" ? event.patientName : event.title;
+  const time = document.createElement("span");
+  time.textContent = `${formatTime(event.start)}-${formatTime(event.end)}`;
+  const meta = document.createElement("small");
+  meta.textContent = event.type === "appointment" ? `${event.title} | ${event.therapistName}` : event.meta || event.source || "";
+  element.append(title, time, meta);
+
+  if (event.type === "appointment") {
+    makeAppointmentDraggable(element, event.appointment);
+  }
+  element.addEventListener("click", async () => {
+    if (event.type === "appointment" && event.referralId) {
+      await openReferralWorkbench(event.referralId);
+    } else if (event.type === "busy") {
+      window.alert(`${event.title}\n${formatDate(event.start)} to ${formatDate(event.end)}`);
+    }
+  });
+  return element;
+}
+
+function attachBlankCalendarDropTarget(body, day, therapistId) {
+  body.addEventListener("dragover", (event) => {
+    event.preventDefault();
+    body.classList.add("is-drop-target");
+  });
+  body.addEventListener("dragleave", (event) => {
+    if (!body.contains(event.relatedTarget)) body.classList.remove("is-drop-target");
+  });
+  body.addEventListener("drop", async (event) => {
+    event.preventDefault();
+    body.classList.remove("is-drop-target");
+    const payload = parseDragPayload(event);
+    if (!payload) return;
+    const slot = slotFromCalendarDrop(day, body, event);
+    if (!slot) return;
+    if (payload.type === "referral" && payload.referral_id) {
+      await createDraggedAppointmentProposal(payload.referral_id, therapistId, slot);
+      return;
+    }
+    if (payload.type === "appointment" && payload.appointment_id) {
+      await requestDraggedAppointmentReschedule(payload.appointment_id, slot);
+    }
+  });
+}
+
+function slotFromCalendarDrop(day, body, event) {
+  const rect = body.getBoundingClientRect();
+  if (!rect.height) return null;
+  const totalMinutes = 13 * 60;
+  const rawMinutes = ((event.clientY - rect.top) / rect.height) * totalMinutes;
+  const startMinutes = Math.min(totalMinutes - 60, Math.max(0, Math.round(rawMinutes / 10) * 10));
+  const startsAt = new Date(day);
+  startsAt.setHours(8, 0, 0, 0);
+  startsAt.setMinutes(startsAt.getMinutes() + startMinutes);
+  const endsAt = new Date(startsAt.getTime() + 60 * 60000);
+  return { starts_at: startsAt.toISOString(), ends_at: endsAt.toISOString() };
+}
+
+function eventBoundsForDay(event, day) {
+  const dayStart = new Date(day);
+  dayStart.setHours(8, 0, 0, 0);
+  const dayEnd = new Date(day);
+  dayEnd.setHours(21, 0, 0, 0);
+  const clippedStart = event.start < dayStart ? dayStart : event.start;
+  const clippedEnd = event.end > dayEnd ? dayEnd : event.end;
+  const totalMinutes = 13 * 60;
+  const startMinutes = Math.max(0, (clippedStart - dayStart) / 60000);
+  const duration = Math.max(20, (clippedEnd - clippedStart) / 60000);
+  return {
+    top: (startMinutes / totalMinutes) * 100,
+    height: Math.min(100 - (startMinutes / totalMinutes) * 100, (duration / totalMinutes) * 100),
+  };
+}
+
+function eventIntersectsCalendarHours(event, day) {
+  const dayStart = new Date(day);
+  dayStart.setHours(8, 0, 0, 0);
+  const dayEnd = new Date(day);
+  dayEnd.setHours(21, 0, 0, 0);
+  return rangesOverlap(event.start, event.end, dayStart, dayEnd);
+}
+
+function eventWeight(event) {
+  return { busy: 0, confirmed: 1, proposed: 2 }[event.status] ?? 4;
+}
+
+function occursOnDay(event, day) {
+  const start = new Date(day);
+  start.setHours(0, 0, 0, 0);
+  const end = addDays(start, 1);
+  return rangesOverlap(event.start, event.end, start, end);
+}
+
+function rangesOverlap(startA, endA, startB, endB) {
+  return startA < endB && endA > startB;
+}
+
+function startOfWeek(date) {
+  const value = new Date(date);
+  value.setHours(0, 0, 0, 0);
+  const day = value.getDay();
+  const diff = day === 0 ? -6 : 1 - day;
+  value.setDate(value.getDate() + diff);
+  return value;
+}
+
+function addDays(date, days) {
+  const value = new Date(date);
+  value.setDate(value.getDate() + days);
+  return value;
+}
+
+function parseDate(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function formatCalendarDay(value) {
+  return value.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function formatTime(value) {
+  return value.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
+
+function therapistName(therapistId) {
+  return latestTherapists.find((therapist) => therapist.id === therapistId)?.name || "Therapist";
+}
+
+function calendarEventTooltip(event) {
+  return [
+    event.type === "appointment" ? event.patientName : event.title,
+    `${formatDate(event.start)} to ${formatDate(event.end)}`,
+    event.therapistName || event.meta,
+  ].filter(Boolean).join("\n");
+}
+
+function defaultAvailabilityBlocks() {
+  return ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"].map((weekday) => ({
+    weekday,
+    start: "08:00",
+    end: "21:00",
+    modality: "online",
+  }));
+}
+
+function calendarBusyCard(period) {
+  const start = period.start ? formatDate(period.start) : "Start unknown";
+  const end = period.end ? formatDate(period.end) : "End unknown";
+  return recordItem({
+    title: period.summary || "Google Calendar busy block",
+    status: "manual",
+    body: `${start} to ${end}`,
+    meta: [period.source || "google_calendar"],
+  });
+}
+
+function calendarSlotDropTarget(slot, therapist) {
+  const item = recordItem({
+    title: slot.starts_at ? formatDate(slot.starts_at) : "Available slot",
+    status: "ready",
+    body: "60-minute session with a 10-minute post-session buffer.",
+    meta: [
+      slot.ends_at ? `ends ${formatDate(slot.ends_at)}` : null,
+      slot.buffer_until ? `buffer until ${formatDate(slot.buffer_until)}` : "10 min buffer",
+      slot.weekday,
+    ],
+  });
+  item.classList.add("calendar-slot");
+  item.addEventListener("dragover", (event) => {
+    event.preventDefault();
+    item.classList.add("is-drop-target");
+  });
+  item.addEventListener("dragleave", () => item.classList.remove("is-drop-target"));
+  item.addEventListener("drop", async (event) => {
+    event.preventDefault();
+    item.classList.remove("is-drop-target");
+    const payload = parseDragPayload(event);
+    if (!payload) return;
+    if (payload.type === "referral" && payload.referral_id) {
+      await createDraggedAppointmentProposal(payload.referral_id, therapist.id, slot);
+      return;
+    }
+    if (payload.type === "appointment" && payload.appointment_id) {
+      await requestDraggedAppointmentReschedule(payload.appointment_id, slot);
+    }
+  });
+  return item;
+}
+
+function calendarIssuesForTherapist(therapistId, summary) {
+  const issues = [...(summary?.sync_errors || [])];
+  (latestTherapistCalendarCapacity?.unmatched_calendar_events || [])
+    .filter((event) => !event.lumen_therapist_id || event.lumen_therapist_id === therapistId)
+    .forEach((event) => issues.push({
+      code: "unmatched_calendar_event",
+      message: event.summary || "Lumen Calendar event has no matching local appointment.",
+      event_id: event.id,
+    }));
+  (latestTherapistCalendarCapacity?.malformed_calendar_events || [])
+    .filter((event) => !event.lumen_therapist_id || event.lumen_therapist_id === therapistId)
+    .forEach((event) => issues.push({
+      code: "malformed_calendar_event",
+      message: event.summary || "Calendar event is missing required Lumen metadata.",
+      event_id: event.id,
+    }));
+  if (latestTherapistCalendarCapacity?.provider_error) {
+    issues.push({ code: "provider_error", message: latestTherapistCalendarCapacity.provider_error });
+  }
+  return issues;
+}
+
+function calendarIssueCard(issue) {
+  return recordItem({
+    title: String(issue.code || "calendar issue").replaceAll("_", " "),
+    status: "sync_issue",
+    body: issue.message || "Calendar sync needs admin attention.",
+    meta: [
+      issue.appointment_id ? `appointment ${shortId(issue.appointment_id)}` : null,
+      issue.event_id ? `event ${shortId(issue.event_id)}` : null,
+    ],
+  });
 }
 
 function renderAvailabilityGrid(container, blocks) {
@@ -1853,13 +2437,14 @@ function renderAvailabilityGrid(container, blocks) {
   const weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
   const grid = document.createElement("div");
   grid.className = "availability-grid";
+  const sourceBlocks = (blocks || []).length ? blocks : defaultAvailabilityBlocks();
   weekdays.forEach((weekday) => {
     const cell = document.createElement("div");
     cell.className = "availability-cell";
     const label = document.createElement("strong");
     label.textContent = weekday.slice(0, 3);
     cell.appendChild(label);
-    const dayBlocks = blocks.filter((block) => String(block.weekday || "").toLowerCase() === weekday.toLowerCase());
+    const dayBlocks = sourceBlocks.filter((block) => String(block.weekday || "").toLowerCase() === weekday.toLowerCase());
     if (!dayBlocks.length) {
       cell.appendChild(pill("Unavailable"));
     } else {
@@ -1868,7 +2453,9 @@ function renderAvailabilityGrid(container, blocks) {
     grid.appendChild(cell);
   });
   container.appendChild(grid);
-  container.appendChild(emptyState("All times use the clinic timezone configured for this demo environment."));
+  container.appendChild(emptyState((blocks || []).length
+    ? "All times use the clinic timezone configured for this demo environment."
+    : "Default availability is used for this demo when no custom weekly blocks are set."));
 }
 
 function detailCard(title, children) {
@@ -2164,14 +2751,23 @@ function reportEvidenceDetails(report) {
   return detail;
 }
 
-function operationSection(title) {
-  const section = document.createElement("section");
-  section.className = "operation-section";
-  const headingEl = document.createElement("h4");
-  headingEl.textContent = title;
+function operationSection(title, options = {}) {
+  const section = options.collapsible ? document.createElement("details") : document.createElement("section");
+  section.className = options.collapsible ? "operation-section collapsible-section" : "operation-section";
+  if (options.collapsible && options.open !== false) section.open = true;
   const body = document.createElement("div");
   body.className = "record-list embedded-list";
-  section.append(headingEl, body);
+  if (options.collapsible) {
+    const summary = document.createElement("summary");
+    const headingEl = document.createElement("h4");
+    headingEl.textContent = title;
+    summary.appendChild(headingEl);
+    section.append(summary, body);
+  } else {
+    const headingEl = document.createElement("h4");
+    headingEl.textContent = title;
+    section.append(headingEl, body);
+  }
   return { section, body };
 }
 
@@ -2253,6 +2849,20 @@ function renderDocuments(container, documents, emptyText) {
   });
 }
 
+function renderReferralDocuments(container, referral) {
+  const seen = new Set();
+  const documents = [
+    ...(referral.documents || []),
+    ...(referral.patient_replies || []),
+    ...(referral.missing_info_replies || []),
+  ].filter((documentRecord) => {
+    if (!documentRecord?.id || seen.has(documentRecord.id)) return false;
+    seen.add(documentRecord.id);
+    return true;
+  });
+  renderDocuments(container, documents, "No referral documents, replies, intake uploads, or waiver records yet.");
+}
+
 function renderMatchSummary(container, matchSummary) {
   container.replaceChildren();
   const ranked = matchSummary?.ranked_matches || [];
@@ -2302,6 +2912,7 @@ function renderAppointments(container, appointments) {
         appointment.ends_at ? `ends ${new Date(appointment.ends_at).toLocaleTimeString()}` : null,
         appointment.google_calendar_event_id ? `calendar ${shortId(appointment.google_calendar_event_id)}` : null,
         appointment.google_calendar_synced_at ? `synced ${formatDate(appointment.google_calendar_synced_at)}` : null,
+        appointment.calendar_sync_issue ? "calendar sync issue" : null,
         appointment.last_provider_error,
       ],
     });
@@ -2585,8 +3196,10 @@ function friendlyTaskType(value) {
     slot_offer_approval: "Slot offer approval",
     send_approval: "Patient message approval",
     appointment_confirmation_approval: "Appointment confirmation approval",
+    appointment_reschedule_approval: "Appointment reschedule approval",
     intake_reminder_approval: "Intake reminder approval",
     intake_exception_approval: "Intake exception approval",
+    inbound_reply_review: "Inbound reply review",
     therapist_note_approval: "Therapist note approval",
     post_session_risk_review: "Post-session risk review",
     report_signoff: "Report signoff",
@@ -2608,6 +3221,11 @@ function formatDate(value) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(date);
+}
+
+function roundHours(value) {
+  const numeric = Number(value || 0);
+  return Math.round(numeric * 10) / 10;
 }
 
 function csvList(value) {

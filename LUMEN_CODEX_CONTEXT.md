@@ -32,7 +32,7 @@ That means:
 - Appointment slots have been proposed and approved.
 - Patient contact has been drafted and approved.
 - Patient reply has been received or simulated and confirmed.
-- Appointment has been confirmed or simulated.
+- Appointment has been confirmed through the admin gate and written to Google Calendar, with a local appointment record linked to the Google event where applicable.
 - Intake checklist has been generated.
 - Required intake is complete or formally waived.
 - Therapist prep brief has been generated.
@@ -64,7 +64,7 @@ Operating principle:
 
 ## Active Scope For The Next Phase
 
-The next implementation phase is UI/workflow streamlining for the admin referral product.
+The next implementation phase is UI/workflow streamlining plus the narrow real Gmail and Google Calendar MVP slice for the admin referral product.
 
 Focus on:
 
@@ -76,6 +76,8 @@ Focus on:
 - Workbench-based referral processing.
 - Simplified operational UI rather than a developer workflow console.
 - Preserving existing backend functionality where possible.
+- Real Gmail send after admin approval.
+- Real Google Calendar availability, event creation, and approved event updates for demo scheduling.
 
 Do not implement the therapist session workflow in this phase.
 
@@ -154,7 +156,7 @@ It should show:
 - Blockers and review tasks
 - Communication thread
 - Therapist matching
-- Scheduling
+- Scheduling status and approved appointment actions
 - Intake/checklist/documents/waivers
 - Prep brief preview
 - Agent activity and audit timeline
@@ -198,8 +200,8 @@ It should show:
 - Current assigned count
 - Next available slot
 - Matching data completeness
-- Availability grid
-- Manual bookings / blocked time
+- Google-backed availability grid
+- Calendar busy periods, Lumen-created appointments, and blocked time
 - Assigned patients/referrals
 - Recent matching history
 
@@ -216,9 +218,9 @@ It should cover:
 - Row-level import errors
 - Email capture status
 - Outbound email status
-- Calendar/manual availability status
+- Calendar availability/write-back status
 - Integration health cards
-- Google Calendar placeholder/status
+- Google Calendar connection/sync status
 
 Referral-specific communication belongs in Workbench, not Integrations.
 
@@ -244,21 +246,51 @@ It should cover:
 
 It should not be part of everyday admin referral processing.
 
-## Calendar / Scheduling Strategy For This Phase
+## Gmail / Calendar Strategy For This Phase
 
-The user has a Google Calendar account and is creating fictitious therapist appointments for the class demo.
+The previous placeholder-only Google integration guidance is superseded. This phase should implement a narrow real Gmail and Google Calendar MVP slice while preserving all human approval gates.
 
-However, the Google Cloud project and real Google Calendar API integration are not ready.
+Current Google setup:
 
-Therefore:
+- Shared clinic/staff Google account: `connorbrown0987@gmail.com`.
+- Fake demo patient account: `lumenpatientdemo@gmail.com`.
+- Gmail capability: `users.messages.send` with `gmail.send`.
+- Calendar capabilities: `freeBusy.query`, `events.insert`, and event update through the enabled Calendar event scope.
+- Calendar scopes: `calendar.readonly` and `calendar.events`.
 
-- Do not implement real Google Calendar API integration in this UI pass.
-- Create a clear placeholder/status area for future Google Calendar setup.
-- Use manual/mock therapist availability and manually recorded/demo appointments for now.
-- Keep scheduling logic and UI structured so a future Google Calendar adapter can replace or augment the manual/mock data.
-- Proposed slots should come from therapist availability/manual bookings for MVP.
-- Appointment creation may be simulated or recorded locally with audit trail.
-- All booking actions still require human approval.
+Email rules:
+
+- The agent may draft patient-facing emails, but must not send them without admin approval.
+- Every `send_approval` review task must be linked to a valid communication draft.
+- Admin approval of a valid send task should call Gmail `users.messages.send`.
+- All demo patient emails should go to `lumenpatientdemo@gmail.com` unless an explicit environment override allows another recipient.
+- Persist send status, Gmail message ID, timestamp, approver/action metadata, and failure reason where applicable.
+
+Calendar and scheduling rules:
+
+- Use one shared clinic Google Calendar for the MVP.
+- Therapist identity should be derived from therapist names already stored in the app.
+- Codex may create fresh fake Google Calendar appointments for demo data; old manually-created blocked-time events can be removed by the user.
+- Google Calendar is the source of truth for busy/free time.
+- Lumen local records are the source of truth for referral linkage, patient linkage, approval status, workflow status, and audit trail.
+- Therapist default availability is 08:00-21:00, 7 days per week.
+- Session length is 60 minutes.
+- Buffer after each session is 10 minutes.
+- Maximum patient-contact time is 20 hours per therapist per week.
+- Generic busy blocks reduce availability but only patient appointments count toward the 20-hour weekly contact cap.
+- Slot proposals should combine Google Calendar busy periods, existing local appointments, the default availability window, session duration, buffer, and weekly cap.
+- Appointment creation in Google Calendar must only occur after admin approval / appointment confirmation approval.
+- Approved reschedules should update both the local appointment record and the linked Google Calendar event.
+- Store the Google Calendar event ID on the local appointment record.
+- Use a deterministic title for Lumen-created events, for example: `[Lumen] Therapist: {therapist_name} | Patient: Sarah O'Connor | Referral: {referral_id}`.
+- If the local appointment exists but the Google event is missing, flag `calendar_sync_issue`.
+- If Google Calendar rejects creation/update or reveals a conflict, keep the referral blocked and show a clear failure reason.
+
+UI placement:
+
+- Workbench should show email draft, approval state, send state, Gmail message ID or failure reason.
+- Availability and calendar/capacity management should live primarily on the Therapists page.
+- Integrations should show Gmail/Calendar health and sync status, not referral-specific communication detail.
 
 ## Admin Referral Status Model
 
@@ -392,9 +424,9 @@ Unless repository inspection reveals a safer order, the first implementation pat
 5. Moving Review Inbox functions into Overview/Workbench.
 6. Moving Intake & Scheduling functions into Workbench/Therapists.
 7. Moving trace/debug functionality into New Referral/System / Agents.
-8. Adding clear Google Calendar placeholder/status while keeping manual/mock availability for now.
+8. Implementing the narrow Gmail send and Google Calendar-backed availability/write-back MVP slice with clear health/sync status.
 9. Adding or improving agent activity/audit timeline visibility.
 
-Do not attempt a full real email/calendar integration in this patch.
+Do not implement broad email/calendar features beyond the approved Gmail send and Google Calendar availability/event write-back MVP slice.
 
 Do not implement the therapist session workflow in this patch.
