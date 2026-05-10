@@ -239,6 +239,19 @@ button.compact,
   min-width: 0;
 }
 
+.dev-user-switcher {
+  min-width: 180px;
+  gap: 4px;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+}
+
+.dev-user-switcher select {
+  padding: 8px 10px;
+  font-size: 0.86rem;
+  text-transform: none;
+}
+
 .content {
   padding: 28px;
 }

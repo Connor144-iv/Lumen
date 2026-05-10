@@ -46,6 +46,14 @@
             <h1 id="page-title">Overview</h1>
           </div>
           <div class="topbar-actions">
+            <label class="dev-user-switcher">
+              Dev only user
+              <select id="dev-user-select" aria-label="Dev only user identity">
+                <option value="">Default admin</option>
+                <option value="demo-admin">Demo admin</option>
+                <option value="demo-clara-therapist-user">Clara therapist</option>
+              </select>
+            </label>
             <a class="button-link primary-action" href="/new-referral" data-nav>New referral</a>
             <button id="demo-reset-button" type="button" class="secondary compact">Reset demo path</button>
             <button id="refresh-product-button" type="button" class="secondary compact">Refresh data</button>
@@ -755,6 +763,7 @@
                   </div>
                   <span class="panel-stat" id="therapist-context-label">Therapist context</span>
                 </div>
+                <div id="documentation-therapist-summary" class="record-list"></div>
                 <form id="documentation-session-form" class="filter-form">
                   <label>
                     Patient

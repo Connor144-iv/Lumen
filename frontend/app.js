@@ -25,10 +25,24 @@ const routes = {
   },
 };
 
+const DEV_USER_STORAGE_KEY = "lumen.devUserId";
+const nativeFetch = window.fetch.bind(window);
+
+window.fetch = (input, init = {}) => {
+  const devUserId = localStorage.getItem(DEV_USER_STORAGE_KEY);
+  if (!devUserId) return nativeFetch(input, init);
+  const url = typeof input === "string" ? new URL(input, window.location.origin) : new URL(input.url, window.location.origin);
+  if (url.origin !== window.location.origin) return nativeFetch(input, init);
+  const headers = new Headers(init.headers || {});
+  headers.set("x-lumen-user-id", devUserId);
+  return nativeFetch(input, { ...init, headers });
+};
+
 const form = document.querySelector("#workflow-form");
 const runButton = document.querySelector("#run-button");
 const resetButton = document.querySelector("#reset-button");
 const demoResetButton = document.querySelector("#demo-reset-button");
+const devUserSelect = document.querySelector("#dev-user-select");
 const exportButton = document.querySelector("#export-button");
 const refreshHealthButton = document.querySelector("#refresh-health-button");
 const refreshProductButton = document.querySelector("#refresh-product-button");
@@ -68,6 +82,7 @@ const gmailInboxRefreshButton = document.querySelector("#gmail-inbox-refresh");
 const securityPostureList = document.querySelector("#security-posture-list");
 const feedbackMetricsList = document.querySelector("#feedback-metrics-list");
 const therapistContextLabel = document.querySelector("#therapist-context-label");
+const documentationTherapistSummary = document.querySelector("#documentation-therapist-summary");
 const documentationSessionForm = document.querySelector("#documentation-session-form");
 const documentationPatientSelect = document.querySelector("#documentation-patient-select");
 const documentationSessionTitle = document.querySelector("#documentation-session-title");
@@ -141,6 +156,28 @@ document.querySelectorAll("[data-nav]").forEach((link) => {
 });
 
 window.addEventListener("popstate", () => applyRoute(window.location.pathname));
+
+if (devUserSelect) {
+  devUserSelect.value = localStorage.getItem(DEV_USER_STORAGE_KEY) || "";
+  devUserSelect.addEventListener("change", async () => {
+    if (devUserSelect.value) {
+      localStorage.setItem(DEV_USER_STORAGE_KEY, devUserSelect.value);
+    } else {
+      localStorage.removeItem(DEV_USER_STORAGE_KEY);
+    }
+    latestSecurityContext = null;
+    currentTherapist = null;
+    currentTherapistPatients = [];
+    latestDocumentationPatients = [];
+    latestDocumentationSessions = [];
+    latestDocumentationDetail = null;
+    latestDocumentationSessionsByPatient = new Map();
+    selectedDocumentationPatientId = null;
+    selectedDocumentationSessionId = null;
+    await loadSecurityContext();
+    await refreshProductWorkspace();
+  });
+}
 
 form.addEventListener("change", (event) => {
   if (event.target.name === "workflow_type") {
@@ -349,12 +386,6 @@ function navigate(path) {
 
 function applyRoute(path) {
   let route = routes[path] || routes["/"];
-  if (route.therapistOnly && securityContextLoaded && !hasTherapistWorkspaceAccess()) {
-    route = routes["/"];
-    if (window.location.pathname !== "/") {
-      window.history.replaceState({}, "", "/");
-    }
-  }
   document.querySelectorAll("[data-page]").forEach((page) => {
     page.classList.toggle("is-active", page.dataset.page === route.page);
   });
@@ -364,11 +395,19 @@ function applyRoute(path) {
   pageTitle.textContent = route.title;
   sectionLabel.textContent = route.label;
   document.title = `Lumen | ${route.title}`;
-  if (route.page === "documentation" && hasTherapistWorkspaceAccess()) {
-    loadDocumentationWorkspace();
+  if (route.page === "documentation") {
+    if (hasTherapistWorkspaceAccess()) {
+      loadDocumentationWorkspace();
+    } else if (securityContextLoaded) {
+      renderDocumentationUnavailable();
+    }
   }
-  if (route.page === "my-patients" && hasTherapistWorkspaceAccess()) {
-    loadMyTherapistPatients();
+  if (route.page === "my-patients") {
+    if (hasTherapistWorkspaceAccess()) {
+      loadMyTherapistPatients();
+    } else if (securityContextLoaded) {
+      renderMyTherapistPatients("Not signed in as therapist.");
+    }
   }
 }
 
@@ -713,6 +752,7 @@ async function loadMyTherapistPatients() {
 async function loadDocumentationWorkspace() {
   if (!hasTherapistWorkspaceAccess()) return;
   setDocumentationMessage("Loading documentation workspace...");
+  renderDocumentationTherapistSummary();
   try {
     await loadDocumentationPatients();
     await loadDocumentationSessions();
@@ -726,6 +766,39 @@ async function loadDocumentationWorkspace() {
     renderDocumentationDetail();
     setDocumentationMessage(friendlyClientError(error), true);
   }
+}
+
+function renderDocumentationUnavailable() {
+  selectedDocumentationPatientId = null;
+  selectedDocumentationSessionId = null;
+  latestDocumentationPatients = [];
+  latestDocumentationSessions = [];
+  latestDocumentationDetail = null;
+  renderDocumentationTherapistSummary("Not signed in as therapist.");
+  renderDocumentationPatientSelect();
+  renderDocumentationSessions();
+  renderDocumentationDetail();
+  setDocumentationMessage("Not signed in as therapist.", true);
+}
+
+function renderDocumentationTherapistSummary(message) {
+  if (!documentationTherapistSummary) return;
+  if (message) {
+    documentationTherapistSummary.replaceChildren(emptyState(message));
+    return;
+  }
+  if (!currentTherapist) {
+    documentationTherapistSummary.replaceChildren(emptyState("Not signed in as therapist."));
+    return;
+  }
+  documentationTherapistSummary.replaceChildren(
+    recordItem({
+      title: currentTherapist.name || "Current therapist",
+      status: "current user",
+      body: currentTherapist.email || "No therapist email recorded.",
+      meta: [currentTherapist.id],
+    }),
+  );
 }
 
 async function loadDocumentationPatients() {
@@ -887,11 +960,21 @@ function renderDocumentationPatientSelect() {
   if (!documentationPatientSelect) return;
   documentationPatientSelect.replaceChildren();
   if (!latestDocumentationPatients.length) {
-    documentationPatientSelect.appendChild(new Option("No assigned patients", ""));
+    documentationPatientSelect.appendChild(new Option(hasTherapistWorkspaceAccess() ? "No assigned patients" : "Sign in as therapist", ""));
     documentationPatientSelect.disabled = true;
+    if (documentationSessionForm) {
+      documentationSessionForm.querySelectorAll("input, button").forEach((element) => {
+        element.disabled = true;
+      });
+    }
     return;
   }
   documentationPatientSelect.disabled = false;
+  if (documentationSessionForm) {
+    documentationSessionForm.querySelectorAll("input, button").forEach((element) => {
+      element.disabled = false;
+    });
+  }
   latestDocumentationPatients.forEach((patient) => {
     documentationPatientSelect.appendChild(new Option(patient.display_name || patient.id, patient.id));
   });
@@ -1026,6 +1109,7 @@ function renderTherapistWorkspaceContext(errorMessage) {
   } else {
     therapistContextLabel.textContent = "Therapist context";
   }
+  renderDocumentationTherapistSummary(errorMessage);
 }
 
 function renderMyTherapistPatients(errorMessage) {
