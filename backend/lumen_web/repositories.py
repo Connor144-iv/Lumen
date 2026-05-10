@@ -1926,6 +1926,24 @@ def security_context(session: Session, user_id: str | None = DEMO_USER_ID) -> di
     }
 
 
+def therapist_for_user(session: Session, user: User | str | None) -> dict[str, Any] | None:
+    user_record = session.get(User, user) if isinstance(user, str) else user
+    if user_record is None or user_record.role != "therapist" or not user_record.active:
+        return None
+    email = (user_record.email or "").strip().lower()
+    if not email:
+        return None
+    therapist = session.scalar(
+        select(Therapist)
+        .where(
+            Therapist.tenant_id == user_record.tenant_id,
+            func.lower(Therapist.email) == email,
+        )
+        .limit(1)
+    )
+    return therapist_to_dict(therapist) if therapist is not None else None
+
+
 def governance_posture(session: Session, tenant_id: str | None = None) -> dict[str, Any]:
     tenant = tenant_id or "demo-clinic"
     audit_count = int(session.scalar(select(func.count(AuditLog.id)).where(AuditLog.tenant_id == tenant)) or 0)

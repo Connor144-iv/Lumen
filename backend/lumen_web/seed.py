@@ -11,6 +11,8 @@ from .models import ClinicalLibraryRecord, DocumentChunk, IntakeTemplate, Patien
 DEMO_TENANT_ID = "demo-clinic"
 DEMO_USER_ID = "demo-admin"
 DEMO_THERAPIST_USER_ID = "demo-therapist-user"
+DEMO_CLARA_THERAPIST_USER_ID = "demo-clara-therapist-user"
+DEMO_CLARA_EMAIL = "clara.demo1234@gmail.com"
 DEMO_DIRECTOR_USER_ID = "demo-director"
 
 
@@ -48,6 +50,25 @@ def seed_demo_data(session: Session) -> None:
                 role="therapist",
             )
         )
+    clara_user = session.get(User, DEMO_CLARA_THERAPIST_USER_ID)
+    if clara_user is None:
+        session.add(
+            User(
+                id=DEMO_CLARA_THERAPIST_USER_ID,
+                tenant_id=DEMO_TENANT_ID,
+                email=DEMO_CLARA_EMAIL,
+                display_name="Dr. Clara Demo",
+                role="therapist",
+                active=True,
+            )
+        )
+    else:
+        clara_user.tenant_id = DEMO_TENANT_ID
+        clara_user.email = DEMO_CLARA_EMAIL
+        clara_user.display_name = "Dr. Clara Demo"
+        clara_user.role = "therapist"
+        clara_user.active = True
+    session.flush()
     director_user = session.get(User, DEMO_DIRECTOR_USER_ID)
     if director_user is None:
         session.add(
