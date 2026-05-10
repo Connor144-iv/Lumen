@@ -324,6 +324,8 @@ def index() -> FileResponse:
 @app.get("/therapists", include_in_schema=False)
 @app.get("/intake", include_in_schema=False)
 @app.get("/clinical", include_in_schema=False)
+@app.get("/documentation", include_in_schema=False)
+@app.get("/my-patients", include_in_schema=False)
 @app.get("/integrations", include_in_schema=False)
 @app.get("/system", include_in_schema=False)
 def app_page() -> FileResponse:
