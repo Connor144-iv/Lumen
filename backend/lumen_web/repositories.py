@@ -261,6 +261,7 @@ DEMO_CLEAN_REFERRAL_ID = "demo-clean-referral-001"
 DEMO_CLEAN_PATIENT_ID = "demo-clean-patient-001"
 DEMO_CLEAN_THERAPIST_ID = "demo-clean-therapist-001"
 DEMO_CLEAN_INTAKE_TEMPLATE_ID = "demo-clean-intake-template"
+DEMO_CLARA_PATIENT_APPOINTMENT_ID = "demo-clara-patient-appt-001"
 SESSION_LENGTH_MINUTES = 60
 SESSION_BUFFER_MINUTES = 10
 THERAPIST_WEEKLY_PATIENT_CONTACT_CAP_HOURS = 20
@@ -2105,6 +2106,8 @@ def reset_clean_demo_referral(session: Session, tenant_id: str = DEMO_TENANT_ID)
     patient.display_name = "Clean Demo Patient"
     patient.contact_email = DEMO_OUTBOUND_PATIENT_EMAIL
     patient.language = "Portuguese"
+    session.flush()
+    _ensure_clara_demo_patient_appointment(session, tenant_id=tenant_id)
 
     referral = Referral(
         id=DEMO_CLEAN_REFERRAL_ID,
@@ -2152,6 +2155,30 @@ def reset_clean_demo_referral(session: Session, tenant_id: str = DEMO_TENANT_ID)
         "therapist": therapist_to_dict(therapist),
         "intake_template": intake_template_to_dict(session.get(IntakeTemplate, DEMO_CLEAN_INTAKE_TEMPLATE_ID)),
     }
+
+
+def _ensure_clara_demo_patient_appointment(session: Session, tenant_id: str) -> Appointment:
+    appointment = session.get(Appointment, DEMO_CLARA_PATIENT_APPOINTMENT_ID)
+    starts_at = utc_now() - timedelta(days=7)
+    ends_at = starts_at + timedelta(minutes=SESSION_LENGTH_MINUTES)
+    if appointment is None:
+        appointment = Appointment(id=DEMO_CLARA_PATIENT_APPOINTMENT_ID, tenant_id=tenant_id)
+        session.add(appointment)
+    appointment.tenant_id = tenant_id
+    appointment.patient_id = DEMO_CLEAN_PATIENT_ID
+    appointment.therapist_id = DEMO_CLEAN_THERAPIST_ID
+    appointment.referral_id = None
+    appointment.starts_at = starts_at
+    appointment.ends_at = ends_at
+    appointment.status = "confirmed"
+    appointment.source = "demo_clara_patient_assignment"
+    appointment.google_calendar_id = None
+    appointment.google_calendar_event_id = None
+    appointment.google_calendar_event_link = None
+    appointment.google_calendar_synced_at = None
+    appointment.last_provider_error = None
+    session.flush()
+    return appointment
 
 
 def _delete_clean_demo_referral_rows(session: Session) -> None:

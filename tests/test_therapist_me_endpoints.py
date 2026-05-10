@@ -9,8 +9,8 @@ from starlette.requests import Request
 
 from app import my_therapist, my_therapist_patients
 from backend.lumen_web.db import Base, SessionLocal, engine
-from backend.lumen_web.models import Appointment, HumanReviewTask, Patient
-from backend.lumen_web.repositories import DEMO_CLEAN_THERAPIST_ID, reset_clean_demo_referral
+from backend.lumen_web.models import Appointment, Patient
+from backend.lumen_web.repositories import DEMO_CLEAN_PATIENT_ID, DEMO_CLEAN_THERAPIST_ID, reset_clean_demo_referral
 from backend.lumen_web.seed import DEMO_CLARA_EMAIL, DEMO_CLARA_THERAPIST_USER_ID, DEMO_TENANT_ID, DEMO_USER_ID
 
 
@@ -27,7 +27,6 @@ def _prepare_clara_without_appointments() -> None:
             session.scalars(select(Appointment.id).where(Appointment.therapist_id == DEMO_CLEAN_THERAPIST_ID))
         )
         if appointment_ids:
-            session.execute(delete(HumanReviewTask).where(HumanReviewTask.appointment_id.in_(appointment_ids)))
             session.execute(delete(Appointment).where(Appointment.id.in_(appointment_ids)))
         session.commit()
     finally:
@@ -61,6 +60,22 @@ def test_clara_patient_list_is_empty_without_appointments() -> None:
     response = my_therapist_patients(_request_for_user(DEMO_CLARA_THERAPIST_USER_ID))
 
     assert response["patients"] == []
+
+
+def test_clara_patient_list_includes_clean_demo_patient_after_reset() -> None:
+    _prepare_clara_without_appointments()
+    session = SessionLocal()
+    try:
+        reset_clean_demo_referral(session)
+        session.commit()
+    finally:
+        session.close()
+
+    response = my_therapist_patients(_request_for_user(DEMO_CLARA_THERAPIST_USER_ID))
+
+    patients = response["patients"]
+    assert [patient["id"] for patient in patients] == [DEMO_CLEAN_PATIENT_ID]
+    assert patients[0]["display_name"] == "Clean Demo Patient"
 
 
 def test_clara_patient_list_includes_patient_from_appointment() -> None:
