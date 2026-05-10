@@ -18,6 +18,15 @@ from pydantic import BaseModel, Field
 
 from backend.lumen_web.db import session_scope
 from backend.lumen_web import google_workspace
+from backend.lumen_web.documentation import (
+    add_documentation_session_text_for_therapist,
+    create_documentation_session_for_therapist,
+    documentation_session_detail_for_therapist,
+    list_documentation_patients_for_therapist,
+    list_documentation_sessions_for_therapist,
+    save_reviewed_documentation_note_for_therapist,
+    update_documentation_session_text_for_therapist,
+)
 from backend.lumen_web.model_health import check_configured_models
 from backend.lumen_web.repositories import (
     apply_review_action,
@@ -281,6 +290,24 @@ class EmailReferralRequest(BaseModel):
     sender: str = ""
     subject: str = ""
     body: str
+
+
+class DocumentationSessionCreateRequest(BaseModel):
+    patient_id: str
+    title: str = "Documentation session"
+    appointment_id: str | None = None
+    referral_id: str | None = None
+
+
+class DocumentationTextRequest(BaseModel):
+    text: str
+    input_type: str = "manual_text"
+    source_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DocumentationReviewedNoteRequest(BaseModel):
+    note_json: dict[str, Any]
+    source_text_id: str | None = None
 
 
 @app.get("/", include_in_schema=False)
@@ -712,6 +739,147 @@ def my_therapist_patients(request: Request) -> dict[str, Any]:
     with session_scope() as session:
         therapist = _current_active_therapist(session, request)
         return {"patients": list_patients_for_therapist(session, therapist["id"])}
+
+
+@app.get("/api/documentation/patients")
+def documentation_patients(request: Request) -> dict[str, Any]:
+    with session_scope() as session:
+        therapist = _current_active_therapist(session, request)
+        return {"patients": list_documentation_patients_for_therapist(session, therapist["id"])}
+
+
+@app.get("/api/documentation/sessions")
+def documentation_sessions(request: Request, patient_id: str | None = None) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            therapist = _current_active_therapist(session, request)
+            return {
+                "sessions": list_documentation_sessions_for_therapist(
+                    session,
+                    therapist_id=therapist["id"],
+                    patient_id=patient_id,
+                )
+            }
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/documentation/sessions", status_code=201)
+def documentation_session_create(body: DocumentationSessionCreateRequest, request: Request) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            therapist = _current_active_therapist(session, request)
+            return {
+                "session": create_documentation_session_for_therapist(
+                    session,
+                    therapist_id=therapist["id"],
+                    patient_id=body.patient_id,
+                    title=body.title,
+                    appointment_id=body.appointment_id,
+                    referral_id=body.referral_id,
+                )
+            }
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/documentation/sessions/{session_id}")
+def documentation_session_get(session_id: str, request: Request) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            therapist = _current_active_therapist(session, request)
+            return documentation_session_detail_for_therapist(
+                session,
+                therapist_id=therapist["id"],
+                documentation_session_id=session_id,
+            )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/documentation/sessions/{session_id}/texts", status_code=201)
+def documentation_session_text_create(
+    session_id: str,
+    body: DocumentationTextRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            therapist = _current_active_therapist(session, request)
+            return {
+                "text": add_documentation_session_text_for_therapist(
+                    session,
+                    therapist_id=therapist["id"],
+                    documentation_session_id=session_id,
+                    text=body.text,
+                    input_type=body.input_type,
+                    source_metadata=body.source_metadata,
+                )
+            }
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.put("/api/documentation/sessions/{session_id}/texts/{text_id}")
+def documentation_session_text_update(
+    session_id: str,
+    text_id: str,
+    body: DocumentationTextRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            therapist = _current_active_therapist(session, request)
+            return {
+                "text": update_documentation_session_text_for_therapist(
+                    session,
+                    therapist_id=therapist["id"],
+                    documentation_session_id=session_id,
+                    text_id=text_id,
+                    text=body.text,
+                    input_type=body.input_type,
+                    source_metadata=body.source_metadata,
+                )
+            }
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/documentation/sessions/{session_id}/notes/reviewed", status_code=201)
+def documentation_session_reviewed_note_create(
+    session_id: str,
+    body: DocumentationReviewedNoteRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            therapist = _current_active_therapist(session, request)
+            return {
+                "note": save_reviewed_documentation_note_for_therapist(
+                    session,
+                    therapist_id=therapist["id"],
+                    documentation_session_id=session_id,
+                    note_json=body.note_json,
+                    source_text_id=body.source_text_id,
+                    reviewer_id=current_user_id(request, fallback=DEMO_THERAPIST_USER_ID),
+                )
+            }
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/therapists/calendar-capacity")
