@@ -68,6 +68,13 @@ const gmailInboxRefreshButton = document.querySelector("#gmail-inbox-refresh");
 const securityPostureList = document.querySelector("#security-posture-list");
 const feedbackMetricsList = document.querySelector("#feedback-metrics-list");
 const therapistContextLabel = document.querySelector("#therapist-context-label");
+const documentationSessionForm = document.querySelector("#documentation-session-form");
+const documentationPatientSelect = document.querySelector("#documentation-patient-select");
+const documentationSessionTitle = document.querySelector("#documentation-session-title");
+const documentationMessage = document.querySelector("#documentation-message");
+const documentationSessionList = document.querySelector("#documentation-session-list");
+const documentationDetail = document.querySelector("#documentation-detail");
+const documentationSessionStatus = document.querySelector("#documentation-session-status");
 const myPatientsList = document.querySelector("#my-patients-list");
 const myPatientsCount = document.querySelector("#my-patients-count");
 const pageTitle = document.querySelector("#page-title");
@@ -110,6 +117,12 @@ let latestAppointments = [];
 let latestSecurityContext = null;
 let currentTherapist = null;
 let currentTherapistPatients = [];
+let latestDocumentationPatients = [];
+let latestDocumentationSessions = [];
+let latestDocumentationDetail = null;
+let latestDocumentationSessionsByPatient = new Map();
+let selectedDocumentationPatientId = null;
+let selectedDocumentationSessionId = null;
 let securityContextLoaded = false;
 let selectedReferralId = null;
 let selectedTherapistId = null;
@@ -307,6 +320,24 @@ if (gmailInboxRefreshButton) {
   });
 }
 
+documentationPatientSelect?.addEventListener("change", async () => {
+  selectedDocumentationPatientId = documentationPatientSelect.value || null;
+  selectedDocumentationSessionId = null;
+  latestDocumentationDetail = null;
+  setDocumentationMessage("Loading sessions...");
+  try {
+    await loadDocumentationSessions();
+    setDocumentationMessage("");
+  } catch (error) {
+    setDocumentationMessage(friendlyClientError(error), true);
+  }
+});
+
+documentationSessionForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await createDocumentationSession();
+});
+
 function navigate(path) {
   const route = routes[path] || routes["/"];
   const nextPath = path === "/overview" ? "/" : path;
@@ -333,6 +364,9 @@ function applyRoute(path) {
   pageTitle.textContent = route.title;
   sectionLabel.textContent = route.label;
   document.title = `Lumen | ${route.title}`;
+  if (route.page === "documentation" && hasTherapistWorkspaceAccess()) {
+    loadDocumentationWorkspace();
+  }
   if (route.page === "my-patients" && hasTherapistWorkspaceAccess()) {
     loadMyTherapistPatients();
   }
@@ -665,15 +699,314 @@ async function loadMyTherapistPatients() {
   if (!myPatientsList || !hasTherapistWorkspaceAccess()) return;
   myPatientsList.replaceChildren(emptyState("Loading patients..."));
   try {
-    const response = await fetch("/api/me/therapist/patients");
-    const data = await readResponseBody(response);
-    if (!response.ok) throw new Error(data.detail || "Patients are unavailable.");
-    currentTherapistPatients = data.patients || [];
+    await loadDocumentationPatients();
+    currentTherapistPatients = latestDocumentationPatients;
+    await loadDocumentationSessionsForPatients(currentTherapistPatients);
     renderMyTherapistPatients();
   } catch (error) {
     currentTherapistPatients = [];
+    latestDocumentationSessionsByPatient = new Map();
     renderMyTherapistPatients(friendlyClientError(error));
   }
+}
+
+async function loadDocumentationWorkspace() {
+  if (!hasTherapistWorkspaceAccess()) return;
+  setDocumentationMessage("Loading documentation workspace...");
+  try {
+    await loadDocumentationPatients();
+    await loadDocumentationSessions();
+    setDocumentationMessage("");
+  } catch (error) {
+    latestDocumentationPatients = [];
+    latestDocumentationSessions = [];
+    latestDocumentationDetail = null;
+    renderDocumentationPatientSelect();
+    renderDocumentationSessions();
+    renderDocumentationDetail();
+    setDocumentationMessage(friendlyClientError(error), true);
+  }
+}
+
+async function loadDocumentationPatients() {
+  const response = await fetch("/api/documentation/patients");
+  const data = await readResponseBody(response);
+  if (!response.ok) throw new Error(data.detail || "Documentation patients are unavailable.");
+  latestDocumentationPatients = data.patients || [];
+  if (
+    selectedDocumentationPatientId &&
+    !latestDocumentationPatients.some((patient) => patient.id === selectedDocumentationPatientId)
+  ) {
+    selectedDocumentationPatientId = null;
+  }
+  if (!selectedDocumentationPatientId && latestDocumentationPatients.length) {
+    selectedDocumentationPatientId = latestDocumentationPatients[0].id;
+  }
+  renderDocumentationPatientSelect();
+  return latestDocumentationPatients;
+}
+
+async function loadDocumentationSessions() {
+  if (!documentationSessionList) return;
+  if (!selectedDocumentationPatientId) {
+    latestDocumentationSessions = [];
+    selectedDocumentationSessionId = null;
+    latestDocumentationDetail = null;
+    renderDocumentationSessions();
+    renderDocumentationDetail();
+    return;
+  }
+  documentationSessionList.replaceChildren(emptyState("Loading sessions..."));
+  const response = await fetch(`/api/documentation/sessions?patient_id=${encodeURIComponent(selectedDocumentationPatientId)}`);
+  const data = await readResponseBody(response);
+  if (!response.ok) throw new Error(data.detail || "Documentation sessions are unavailable.");
+  latestDocumentationSessions = data.sessions || [];
+  if (
+    selectedDocumentationSessionId &&
+    !latestDocumentationSessions.some((session) => session.id === selectedDocumentationSessionId)
+  ) {
+    selectedDocumentationSessionId = null;
+    latestDocumentationDetail = null;
+  }
+  renderDocumentationSessions();
+  if (selectedDocumentationSessionId) {
+    await loadDocumentationDetail(selectedDocumentationSessionId);
+  } else {
+    renderDocumentationDetail();
+  }
+}
+
+async function loadDocumentationSessionsForPatients(patients) {
+  const pairs = await Promise.all(
+    (patients || []).map(async (patient) => {
+      const response = await fetch(`/api/documentation/sessions?patient_id=${encodeURIComponent(patient.id)}`);
+      const data = await readResponseBody(response);
+      if (!response.ok) throw new Error(data.detail || "Documentation sessions are unavailable.");
+      return [patient.id, data.sessions || []];
+    }),
+  );
+  latestDocumentationSessionsByPatient = new Map(pairs);
+}
+
+async function createDocumentationSession() {
+  if (!selectedDocumentationPatientId) {
+    setDocumentationMessage("Select a patient before creating a session.", true);
+    return;
+  }
+  const payload = {
+    patient_id: selectedDocumentationPatientId,
+    title: documentationSessionTitle?.value?.trim() || "Documentation session",
+  };
+  setDocumentationMessage("Creating session...");
+  try {
+    const response = await fetch("/api/documentation/sessions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await readResponseBody(response);
+    if (!response.ok) throw new Error(data.detail || "Documentation session could not be created.");
+    selectedDocumentationSessionId = data.session.id;
+    if (documentationSessionTitle) documentationSessionTitle.value = "";
+    await loadDocumentationSessions();
+    await loadDocumentationDetail(selectedDocumentationSessionId);
+    setDocumentationMessage("Session created.");
+  } catch (error) {
+    setDocumentationMessage(friendlyClientError(error), true);
+  }
+}
+
+async function loadDocumentationDetail(sessionId) {
+  if (!sessionId) {
+    latestDocumentationDetail = null;
+    renderDocumentationDetail();
+    return;
+  }
+  if (documentationDetail) documentationDetail.replaceChildren(emptyState("Loading session detail..."));
+  const response = await fetch(`/api/documentation/sessions/${encodeURIComponent(sessionId)}`);
+  const data = await readResponseBody(response);
+  if (!response.ok) throw new Error(data.detail || "Documentation session detail is unavailable.");
+  latestDocumentationDetail = data;
+  selectedDocumentationSessionId = data.session?.id || sessionId;
+  renderDocumentationSessions();
+  renderDocumentationDetail();
+}
+
+async function selectDocumentationSession(sessionId) {
+  selectedDocumentationSessionId = sessionId;
+  setDocumentationMessage("");
+  try {
+    await loadDocumentationDetail(sessionId);
+  } catch (error) {
+    setDocumentationMessage(friendlyClientError(error), true);
+  }
+}
+
+async function saveDocumentationText(textRecord, textValue) {
+  if (!selectedDocumentationSessionId) return;
+  const payload = {
+    text: textValue,
+    input_type: "manual_text",
+    source_metadata: { source: "therapist_manual_entry" },
+  };
+  const url = textRecord
+    ? `/api/documentation/sessions/${encodeURIComponent(selectedDocumentationSessionId)}/texts/${encodeURIComponent(textRecord.id)}`
+    : `/api/documentation/sessions/${encodeURIComponent(selectedDocumentationSessionId)}/texts`;
+  const response = await fetch(url, {
+    method: textRecord ? "PUT" : "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await readResponseBody(response);
+  if (!response.ok) throw new Error(data.detail || "Session text could not be saved.");
+  await loadDocumentationDetail(selectedDocumentationSessionId);
+}
+
+async function saveDocumentationReviewedNote(noteValue, sourceTextId) {
+  if (!selectedDocumentationSessionId) return;
+  const cleanValue = noteValue.trim();
+  if (!cleanValue) throw new Error("Reviewed note is required.");
+  const payload = {
+    source_text_id: sourceTextId || null,
+    note_json: { summary: cleanValue },
+  };
+  const response = await fetch(
+    `/api/documentation/sessions/${encodeURIComponent(selectedDocumentationSessionId)}/notes/reviewed`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+  const data = await readResponseBody(response);
+  if (!response.ok) throw new Error(data.detail || "Reviewed note could not be saved.");
+  await loadDocumentationDetail(selectedDocumentationSessionId);
+}
+
+function renderDocumentationPatientSelect() {
+  if (!documentationPatientSelect) return;
+  documentationPatientSelect.replaceChildren();
+  if (!latestDocumentationPatients.length) {
+    documentationPatientSelect.appendChild(new Option("No assigned patients", ""));
+    documentationPatientSelect.disabled = true;
+    return;
+  }
+  documentationPatientSelect.disabled = false;
+  latestDocumentationPatients.forEach((patient) => {
+    documentationPatientSelect.appendChild(new Option(patient.display_name || patient.id, patient.id));
+  });
+  documentationPatientSelect.value = selectedDocumentationPatientId || latestDocumentationPatients[0].id;
+}
+
+function renderDocumentationSessions() {
+  if (!documentationSessionList) return;
+  if (!selectedDocumentationPatientId) {
+    documentationSessionList.replaceChildren(emptyState("No documentation patients are available."));
+    return;
+  }
+  if (!latestDocumentationSessions.length) {
+    documentationSessionList.replaceChildren(emptyState("No documentation sessions yet."));
+    return;
+  }
+  documentationSessionList.replaceChildren(
+    ...latestDocumentationSessions.map((session) => documentationSessionCard(session)),
+  );
+}
+
+function documentationSessionCard(session) {
+  const item = recordItem({
+    title: session.title || "Documentation session",
+    status: session.status || "active",
+    body: session.patient_label_snapshot || "Therapist documentation session.",
+    meta: [formatDate(session.created_at), session.updated_at ? `updated ${formatDate(session.updated_at)}` : null],
+  });
+  if (session.id === selectedDocumentationSessionId) item.classList.add("is-selected");
+  const actions = document.createElement("div");
+  actions.className = "actions tight";
+  actions.appendChild(actionButton(session.id === selectedDocumentationSessionId ? "Selected" : "Open", () => selectDocumentationSession(session.id)));
+  item.appendChild(actions);
+  return item;
+}
+
+function renderDocumentationDetail() {
+  if (!documentationDetail) return;
+  const session = latestDocumentationDetail?.session;
+  if (documentationSessionStatus) {
+    documentationSessionStatus.textContent = session ? session.status || "active" : "No session selected";
+  }
+  if (!session) {
+    documentationDetail.replaceChildren(emptyState("Select or create a documentation session."));
+    return;
+  }
+
+  const latestText = (latestDocumentationDetail.texts || [])[0] || null;
+  const latestNote = (latestDocumentationDetail.notes || [])[0] || null;
+  const header = recordItem({
+    title: session.title || "Documentation session",
+    status: session.status || "active",
+    body: session.patient_label_snapshot || "Selected documentation session.",
+    meta: [session.therapist_label_snapshot, formatDate(session.created_at)],
+  });
+
+  const transcriptForm = document.createElement("form");
+  transcriptForm.className = "record-item";
+  transcriptForm.dataset.status = latestText ? "active" : "pending";
+  transcriptForm.append(heading("Transcript text"), pill(latestText ? "saved" : "new"));
+  const transcriptInput = document.createElement("textarea");
+  transcriptInput.name = "text";
+  transcriptInput.placeholder = "Enter transcript or session text.";
+  transcriptInput.value = latestText?.text || "";
+  const transcriptActions = document.createElement("div");
+  transcriptActions.className = "actions tight";
+  const transcriptSubmit = document.createElement("button");
+  transcriptSubmit.type = "submit";
+  transcriptSubmit.textContent = latestText ? "Update transcript" : "Save transcript";
+  transcriptActions.appendChild(transcriptSubmit);
+  transcriptForm.append(transcriptInput, transcriptActions);
+  transcriptForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    setDocumentationMessage("Saving transcript...");
+    try {
+      await saveDocumentationText(latestText, transcriptInput.value);
+      setDocumentationMessage("Transcript saved.");
+    } catch (error) {
+      setDocumentationMessage(friendlyClientError(error), true);
+    }
+  });
+
+  const noteForm = document.createElement("form");
+  noteForm.className = "record-item";
+  noteForm.dataset.status = latestNote ? "reviewed" : "pending";
+  noteForm.append(heading("Reviewed note"), pill(latestNote ? latestNote.status : "new"));
+  const noteInput = document.createElement("textarea");
+  noteInput.name = "note";
+  noteInput.placeholder = "Write a reviewed note summary.";
+  noteInput.value = latestNote?.reviewed_json?.summary || latestNote?.note_json?.summary || "";
+  const noteActions = document.createElement("div");
+  noteActions.className = "actions tight";
+  const noteSubmit = document.createElement("button");
+  noteSubmit.type = "submit";
+  noteSubmit.textContent = "Save reviewed note";
+  noteActions.appendChild(noteSubmit);
+  noteForm.append(noteInput, noteActions);
+  noteForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    setDocumentationMessage("Saving reviewed note...");
+    try {
+      await saveDocumentationReviewedNote(noteInput.value, latestText?.id);
+      setDocumentationMessage("Reviewed note saved.");
+    } catch (error) {
+      setDocumentationMessage(friendlyClientError(error), true);
+    }
+  });
+
+  documentationDetail.replaceChildren(header, transcriptForm, noteForm);
+}
+
+function setDocumentationMessage(message, isError = false) {
+  if (!documentationMessage) return;
+  documentationMessage.textContent = message || "";
+  documentationMessage.dataset.status = isError ? "failed" : "idle";
 }
 
 function renderRoleAwareNavigation() {
@@ -713,12 +1046,33 @@ function renderMyTherapistPatients(errorMessage) {
 }
 
 function myPatientCard(patient) {
-  return recordItem({
+  const sessions = latestDocumentationSessionsByPatient.get(patient.id) || [];
+  const item = recordItem({
     title: patient.display_name || patient.name || `Patient ${shortId(patient.id)}`,
     status: patient.status || "active",
     body: patient.contact_email || "No contact email recorded.",
-    meta: [patient.language, patient.next_appointment_at ? `next ${formatDate(patient.next_appointment_at)}` : null],
+    meta: [
+      patient.language,
+      `${sessions.length} documentation session${sessions.length === 1 ? "" : "s"}`,
+      patient.next_appointment_at ? `next ${formatDate(patient.next_appointment_at)}` : null,
+    ],
   });
+  const actions = document.createElement("div");
+  actions.className = "actions tight";
+  actions.appendChild(
+    actionButton("Open documentation", () => {
+      selectedDocumentationPatientId = patient.id;
+      selectedDocumentationSessionId = null;
+      navigate("/documentation");
+    }),
+  );
+  item.appendChild(actions);
+  const sessionSummary = document.createElement("p");
+  sessionSummary.textContent = sessions.length
+    ? `Latest: ${sessions[0].title || "Documentation session"}`
+    : "No documentation sessions yet.";
+  item.appendChild(sessionSummary);
+  return item;
 }
 
 async function loadWorkflows() {

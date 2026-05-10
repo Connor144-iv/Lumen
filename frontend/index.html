@@ -755,13 +755,30 @@
                   </div>
                   <span class="panel-stat" id="therapist-context-label">Therapist context</span>
                 </div>
-                <div id="documentation-placeholder" class="record-list">
-                  <article class="record-item" data-status="configured">
-                    <h4>Documentation workspace</h4>
-                    <span class="pill">placeholder</span>
-                    <p>Therapist documentation will live here after the documentation MVP is ported.</p>
-                  </article>
+                <form id="documentation-session-form" class="filter-form">
+                  <label>
+                    Patient
+                    <select id="documentation-patient-select" name="patient_id"></select>
+                  </label>
+                  <label>
+                    Session title
+                    <input id="documentation-session-title" name="title" type="text" placeholder="Documentation session" />
+                  </label>
+                  <button type="submit">New session</button>
+                  <p id="documentation-message" class="empty-state"></p>
+                </form>
+                <div id="documentation-session-list" class="record-list"></div>
+              </section>
+
+              <section class="panel" aria-labelledby="documentation-detail-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Selected session</p>
+                    <h2 id="documentation-detail-title">Transcript and reviewed note</h2>
+                  </div>
+                  <span class="panel-stat" id="documentation-session-status">No session selected</span>
                 </div>
+                <div id="documentation-detail" class="record-list"></div>
               </section>
             </div>
           </section>
