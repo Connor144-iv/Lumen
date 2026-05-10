@@ -24,11 +24,12 @@ from backend.lumen_web.repositories import (
     approval_payload_for_task,
     complete_consent_record,
     complete_intake_item,
+    continue_email_referral_workflow,
     approve_session_note,
     create_clinical_library_record,
-    create_email_referral,
     create_clinical_escalation_review,
     create_duplicate_resolution_review,
+    create_intake_template_file,
     create_manual_appointment_proposal,
     create_referral_document,
     create_session_note,
@@ -40,6 +41,7 @@ from backend.lumen_web.repositories import (
     draft_feedback_metrics,
     export_report_draft,
     deterministic_match_for_referral,
+    document_download_info,
     generate_missing_intake_reminder,
     generate_prep_brief,
     generate_report_draft,
@@ -50,6 +52,8 @@ from backend.lumen_web.repositories import (
     ingest_gmail_message,
     intake_workspace,
     list_intake_tracker,
+    list_inbound_gmail_messages,
+    gmail_referral_workflow_input,
     list_referral_import_batches,
     list_referral_import_errors,
     list_appointments,
@@ -64,12 +68,14 @@ from backend.lumen_web.repositories import (
     propose_appointment_slots,
     referral_journey_dashboard,
     referral_detail,
+    referral_retry_workflow_input,
     referral_workbench_state,
     record_draft_feedback,
     record_missing_info_reply,
     record_simulated_patient_reply,
     reset_clean_demo_referral,
     review_task_to_dict,
+    mark_inbound_gmail_referral_workflow_started,
     request_consent_exception,
     request_intake_item_exception,
     save_questionnaire_response,
@@ -115,6 +121,10 @@ class ReviewActionRequest(BaseModel):
     final_text: str | None = None
     rejection_reason: str | None = None
     reviewer_id: str | None = None
+    document_id: str | None = None
+    intake_item_id: str | None = None
+    consent_id: str | None = None
+    questionnaire_name: str | None = None
 
 
 class TherapistPayload(BaseModel):
@@ -133,6 +143,7 @@ class TherapistPayload(BaseModel):
 class AppointmentProposalRequest(BaseModel):
     therapist_id: str | None = None
     limit: int = 3
+    availability_text: str | None = None
 
 
 class ManualAppointmentProposalRequest(BaseModel):
@@ -208,6 +219,13 @@ class GmailSyncRequest(BaseModel):
     tenant_id: str | None = DEMO_TENANT_ID
     sender: str | None = None
     max_results: int = 10
+    include_recent_read: bool = True
+    recent_query: str | None = None
+
+
+class GmailInboxConvertRequest(BaseModel):
+    document_id: str
+    tenant_id: str | None = DEMO_TENANT_ID
 
 
 class SessionNoteRequest(BaseModel):
@@ -368,6 +386,47 @@ def referral_workbench(referral_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@app.post("/api/referrals/{referral_id}/retry-extraction", status_code=202)
+def referral_retry_extraction(referral_id: str) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            retry = referral_retry_workflow_input(session, referral_id)
+        job = jobs.submit(
+            WorkflowRequest(
+                workflow_type="new_referral",
+                tenant_id=retry["tenant_id"],
+                patient_id=retry.get("patient_id"),
+                raw_input=retry["raw_input"],
+                referral_id=retry["referral_id"],
+            )
+        )
+        return {
+            "status": "workflow_started",
+            "conversion_status": "workflow_started",
+            "job_id": job["job_id"],
+            "referral_id": job.get("referral_id"),
+            "status_url": f"/api/status/{job['job_id']}",
+            "events_url": f"/api/events/{job['job_id']}",
+        }
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/referrals/{referral_id}/continue-email-workflow")
+def referral_continue_email_workflow(referral_id: str) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            result = continue_email_referral_workflow(session, referral_id)
+            result["workbench_state"] = referral_workbench_state(session, referral_id)
+            return result
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/referrals/{referral_id}/match")
 def referral_match(referral_id: str) -> dict[str, Any]:
     try:
@@ -386,6 +445,7 @@ def appointment_proposals(referral_id: str, body: AppointmentProposalRequest) ->
                 referral_id=referral_id,
                 therapist_id=body.therapist_id,
                 limit=max(1, min(body.limit, 10)),
+                availability_text=body.availability_text,
             )
             return {"appointments": proposals}
     except (KeyError, ValueError) as exc:
@@ -564,6 +624,10 @@ def review_task_action(task_id: str, body: ReviewActionRequest) -> dict[str, Any
                 final_text=body.final_text,
                 rejection_reason=body.rejection_reason,
                 reviewer_id=body.reviewer_id,
+                document_id=body.document_id,
+                intake_item_id=body.intake_item_id,
+                consent_id=body.consent_id,
+                questionnaire_name=body.questionnaire_name,
             )
             task_payload = review_task_to_dict(task)
             resume_payload = (
@@ -662,6 +726,34 @@ def intake_templates(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
         return {"templates": list_intake_templates(session, tenant_id=tenant_id)}
 
 
+@app.post("/api/intake/templates/{template_id}/items/{item_key}/file", status_code=201)
+async def intake_template_file_upload(template_id: str, item_key: str, request: Request) -> dict[str, Any]:
+    try:
+        form = await request.form()
+        upload = form.get("file")
+        if upload is None or not hasattr(upload, "read"):
+            raise ValueError("A file field is required.")
+        content = await upload.read()
+        file_name = str(getattr(upload, "filename", "") or "intake-template-file")
+        content_type = str(getattr(upload, "content_type", "") or "application/octet-stream")
+        file_meta = store_uploaded_document(f"template-{template_id}-{item_key}", file_name, content_type, content)
+        with session_scope() as session:
+            document = create_intake_template_file(
+                session,
+                template_id=template_id,
+                item_key=item_key,
+                title=file_meta["file_name"],
+                storage_uri=file_meta["storage_uri"],
+                metadata=file_meta,
+                actor_user_id=current_user_id(request, fallback=DEMO_USER_ID),
+            )
+        return {"document": document}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/intake/tracker")
 def intake_tracker(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
     with session_scope() as session:
@@ -737,6 +829,24 @@ async def referral_document_upload(referral_id: str, request: Request) -> dict[s
         return {"document": document}
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/documents/{document_id}/download")
+def document_download(document_id: str) -> FileResponse:
+    try:
+        with session_scope() as session:
+            download = document_download_info(session, document_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FileResponse(
+        path=download["path"],
+        filename=download["file_name"],
+        media_type=download["media_type"],
+    )
 
 
 @app.post("/api/intake/items/{item_id}/complete")
@@ -1047,15 +1157,22 @@ async def referral_import_batch_create(request: Request) -> dict[str, Any]:
 @app.post("/api/integrations/email-referrals", status_code=201)
 def email_referral_create(body: EmailReferralRequest, request: Request) -> dict[str, Any]:
     try:
-        with session_scope() as session:
-            return create_email_referral(
-                session,
+        raw_input = email_referral_raw_input(sender=body.sender, subject=body.subject, body=body.body)
+        job = jobs.submit(
+            WorkflowRequest(
+                workflow_type="new_referral",
                 tenant_id=body.tenant_id or DEMO_TENANT_ID,
-                sender=body.sender,
-                subject=body.subject,
-                body=body.body,
-                actor_user_id=current_user_id(request, fallback=DEMO_USER_ID),
+                raw_input=raw_input,
             )
+        )
+        return {
+            "status": "workflow_started",
+            "conversion_status": "workflow_started",
+            "job_id": job["job_id"],
+            "referral_id": job.get("referral_id"),
+            "status_url": f"/api/status/{job['job_id']}",
+            "events_url": f"/api/events/{job['job_id']}",
+        }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1064,15 +1181,55 @@ def email_referral_create(body: EmailReferralRequest, request: Request) -> dict[
 def gmail_sync(body: GmailSyncRequest) -> dict[str, Any]:
     if not google_workspace.is_enabled():
         raise HTTPException(status_code=400, detail="Google Workspace integration is not enabled.")
+    try:
+        account_mismatch = google_workspace.gmail_account_mismatch_message()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=google_workspace.provider_error_message(exc)) from exc
+    if account_mismatch:
+        raise HTTPException(status_code=400, detail=account_mismatch)
 
     max_results = max(1, min(body.max_results, 50))
-    messages = google_workspace.list_unread_gmail_messages(
+    unread_messages = google_workspace.list_unread_gmail_messages(
         sender_email=body.sender,
         max_results=max_results,
+        unread_only=True,
     )
+    messages_by_id: dict[str, dict[str, Any]] = {}
+    for item in unread_messages:
+        message_id = str(item.get("id") or "").strip()
+        if message_id:
+            messages_by_id[message_id] = item
+    recent_messages: list[dict[str, Any]] = []
+    if body.include_recent_read:
+        try:
+            recent_query = body.recent_query or "newer_than:14d"
+            if not body.sender and "from:" not in recent_query.lower():
+                recent_query = f"{recent_query} from:lumenpatientdemo@gmail.com"
+            recent_messages = google_workspace.list_unread_gmail_messages(
+                sender_email=body.sender,
+                query=recent_query,
+                max_results=max_results,
+                unread_only=False,
+            )
+            for item in recent_messages:
+                message_id = str(item.get("id") or "").strip()
+                if message_id and message_id not in messages_by_id:
+                    messages_by_id[message_id] = item
+        except Exception as exc:
+            recent_messages = []
+            errors = [
+                {
+                    "stage": "recent_inbox_list",
+                    "error": google_workspace.provider_error_message(exc),
+                }
+            ]
+        else:
+            errors = []
+    else:
+        errors = []
+    messages = list(messages_by_id.values())
     processed: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
-    errors: list[dict[str, Any]] = []
 
     for item in messages:
         message_id = str(item.get("id") or "").strip()
@@ -1082,6 +1239,7 @@ def gmail_sync(body: GmailSyncRequest) -> dict[str, Any]:
         try:
             raw_message = google_workspace.get_gmail_message(message_id=message_id, format="full")
             parsed = google_workspace.parse_gmail_message(raw_message)
+            parsed["attachments"] = _download_gmail_attachments_for_intake(parsed)
         except Exception as exc:
             errors.append(
                 {
@@ -1123,7 +1281,91 @@ def gmail_sync(body: GmailSyncRequest) -> dict[str, Any]:
         "skipped": skipped,
         "errors": errors,
         "total_seen": len(messages),
+        "unread_seen": len(unread_messages),
+        "recent_seen": len(recent_messages),
+        "recent_query": recent_query if body.include_recent_read else None,
     }
+
+
+def _download_gmail_attachments_for_intake(message: dict[str, Any]) -> list[dict[str, Any]]:
+    message_id = str(message.get("message_id") or "").strip()
+    stored: list[dict[str, Any]] = []
+    for attachment in message.get("attachments") or []:
+        item = dict(attachment)
+        attachment_id = str(item.get("attachment_id") or "").strip()
+        if not attachment_id:
+            stored.append({**item, "download_status": "failed", "error": "Attachment ID was missing from Gmail metadata."})
+            continue
+        try:
+            content = google_workspace.download_gmail_attachment(message_id=message_id, attachment_id=attachment_id)
+            file_name = str(item.get("file_name") or "attachment")
+            content_type = str(item.get("mime_type") or "application/octet-stream")
+            storage_meta = store_uploaded_document(f"gmail-{message_id}", file_name, content_type, content)
+            stored.append({**item, **storage_meta, "download_status": "stored"})
+        except Exception as exc:
+            stored.append(
+                {
+                    **item,
+                    "download_status": "failed",
+                    "error": google_workspace.provider_error_message(exc),
+                }
+            )
+    return stored
+
+
+@app.get("/api/integrations/gmail-inbox")
+def gmail_inbox(tenant_id: str | None = DEMO_TENANT_ID, limit: int = 50) -> dict[str, Any]:
+    with session_scope() as session:
+        return {"messages": list_inbound_gmail_messages(session, tenant_id=tenant_id, limit=limit)}
+
+
+@app.post("/api/integrations/gmail-inbox/convert", status_code=201)
+def gmail_inbox_convert(body: GmailInboxConvertRequest, request: Request) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            prepared = gmail_referral_workflow_input(
+                session,
+                document_id=body.document_id,
+                tenant_id=body.tenant_id or DEMO_TENANT_ID,
+            )
+        if prepared["status"] == "already_converted":
+            return {
+                "status": "already_converted",
+                "conversion_status": "already_converted",
+                "job_id": prepared.get("job_id"),
+                "referral_id": prepared.get("referral_id"),
+                "events_url": f"/api/events/{prepared['job_id']}" if prepared.get("job_id") else None,
+                "referral": prepared.get("referral"),
+                "document": prepared.get("document"),
+            }
+
+        job = jobs.submit(
+            WorkflowRequest(
+                workflow_type="new_referral",
+                tenant_id=body.tenant_id or DEMO_TENANT_ID,
+                raw_input=prepared["raw_input"],
+            )
+        )
+        with session_scope() as session:
+            document = mark_inbound_gmail_referral_workflow_started(
+                session,
+                document_id=body.document_id,
+                tenant_id=body.tenant_id or DEMO_TENANT_ID,
+                referral_id=job.get("referral_id"),
+                job_id=job["job_id"],
+                actor_user_id=current_user_id(request, fallback=DEMO_USER_ID),
+            )
+        return {
+            "status": "workflow_started",
+            "conversion_status": "workflow_started",
+            "job_id": job["job_id"],
+            "referral_id": job.get("referral_id"),
+            "status_url": f"/api/status/{job['job_id']}",
+            "events_url": f"/api/events/{job['job_id']}",
+            "document": document,
+        }
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/security/context")
@@ -1312,6 +1554,31 @@ def normalize_raw_input(workflow_type: str, data: dict[str, Any]) -> dict[str, A
         "source_channel": source_channel,
         "raw_text": raw_text,
         "uploaded_file_name": data.get("uploaded_file_name"),
+    }
+
+
+def email_referral_raw_input(*, sender: str, subject: str, body: str) -> dict[str, Any]:
+    clean_body = str(body or "").strip()
+    if not clean_body:
+        raise ValueError("Email body is required.")
+    sender_text = str(sender or "").strip()
+    subject_text = str(subject or "").strip()
+    raw_text = "\n".join(
+        part
+        for part in [
+            f"From: {sender_text}" if sender_text else "",
+            f"Subject: {subject_text}" if subject_text else "",
+            clean_body,
+        ]
+        if part
+    )
+    contact_match = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", sender_text)
+    return {
+        "source_channel": "email",
+        "raw_text": raw_text,
+        "sender": sender_text,
+        "subject": subject_text,
+        "contact_email": contact_match.group(0).lower() if contact_match else None,
     }
 
 

@@ -91,11 +91,11 @@ The Gmail and Google Calendar MVP is now part of the admin-gated workflow:
 
 - Approved patient-facing communication drafts send through Gmail when Google Workspace is enabled. Demo patient email is restricted to `lumenpatientdemo@gmail.com` unless `LUMEN_OUTBOUND_PATIENT_EMAIL_OVERRIDE` is set.
 - Slot proposals use Google Calendar busy time, local appointments, 60-minute sessions, a 10-minute buffer, and the 20-hour weekly therapist patient-contact cap.
-- Approved appointment confirmations create Google Calendar events and store the event ID on the local appointment record.
+- Patient confirmation replies (Option/code) auto-approve appointment confirmations, create Google Calendar events, and store the event ID on the local appointment record.
 - Approved reschedule tasks update the linked Google Calendar event before the local appointment time changes.
 - The Therapists page shows Google-backed busy periods, next available slots, weekly contact capacity, active appointments, sync issues, and drag/drop scheduling targets.
 
-Provider-backed patient reply ingestion beyond the current simulated/manual reply capture remains a later enhancement.
+Inbound Gmail replies can be synced manually from the Integrations inbox and routed to the referral workflow.
 
 ## Smoke Test
 

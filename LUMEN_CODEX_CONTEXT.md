@@ -248,11 +248,11 @@ It should not be part of everyday admin referral processing.
 
 ## Gmail / Calendar Strategy For This Phase
 
-The previous placeholder-only Google integration guidance is superseded. This phase should implement a narrow real Gmail and Google Calendar MVP slice while preserving all human approval gates.
+The previous placeholder-only Google integration guidance is superseded. This phase should implement a narrow real Gmail and Google Calendar MVP slice with admin approval for outbound sends and automatic confirmation on patient acceptance.
 
 Current Google setup:
 
-- Shared clinic/staff Google account: `connorbrown0987@gmail.com`.
+- Shared clinic/staff Google account: `clinic-admin@example.test`.
 - Fake demo patient account: `lumenpatientdemo@gmail.com`.
 - Gmail capability: `users.messages.send` with `gmail.send`.
 - Calendar capabilities: `freeBusy.query`, `events.insert`, and event update through the enabled Calendar event scope.
@@ -278,8 +278,8 @@ Calendar and scheduling rules:
 - Buffer after each session is 10 minutes.
 - Maximum patient-contact time is 20 hours per therapist per week.
 - Generic busy blocks reduce availability but only patient appointments count toward the 20-hour weekly contact cap.
-- Slot proposals should combine Google Calendar busy periods, existing local appointments, the default availability window, session duration, buffer, and weekly cap.
-- Appointment creation in Google Calendar must only occur after admin approval / appointment confirmation approval.
+- Slot proposals should combine Google Calendar busy periods, existing local appointments, patient availability hints in referral raw text, the default availability window, session duration, buffer, and weekly cap.
+- Patient confirmations auto-approve appointment confirmations and create Google Calendar events when Google Workspace is enabled.
 - Approved reschedules should update both the local appointment record and the linked Google Calendar event.
 - Store the Google Calendar event ID on the local appointment record.
 - Use a deterministic title for Lumen-created events, for example: `[Lumen] Therapist: {therapist_name} | Patient: Sarah O'Connor | Referral: {referral_id}`.
@@ -290,7 +290,7 @@ UI placement:
 
 - Workbench should show email draft, approval state, send state, Gmail message ID or failure reason.
 - Availability and calendar/capacity management should live primarily on the Therapists page.
-- Integrations should show Gmail/Calendar health and sync status, not referral-specific communication detail.
+- Integrations should show Gmail/Calendar health, inbox sync status, and the inbound Gmail review list.
 
 ## Admin Referral Status Model
 

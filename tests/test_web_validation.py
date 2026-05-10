@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from backend.lumen_web import repositories
 from app import app
 from backend.lumen_web.workflow_state import canonical_referral_status
 from backend.lumen_web.workflow_jobs import WorkflowJobManager, WorkflowRequest
@@ -50,6 +51,22 @@ def test_integration_health_exposes_manual_google_calendar_placeholder() -> None
     calendar = checks["Google Calendar availability"]
     assert calendar["status"] == "manual"
     assert "not connected yet" in calendar["message"]
+
+
+def test_integration_health_reports_provider_errors_without_500(monkeypatch) -> None:
+    monkeypatch.setattr(
+        repositories.google_workspace,
+        "google_workspace_status",
+        lambda refresh=False: (_ for _ in ()).throw(RuntimeError("provider exploded")),
+    )
+    monkeypatch.setattr(repositories.google_workspace, "is_enabled", lambda: True)
+
+    response = client.get("/api/integrations/health")
+
+    assert response.status_code == 200
+    checks = {check["name"]: check for check in response.json()["checks"]}
+    assert checks["Gmail send"]["status"] == "failed"
+    assert "provider exploded" in checks["Gmail send"]["message"]
 
 
 def test_legacy_referral_statuses_map_to_admin_workflow_terms() -> None:

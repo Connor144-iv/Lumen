@@ -45,6 +45,7 @@ class GoogleWorkspaceSettings:
     token_path: Path
     calendar_id: str
     timezone: str
+    expected_gmail_account: str | None
 
 
 def settings() -> GoogleWorkspaceSettings:
@@ -54,6 +55,7 @@ def settings() -> GoogleWorkspaceSettings:
         token_path=Path(os.getenv("LUMEN_GOOGLE_TOKEN_PATH") or SECRET_DIR / TOKEN_FILE_NAME),
         calendar_id=os.getenv("LUMEN_GOOGLE_CALENDAR_ID", "primary").strip() or "primary",
         timezone=os.getenv("LUMEN_GOOGLE_TIMEZONE", "Europe/Lisbon").strip() or "Europe/Lisbon",
+        expected_gmail_account=(os.getenv("LUMEN_GOOGLE_EXPECTED_GMAIL_ACCOUNT", "clinic-admin@example.test").strip() or None),
     )
 
 
@@ -76,6 +78,7 @@ def google_workspace_status(refresh: bool = True) -> dict[str, Any]:
     authorized = False
     dependency_available = True
     error: str | None = None
+    gmail_email_address: str | None = None
 
     try:
         _google_imports()
@@ -94,6 +97,10 @@ def google_workspace_status(refresh: bool = True) -> dict[str, Any]:
             token_valid = bool(credentials.valid)
             authorized = token_valid and _credentials_have_scopes(credentials)
             if authorized:
+                try:
+                    gmail_email_address = gmail_profile_email()
+                except GoogleWorkspaceError as exc:
+                    error = provider_error_message(exc)
                 _clear_error()
         except GoogleWorkspaceError as exc:
             error = provider_error_message(exc)
@@ -110,10 +117,46 @@ def google_workspace_status(refresh: bool = True) -> dict[str, Any]:
         "client_secret_present": cfg.client_secret_path.exists(),
         "calendar_id": cfg.calendar_id,
         "timezone": cfg.timezone,
+        "gmail_email_address": gmail_email_address,
+        "expected_gmail_account": cfg.expected_gmail_account,
+        "account_matches_expected": _account_matches_expected(gmail_email_address, cfg.expected_gmail_account),
         "configured_scopes": GOOGLE_WORKSPACE_SCOPE_LABELS,
         "scope_urls": GOOGLE_WORKSPACE_SCOPES,
         "last_provider_error": error,
     }
+
+
+def gmail_account_mismatch_message() -> str | None:
+    cfg = settings()
+    if not cfg.expected_gmail_account:
+        return None
+    actual = gmail_profile_email()
+    if _account_matches_expected(actual, cfg.expected_gmail_account):
+        return None
+    return (
+        f"Google Workspace is authorized for {actual or 'an unknown Gmail account'}, "
+        f"but Lumen is configured to sync {cfg.expected_gmail_account}. "
+        "Re-run scripts/google_workspace_auth.py and choose the admin clinic Gmail account."
+    )
+
+
+def gmail_profile_email() -> str | None:
+    gmail = _build_gmail_service()
+    try:
+        profile = gmail.users().getProfile(userId="me").execute()
+    except Exception as exc:  # pragma: no cover - exercised with mocked provider tests
+        _remember_error(exc)
+        raise GoogleWorkspaceError(f"Gmail profile fetch failed: {provider_error_message(exc)}") from exc
+    _clear_error()
+    return str(profile.get("emailAddress") or "").strip() or None
+
+
+def _account_matches_expected(actual: str | None, expected: str | None) -> bool | None:
+    if not expected:
+        return None
+    if not actual:
+        return False
+    return actual.strip().lower() == expected.strip().lower()
 
 
 def send_approved_draft(
@@ -121,6 +164,7 @@ def send_approved_draft(
     recipient_email: str,
     subject: str | None,
     body: str,
+    attachments: list[dict[str, Any]] | None = None,
     sender: str = "me",
 ) -> dict[str, Any]:
     gmail = _build_gmail_service()
@@ -128,6 +172,18 @@ def send_approved_draft(
     message["To"] = recipient_email
     message["Subject"] = subject or "Message from Lumen Clinic"
     message.set_content(body)
+    for attachment in attachments or []:
+        content = attachment.get("content") or b""
+        if isinstance(content, str):
+            content = content.encode("utf-8")
+        content_type = str(attachment.get("content_type") or "application/octet-stream")
+        maintype, _, subtype = content_type.partition("/")
+        message.add_attachment(
+            bytes(content),
+            maintype=maintype or "application",
+            subtype=subtype or "octet-stream",
+            filename=str(attachment.get("file_name") or "attachment"),
+        )
 
     encoded = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
     try:
@@ -150,9 +206,10 @@ def list_unread_gmail_messages(
     sender_email: str | None = None,
     query: str | None = None,
     max_results: int = 10,
+    unread_only: bool = True,
 ) -> list[dict[str, str]]:
     gmail = _build_gmail_service()
-    terms = ["is:unread"]
+    terms = ["is:unread"] if unread_only else ["in:inbox"]
     if sender_email:
         terms.append(f"from:{sender_email}")
     if query:
@@ -183,17 +240,37 @@ def get_gmail_message(*, message_id: str, format: str = "full") -> dict[str, Any
     return result
 
 
+def download_gmail_attachment(*, message_id: str, attachment_id: str) -> bytes:
+    gmail = _build_gmail_service()
+    try:
+        result = (
+            gmail.users()
+            .messages()
+            .attachments()
+            .get(userId="me", messageId=message_id, id=attachment_id)
+            .execute()
+        )
+    except Exception as exc:  # pragma: no cover - exercised with mocked provider tests
+        _remember_error(exc)
+        raise GoogleWorkspaceError(f"Gmail attachment download failed: {provider_error_message(exc)}") from exc
+
+    _clear_error()
+    return _decode_gmail_attachment(result.get("data") or "")
+
+
 def parse_gmail_message(message: dict[str, Any]) -> dict[str, Any]:
     payload = message.get("payload") or {}
     headers = _gmail_headers(payload)
+    message_id = message.get("id")
     return {
-        "message_id": message.get("id"),
+        "message_id": message_id,
         "thread_id": message.get("threadId"),
         "snippet": message.get("snippet") or "",
         "subject": headers.get("Subject", ""),
         "from": headers.get("From", ""),
         "date": headers.get("Date", ""),
         "body": _gmail_message_body(payload),
+        "attachments": _gmail_message_attachments(payload, message_id=str(message_id or "")),
     }
 
 
@@ -575,6 +652,31 @@ def _gmail_message_body(payload: dict[str, Any]) -> str:
     return body.strip()
 
 
+def _gmail_message_attachments(payload: dict[str, Any], *, message_id: str) -> list[dict[str, Any]]:
+    attachments: list[dict[str, Any]] = []
+
+    def visit(part: dict[str, Any]) -> None:
+        filename = str(part.get("filename") or "").strip()
+        body = part.get("body") or {}
+        attachment_id = str(body.get("attachmentId") or "").strip()
+        if filename or attachment_id:
+            attachments.append(
+                {
+                    "message_id": message_id,
+                    "attachment_id": attachment_id or None,
+                    "file_name": filename or "attachment",
+                    "mime_type": str(part.get("mimeType") or "application/octet-stream"),
+                    "size_bytes": body.get("size"),
+                }
+            )
+        for child in part.get("parts") or []:
+            visit(child)
+
+    if payload:
+        visit(payload)
+    return attachments
+
+
 def _gmail_message_body_plain(payload: dict[str, Any]) -> str:
     if not payload:
         return ""
@@ -611,6 +713,16 @@ def _decode_gmail_body(value: str) -> str:
     except Exception:
         return ""
     return decoded.decode("utf-8", errors="replace")
+
+
+def _decode_gmail_attachment(value: str) -> bytes:
+    if not value:
+        return b""
+    padding = "=" * (-len(value) % 4)
+    try:
+        return base64.urlsafe_b64decode((value + padding).encode("ascii"))
+    except Exception as exc:
+        raise GoogleWorkspaceError("Gmail attachment payload was not valid base64url data.") from exc
 
 
 def _appointment_summary(*, therapist_name: str | None, patient_name: str | None, referral_id: str | None) -> str:

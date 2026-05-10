@@ -8,6 +8,7 @@ import json
 import os
 import re
 from datetime import datetime, time, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import delete, func, select
@@ -152,6 +153,7 @@ REVIEW_TASK_NEXT_ACTIONS = {
     "appointment_reschedule_approval": ("confirm_appointment", "Approve reschedule"),
     "intake_reminder_approval": ("complete_intake", "Approve intake reminder"),
     "intake_exception_approval": ("complete_intake", "Review intake exception"),
+    "intake_submission_review": ("complete_intake", "Review intake submission"),
     "inbound_reply_review": ("review_gate", "Review inbound reply"),
 }
 
@@ -161,6 +163,7 @@ REVIEW_TASK_PRIORITY = (
     "appointment_confirmation_approval",
     "appointment_reschedule_approval",
     "intake_exception_approval",
+    "intake_submission_review",
     "inbound_reply_review",
     "admin_missing_info_review",
     "duplicate_resolution",
@@ -188,6 +191,14 @@ ACTION_OWNER_LABELS = {
     "closed": "Complete",
     "review_gate": "Admin",
     "revise_agent_output": "Agent / admin",
+    "retry_extraction": "Agent",
+    "wait_extraction": "Agent",
+    "review_first_response": "Admin",
+    "send_email": "Admin",
+    "sync_replies": "Admin",
+    "resolve_reply": "Admin",
+    "resolve_match": "Admin",
+    "continue_email_workflow": "Admin",
 }
 
 NEXT_ACTION_ALLOWED_ACTIONS = {
@@ -207,6 +218,14 @@ NEXT_ACTION_ALLOWED_ACTIONS = {
     "closed": (),
     "review_gate": ("review_gate",),
     "revise_agent_output": ("revise_agent_output",),
+    "retry_extraction": ("retry_extraction",),
+    "wait_extraction": (),
+    "review_first_response": ("review_gate",),
+    "send_email": ("review_gate",),
+    "sync_replies": ("sync_replies", "record_patient_reply"),
+    "resolve_reply": ("review_gate", "record_missing_reply"),
+    "resolve_match": ("run_match", "suitability_review"),
+    "continue_email_workflow": ("continue_email_workflow", "retry_extraction"),
 }
 
 REQUEST_CHANGES_ACTIONS = {
@@ -222,6 +241,7 @@ REQUEST_CHANGES_ACTIONS = {
     "appointment_reschedule_approval": ("review_gate",),
     "intake_reminder_approval": ("draft_intake_reminder",),
     "intake_exception_approval": ("complete_intake",),
+    "intake_submission_review": ("complete_intake", "draft_intake_reminder"),
 }
 
 GMAIL_APPROVAL_TASK_TYPES = {
@@ -231,8 +251,12 @@ GMAIL_APPROVAL_TASK_TYPES = {
 }
 
 INBOUND_GMAIL_STORAGE_PREFIX = "gmail:message:"
+INTAKE_TEMPLATE_FILE_DOCUMENT_TYPE = "intake_template_file"
+INTAKE_REPLY_STATUSES = {"intake_packet_sent", "intake_incomplete"}
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 DEMO_OUTBOUND_PATIENT_EMAIL = "lumenpatientdemo@gmail.com"
+DEMO_CLARA_EMAIL = "clara.demo1234@gmail.com"
 DEMO_CLEAN_REFERRAL_ID = "demo-clean-referral-001"
 DEMO_CLEAN_PATIENT_ID = "demo-clean-patient-001"
 DEMO_CLEAN_THERAPIST_ID = "demo-clean-therapist-001"
@@ -240,6 +264,18 @@ DEMO_CLEAN_INTAKE_TEMPLATE_ID = "demo-clean-intake-template"
 SESSION_LENGTH_MINUTES = 60
 SESSION_BUFFER_MINUTES = 10
 THERAPIST_WEEKLY_PATIENT_CONTACT_CAP_HOURS = 20
+EMAIL_WORKFLOW_STALE_MINUTES = 10
+EMAIL_FOLLOWUP_NON_BLOCKING_MISSING_FIELDS = {
+    "date_of_birth",
+    "dob",
+    "contact_phone_or_date_of_birth",
+    "contact_phone",
+    "phone",
+    "insurer",
+    "insurance",
+    "referring_entity",
+    "patient_name",
+}
 DEFAULT_AVAILABILITY_BLOCKS = [
     {"weekday": day, "start": "08:00", "end": "21:00", "modality": "online"}
     for day in ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
@@ -302,18 +338,24 @@ def create_referral_for_request(session: Session, request: Any) -> Referral | No
         return None
 
     raw_input = request.raw_input or {}
+    source_channel = str(raw_input.get("source_channel") or "webform")
+    is_email_referral = source_channel.strip().lower() == "email"
     referral = Referral(
         tenant_id=request.tenant_id,
         patient_id=request.patient_id,
-        source_channel=str(raw_input.get("source_channel") or "webform"),
+        source_channel=source_channel,
         raw_text=str(raw_input.get("raw_text") or ""),
         uploaded_file_name=raw_input.get("uploaded_file_name"),
         status="normalising",
-        missing_fields=_deterministic_missing_fields(raw_input),
+        contact_email=_extract_email_address(str(raw_input.get("contact_email") or raw_input.get("sender") or "")),
+        missing_fields=[] if is_email_referral else _deterministic_missing_fields(raw_input),
     )
     session.add(referral)
     session.flush()
-    _ensure_admin_missing_info_task(session, referral)
+    if is_email_referral:
+        _apply_deterministic_email_referral_facts(session, referral, raw_input=raw_input)
+    if not is_email_referral:
+        _ensure_admin_missing_info_task(session, referral)
     write_audit(
         session,
         tenant_id=request.tenant_id,
@@ -403,7 +445,261 @@ def finish_workflow_run(
     if run.referral_id:
         update_referral_from_result(session, run)
     persist_human_review_tasks(session, run)
+    _maybe_prepare_email_referral_followup(session, run)
     return run
+
+
+def _maybe_prepare_email_referral_followup(session: Session, run: WorkflowRun) -> None:
+    if run.workflow_type != "new_referral" or run.status not in {"completed", "needs_review"} or not run.referral_id:
+        return
+    referral = session.get(Referral, run.referral_id)
+    if referral is None:
+        return
+    raw_input = (run.request_payload or {}).get("raw_input") if isinstance(run.request_payload, dict) else {}
+    source_channel = str((raw_input or {}).get("source_channel") or referral.source_channel or "").strip().lower()
+    if source_channel != "email":
+        return
+    if _email_followup_has_clinical_blocker(referral):
+        return
+    try:
+        prepare_email_referral_followup(session, referral.id)
+    except Exception as exc:
+        write_audit(
+            session,
+            tenant_id=run.tenant_id,
+            action="email_followup_prepare_failed",
+            entity_type="referral",
+            entity_id=referral.id,
+            after={"workflow_run_id": run.id, "error": str(exc)},
+        )
+
+
+def prepare_email_referral_followup(
+    session: Session,
+    referral_id: str,
+    *,
+    availability_text: str | None = None,
+    force_new_draft: bool = False,
+) -> dict[str, Any]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    if _email_followup_has_clinical_blocker(referral):
+        return {"status": "blocked", "reason": "clinical_or_risk_review_required", "referral": referral_summary(referral)}
+    blocking_missing = _matching_blocking_missing_fields(referral)
+    if blocking_missing:
+        return {
+            "status": "blocked",
+            "reason": "blocking_missing_information",
+            "missing_fields": blocking_missing,
+            "referral": referral_summary(referral),
+        }
+
+    patient = _ensure_patient_for_referral(session, referral)
+    match = deterministic_match_for_referral(session, referral.id, allow_noncritical_missing=True)
+    therapist_id = _top_match_therapist_id(referral)
+    if not therapist_id:
+        return {
+            "status": "partial",
+            "reason": "no_eligible_therapist",
+            "referral": referral_summary(referral),
+            "patient_id": patient.id,
+            "match": match,
+            "appointments": [],
+            "draft": None,
+        }
+    proposals = propose_appointment_slots(
+        session,
+        referral.id,
+        therapist_id=therapist_id,
+        limit=1,
+        availability_text=availability_text,
+    )
+    draft = _existing_slot_contact_draft(session, referral) if not force_new_draft else None
+    if proposals and draft is None:
+        draft = draft_first_contact_message(session, referral.id)
+    session.flush()
+    return {
+        "status": "prepared" if proposals and draft else "partial",
+        "referral": referral_summary(referral),
+        "patient_id": patient.id,
+        "match": match,
+        "appointments": proposals,
+        "draft": draft,
+    }
+
+
+def continue_email_referral_workflow(session: Session, referral_id: str) -> dict[str, Any]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    if str(referral.source_channel or "").strip().lower() != "email":
+        raise ValueError("Only email referrals can be continued from email facts.")
+    extracted = _apply_deterministic_email_referral_facts(session, referral)
+    _clear_email_demo_duplicate_candidates(session, referral)
+    result = prepare_email_referral_followup(session, referral.id)
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="continue_email_referral_workflow",
+        entity_type="referral",
+        entity_id=referral.id,
+        after={"extracted": extracted, "result": json_safe(result)},
+    )
+    return {
+        "status": result.get("status", "prepared"),
+        "extracted": extracted,
+        "result": result,
+        "referral": referral_summary(referral),
+    }
+
+
+def _apply_deterministic_email_referral_facts(
+    session: Session,
+    referral: Referral,
+    *,
+    raw_input: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if str(referral.source_channel or "").strip().lower() != "email":
+        return {}
+    source = raw_input or {}
+    raw_text = str(source.get("raw_text") or referral.raw_text or "")
+    updates = _extract_missing_info_updates_from_text(raw_text)
+    sender_email = _extract_email_address(str(source.get("contact_email") or source.get("sender") or ""))
+    if sender_email:
+        updates.setdefault("contact_email", sender_email)
+    before = referral_summary(referral)
+    applied: dict[str, Any] = {}
+    field_map = {
+        "patient_name": "patient_name",
+        "date_of_birth": "date_of_birth",
+        "contact_email": "contact_email",
+        "contact_phone": "contact_phone",
+        "insurer": "insurer",
+        "referring_entity": "referring_entity",
+    }
+    for key, attr in field_map.items():
+        value = updates.get(key)
+        if value and not getattr(referral, attr):
+            setattr(referral, attr, value)
+            applied[key] = value
+    missing_fields = _deterministic_email_missing_fields(raw_text, referral)
+    if list(referral.missing_fields or []) != missing_fields:
+        referral.missing_fields = missing_fields
+        applied["missing_fields"] = missing_fields
+    if _clear_email_demo_duplicate_candidates(session, referral):
+        applied["duplicate_candidates"] = []
+    if applied:
+        referral.updated_at = utc_now()
+        write_audit(
+            session,
+            tenant_id=referral.tenant_id,
+            action="deterministic_email_extract",
+            entity_type="referral",
+            entity_id=referral.id,
+            before=before,
+            after=referral_summary(referral),
+        )
+    return applied
+
+
+def _clear_email_demo_duplicate_candidates(session: Session, referral: Referral) -> bool:
+    if str(referral.source_channel or "").strip().lower() != "email":
+        return False
+    if not referral.duplicate_candidates:
+        return False
+    before = referral_summary(referral)
+    referral.duplicate_candidates = []
+    referral.updated_at = utc_now()
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="demo_bypass_email_duplicate_candidates",
+        entity_type="referral",
+        entity_id=referral.id,
+        before=before,
+        after=referral_summary(referral),
+    )
+    return True
+
+
+def _deterministic_email_missing_fields(raw_text: str, referral: Referral) -> list[str]:
+    text = str(raw_text or "")
+    existing = {str(field or "").strip() for field in (referral.missing_fields or []) if str(field or "").strip()}
+    missing: list[str] = []
+    if not referral.patient_name:
+        missing.append("patient_name")
+    if not (referral.contact_email or _extract_email_address(text)):
+        missing.append("contact_email")
+    if not (referral.date_of_birth or referral.contact_phone or _extract_date_of_birth(text) or _extract_phone_number(text)):
+        if {"date_of_birth", "dob"} & existing:
+            missing.append("date_of_birth")
+        elif {"contact_phone", "phone"} & existing:
+            missing.append("contact_phone")
+        else:
+            missing.append("contact_phone_or_date_of_birth")
+    if not (referral.insurer or _extract_insurer(text)):
+        missing.append("insurer")
+    return list(dict.fromkeys(missing))
+
+
+def _email_followup_has_clinical_blocker(referral: Referral) -> bool:
+    status = canonical_referral_status(referral.status)
+    return (
+        status in {"needs_clinical_review", "clinical_escalation_review"}
+        or bool(referral.risk_present)
+        or referral.urgency in {"elevated", "urgent", "unknown"}
+        or referral.risk_category == "unknown"
+    )
+
+
+def _existing_slot_contact_draft(session: Session, referral: Referral) -> dict[str, Any] | None:
+    drafts = list(
+        session.scalars(
+            select(CommunicationDraft)
+            .where(
+                CommunicationDraft.referral_id == referral.id,
+                CommunicationDraft.status.in_(["draft_pending_review", "approved_pending_send", "sent"]),
+            )
+            .order_by(CommunicationDraft.created_at.desc())
+            .limit(10)
+        )
+    )
+    draft = next((item for item in drafts if item.proposed_slots), None)
+    return communication_draft_to_dict(draft) if draft else None
+
+
+def _review_task_exists(
+    session: Session,
+    referral_id: str,
+    task_type: str,
+    *,
+    statuses: tuple[str, ...],
+) -> bool:
+    return bool(
+        session.scalar(
+            select(HumanReviewTask.id)
+            .where(
+                HumanReviewTask.referral_id == referral_id,
+                HumanReviewTask.task_type == task_type,
+                HumanReviewTask.status.in_(list(statuses)),
+            )
+            .limit(1)
+        )
+    )
+
+
+def _open_inbound_reply_task(session: Session, referral: Referral) -> HumanReviewTask | None:
+    return session.scalar(
+        select(HumanReviewTask)
+        .where(
+            HumanReviewTask.referral_id == referral.id,
+            HumanReviewTask.task_type == "inbound_reply_review",
+            HumanReviewTask.status == "open",
+        )
+        .order_by(HumanReviewTask.created_at.desc())
+        .limit(1)
+    )
 
 
 def append_workflow_event(
@@ -459,7 +755,76 @@ def get_workflow_run(session: Session, job_id: str) -> WorkflowRun:
 
 def workflow_snapshot(session: Session, job_id: str) -> dict[str, Any]:
     run = get_workflow_run(session, job_id)
+    _mark_workflow_stale_if_needed(session, run)
     return workflow_run_to_dict(run)
+
+
+def _mark_stale_workflows_for_referral(
+    session: Session,
+    referral: Referral,
+    workflows: list[WorkflowRun] | None = None,
+) -> None:
+    runs = workflows
+    if runs is None:
+        runs = list(
+            session.scalars(
+                select(WorkflowRun)
+                .where(WorkflowRun.referral_id == referral.id)
+                .order_by(WorkflowRun.created_at.desc())
+            )
+        )
+    changed = False
+    for run in runs:
+        if _mark_workflow_stale_if_needed(session, run):
+            changed = True
+    if changed and canonical_referral_status(referral.status) == "normalising":
+        transition_referral_status(
+            session,
+            referral,
+            "needs_admin_review",
+            reason="Agent extraction timed out; retry is required.",
+        )
+
+
+def _mark_workflow_stale_if_needed(session: Session, run: WorkflowRun) -> bool:
+    if run.status != "running":
+        return False
+    updated_at = _normalise_datetime(run.updated_at or run.created_at or utc_now())
+    if utc_now() - updated_at <= timedelta(minutes=EMAIL_WORKFLOW_STALE_MINUTES):
+        return False
+    before = workflow_run_summary(run)
+    run.status = "failed"
+    run.error = f"Workflow was still running after {EMAIL_WORKFLOW_STALE_MINUTES} minutes; retry extraction."
+    run.updated_at = utc_now()
+    write_audit(
+        session,
+        tenant_id=run.tenant_id,
+        action="mark_stale",
+        entity_type="workflow_run",
+        entity_id=run.id,
+        before=before,
+        after=workflow_run_summary(run),
+    )
+    if run.referral_id:
+        referral = session.get(Referral, run.referral_id)
+        if referral is not None and canonical_referral_status(referral.status) == "normalising":
+            transition_referral_status(
+                session,
+                referral,
+                "needs_admin_review",
+                reason="Agent extraction timed out; retry is required.",
+            )
+    if not any(event.node == "workflow_timeout" for event in run.events):
+        append_workflow_event(
+            session,
+            job_id=run.id,
+            event_type="error",
+            status="failed",
+            message=run.error,
+            node="workflow_timeout",
+        )
+    session.flush()
+    return True
 
 
 def workflow_events_since(session: Session, job_id: str, cursor: int) -> tuple[list[dict[str, Any]], str]:
@@ -558,6 +923,7 @@ def referral_detail(session: Session, referral_id: str) -> dict[str, Any]:
     referral = session.get(Referral, referral_id)
     if referral is None:
         raise KeyError(f"Unknown referral: {referral_id}")
+    _apply_deterministic_email_referral_facts(session, referral)
 
     drafts = list(
         session.scalars(select(CommunicationDraft).where(CommunicationDraft.referral_id == referral_id).order_by(CommunicationDraft.created_at.desc()))
@@ -568,6 +934,7 @@ def referral_detail(session: Session, referral_id: str) -> dict[str, Any]:
     workflows = list(
         session.scalars(select(WorkflowRun).where(WorkflowRun.referral_id == referral_id).order_by(WorkflowRun.created_at.desc()))
     )
+    _mark_stale_workflows_for_referral(session, referral, workflows)
     detail = referral_summary(referral)
     detail.update(
         {
@@ -595,6 +962,7 @@ def referral_workbench_state(session: Session, referral_id: str) -> dict[str, An
     referral = session.get(Referral, referral_id)
     if referral is None:
         raise KeyError(f"Unknown referral: {referral_id}")
+    _apply_deterministic_email_referral_facts(session, referral)
     tasks = list(
         session.scalars(select(HumanReviewTask).where(HumanReviewTask.referral_id == referral_id).order_by(HumanReviewTask.created_at.desc()))
     )
@@ -604,7 +972,30 @@ def referral_workbench_state(session: Session, referral_id: str) -> dict[str, An
     workflows = list(
         session.scalars(select(WorkflowRun).where(WorkflowRun.referral_id == referral_id).order_by(WorkflowRun.created_at.desc()))
     )
+    _mark_stale_workflows_for_referral(session, referral, workflows)
     return _referral_workbench_state(session, referral, tasks=tasks, drafts=drafts, workflows=workflows)
+
+
+def referral_retry_workflow_input(session: Session, referral_id: str) -> dict[str, Any]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    if canonical_referral_status(referral.status) not in {"normalising", "needs_admin_review"}:
+        raise ValueError("Only normalising or failed-review referrals can be retried.")
+    raw_text = referral.raw_text or ""
+    if not raw_text.strip():
+        raise ValueError("Referral has no raw email text to retry.")
+    return {
+        "tenant_id": referral.tenant_id,
+        "patient_id": referral.patient_id,
+        "referral_id": referral.id,
+        "raw_input": {
+            "source_channel": referral.source_channel or "email",
+            "raw_text": raw_text,
+            "contact_email": referral.contact_email,
+            "sender": referral.contact_email,
+        },
+    }
 
 
 def _referral_workbench_state(
@@ -620,6 +1011,7 @@ def _referral_workbench_state(
     stage = _journey_stage(status)
     open_tasks = [task for task in tasks if task.status == "open"]
     change_tasks = [task for task in tasks if task.status == "changes_requested"]
+    email_workflow = _email_workflow_packet(session, referral, tasks=tasks, drafts=drafts, workflows=workflows)
     next_action, next_label = _task_aware_next_action(summary, open_tasks)
     blockers = _journey_blockers(session, referral, open_tasks)
 
@@ -650,7 +1042,21 @@ def _referral_workbench_state(
             "warning",
         )
 
+    if email_workflow is not None and changed_gate is None:
+        primary_action = email_workflow["next_action"]
+        primary_action_label = email_workflow["next_action_label"]
+        owner = ACTION_OWNER_LABELS.get(primary_action, "Admin")
+        allowed_actions = list(NEXT_ACTION_ALLOWED_ACTIONS.get(primary_action, ("review_gate",)))
+        for blocker in email_workflow.get("blockers") or []:
+            _append_blocker(blockers, blocker["code"], blocker["label"], blocker.get("severity", "warning"))
+
     primary_blocker = _primary_blocker(blockers)
+    if changed_gate is not None:
+        primary_blocker = {
+            "code": "changes_requested",
+            "label": f"Changes requested: {changed_gate.rejection_reason or changed_gate.reason}",
+            "severity": "warning",
+        }
     if primary_blocker is None and open_gate is not None:
         primary_blocker = {
             "code": f"review_{open_gate.task_type}",
@@ -675,6 +1081,194 @@ def _referral_workbench_state(
         "progress": _workbench_progress_facts(session, referral, tasks=tasks, drafts=drafts),
         "agent_outputs": _agent_outputs_for_referral(session, referral, tasks=tasks, drafts=drafts),
         "activity": _referral_activity(session, referral, tasks=tasks, drafts=drafts, workflows=workflows),
+        "email_workflow": email_workflow,
+    }
+
+
+def _email_workflow_packet(
+    session: Session,
+    referral: Referral,
+    *,
+    tasks: list[HumanReviewTask],
+    drafts: list[CommunicationDraft],
+    workflows: list[WorkflowRun],
+) -> dict[str, Any] | None:
+    if str(referral.source_channel or "").strip().lower() != "email":
+        return None
+
+    latest_workflow = next((run for run in workflows if run.workflow_type == "new_referral"), None)
+    proposed_appointment = _latest_appointment_for_referral(session, referral, statuses=("proposed",))
+    confirmed_appointment = _latest_appointment_for_referral(session, referral, statuses=("confirmed",))
+    slot_draft = next((draft for draft in drafts if draft.proposed_slots), None)
+    latest_sent_draft = next((draft for draft in drafts if draft.status == "sent"), None)
+    latest_draft = slot_draft or (drafts[0] if drafts else None)
+    open_tasks = [task for task in tasks if task.status == "open"]
+    open_task_types = {task.task_type for task in open_tasks}
+    relevant_task_types = {
+        "match_approval",
+        "slot_offer_approval",
+        "send_approval",
+        "appointment_confirmation_approval",
+        "inbound_reply_review",
+    }
+    packet_tasks = [review_task_to_dict(task) for task in open_tasks if task.task_type in relevant_task_types]
+    no_match = _email_no_match_summary(referral)
+    blockers: list[dict[str, str]] = []
+    if no_match:
+        blockers.append({"code": "no_eligible_therapist", "label": no_match["label"], "severity": "warning"})
+
+    has_response_artifacts = bool(
+        proposed_appointment
+        or latest_draft
+        or confirmed_appointment
+        or (open_task_types & relevant_task_types)
+    )
+    if latest_workflow and latest_workflow.status == "failed" and not _email_referral_has_extracted_facts(referral):
+        next_action = "retry_extraction"
+        next_label = "Retry extraction"
+    elif latest_workflow and latest_workflow.status in {"queued", "running"} and not has_response_artifacts:
+        next_action = "continue_email_workflow"
+        next_label = "Continue from email"
+    elif "inbound_reply_review" in open_task_types:
+        next_action = "resolve_reply"
+        next_label = "Resolve patient reply"
+    elif "appointment_confirmation_approval" in open_task_types:
+        next_action = "confirm_appointment"
+        next_label = "Create Google Calendar event"
+    elif "send_approval" in open_task_types and _review_prereqs_approved(tasks):
+        next_action = "send_email"
+        next_label = "Send email to patient"
+    elif open_task_types & {"match_approval", "slot_offer_approval", "send_approval"} or (latest_draft and latest_draft.status == "draft_pending_review"):
+        next_action = "review_first_response"
+        next_label = "Review first response"
+    elif latest_sent_draft and not confirmed_appointment:
+        next_action = "sync_replies"
+        next_label = "Sync replies"
+    elif no_match:
+        next_action = "resolve_match"
+        next_label = "Resolve therapist match"
+    elif confirmed_appointment:
+        next_action = "start_intake"
+        next_label = "Start intake"
+    elif not has_response_artifacts:
+        next_action = "continue_email_workflow"
+        next_label = "Continue from email"
+    else:
+        next_action = "review_first_response"
+        next_label = "Review first response"
+
+    return {
+        "status": _email_workflow_status(latest_workflow, referral, latest_draft, proposed_appointment, confirmed_appointment),
+        "next_action": next_action,
+        "next_action_label": next_label,
+        "facts": {
+            "patient_name": referral.patient_name,
+            "date_of_birth": referral.date_of_birth,
+            "contact_email": referral.contact_email,
+            "contact_phone": referral.contact_phone,
+            "insurer": referral.insurer,
+            "referring_entity": referral.referring_entity,
+            "language_preference": referral.language_preference,
+            "modality_preference": referral.modality_preference,
+            "missing_fields": list(referral.missing_fields or []),
+        },
+        "workflow": workflow_run_to_dict(latest_workflow, include_events=False) if latest_workflow else None,
+        "match": json_safe(referral.match_summary or {}),
+        "no_match": no_match,
+        "held_appointment": appointment_to_dict(proposed_appointment) if proposed_appointment else None,
+        "confirmed_appointment": appointment_to_dict(confirmed_appointment) if confirmed_appointment else None,
+        "draft": communication_draft_to_dict(latest_draft) if latest_draft else None,
+        "gmail": {
+            "thread_id": latest_draft.gmail_thread_id if latest_draft else None,
+            "message_id": latest_draft.gmail_message_id if latest_draft else None,
+            "sent_at": iso_or_none(latest_draft.sent_at) if latest_draft else None,
+        },
+        "review_tasks": packet_tasks,
+        "blockers": blockers,
+        "progress": _email_workflow_progress(latest_workflow, referral, latest_draft, proposed_appointment, confirmed_appointment),
+    }
+
+
+def _email_workflow_status(
+    workflow: WorkflowRun | None,
+    referral: Referral,
+    draft: CommunicationDraft | None,
+    proposed: Appointment | None,
+    confirmed: Appointment | None,
+) -> str:
+    if confirmed:
+        return "confirmed"
+    if draft and draft.status == "sent":
+        return "waiting_for_reply"
+    if draft or proposed:
+        return "first_response_prepared"
+    if _email_referral_has_extracted_facts(referral):
+        return "facts_extracted"
+    if workflow and workflow.status in {"queued", "running"}:
+        return "extracting"
+    if workflow and workflow.status == "failed":
+        return "retry_needed"
+    if referral.match_summary:
+        return "facts_extracted"
+    return "received"
+
+
+def _email_workflow_progress(
+    workflow: WorkflowRun | None,
+    referral: Referral,
+    draft: CommunicationDraft | None,
+    proposed: Appointment | None,
+    confirmed: Appointment | None,
+) -> dict[str, bool]:
+    return {
+        "email_received": True,
+        "facts_extracted": _email_referral_has_extracted_facts(referral) or bool(workflow and workflow.status in {"completed", "needs_review"}),
+        "first_response_prepared": bool(draft or proposed),
+        "waiting_for_reply": bool(draft and draft.status == "sent"),
+        "appointment_confirmation": bool(confirmed),
+        "confirmed": bool(confirmed and (not google_workspace.is_enabled() or confirmed.google_calendar_event_id)),
+    }
+
+
+def _email_referral_has_extracted_facts(referral: Referral) -> bool:
+    return bool(referral.patient_name or referral.risk_category or referral.language_preference or referral.match_summary)
+
+
+def _review_prereqs_approved(tasks: list[HumanReviewTask]) -> bool:
+    approved = {task.task_type for task in tasks if task.status == "approved"}
+    return "match_approval" in approved and "slot_offer_approval" in approved
+
+
+def _latest_appointment_for_referral(
+    session: Session,
+    referral: Referral,
+    *,
+    statuses: tuple[str, ...],
+) -> Appointment | None:
+    return session.scalar(
+        select(Appointment)
+        .where(Appointment.referral_id == referral.id, Appointment.status.in_(list(statuses)))
+        .order_by(Appointment.updated_at.desc())
+        .limit(1)
+    )
+
+
+def _email_no_match_summary(referral: Referral) -> dict[str, Any] | None:
+    match = referral.match_summary or {}
+    ranked = match.get("ranked_matches") or []
+    excluded = match.get("excluded_therapists") or []
+    if ranked or not match:
+        return None
+    reasons: dict[str, int] = {}
+    for item in excluded:
+        for reason in item.get("exclusion_reasons") or []:
+            reasons[str(reason)] = reasons.get(str(reason), 0) + 1
+    ordered = sorted(reasons.items(), key=lambda item: item[1], reverse=True)
+    reason_text = ", ".join(reason for reason, _ in ordered[:3]) or str(match.get("rationale") or "").strip() or "no eligible therapist matched the referral constraints"
+    return {
+        "label": f"No eligible therapist found: {reason_text}.",
+        "reasons": [{"reason": reason, "count": count} for reason, count in ordered],
+        "excluded_count": len(excluded),
     }
 
 
@@ -1181,15 +1775,7 @@ def create_email_referral(
     clean_body = body.strip()
     if not clean_body:
         raise ValueError("Email body is required.")
-    raw_text = "\n".join(
-        part
-        for part in [
-            f"From: {sender.strip()}" if sender.strip() else "",
-            f"Subject: {subject.strip()}" if subject.strip() else "",
-            clean_body,
-        ]
-        if part
-    )
+    raw_text = _email_referral_raw_text(sender=sender, subject=subject, body=clean_body)
     document = Document(
         tenant_id=tenant_id,
         document_type="email_referral",
@@ -1217,6 +1803,19 @@ def create_email_referral(
         after={"referral": referral_summary(referral), "document": document_to_dict(document)},
     )
     return {"referral": referral_summary(referral), "document": document_to_dict(document)}
+
+
+def _email_referral_raw_text(*, sender: str, subject: str, body: str) -> str:
+    clean_body = str(body or "").strip()
+    return "\n".join(
+        part
+        for part in [
+            f"From: {str(sender or '').strip()}" if str(sender or "").strip() else "",
+            f"Subject: {str(subject or '').strip()}" if str(subject or "").strip() else "",
+            clean_body,
+        ]
+        if part
+    )
 
 
 def list_referral_import_batches(
@@ -1252,7 +1851,15 @@ def integration_health(session: Session, tenant_id: str | None = None) -> dict[s
         .order_by(ReferralImportBatch.created_at.desc())
         .limit(1)
     )
-    google_status = google_workspace.google_workspace_status(refresh=False)
+    try:
+        google_status = google_workspace.google_workspace_status(refresh=False)
+    except Exception as exc:
+        google_status = {
+            "enabled": google_workspace.is_enabled(),
+            "authorized": False,
+            "token_present": False,
+            "last_provider_error": google_workspace.provider_error_message(exc),
+        }
     google_check_status = _google_integration_check_status(google_status)
     return {
         "checks": [
@@ -1418,7 +2025,7 @@ def reset_clean_demo_referral(session: Session, tenant_id: str = DEMO_TENANT_ID)
             id=DEMO_CLEAN_THERAPIST_ID,
             tenant_id=tenant_id,
             name="Dr. Clara Demo",
-            email="clara.demo@demo-clinic.local",
+            email=DEMO_CLARA_EMAIL,
             specialties=["anxiety", "work stress", "adjustment"],
             age_groups=["adult"],
             languages=["Portuguese", "English"],
@@ -1434,7 +2041,7 @@ def reset_clean_demo_referral(session: Session, tenant_id: str = DEMO_TENANT_ID)
     else:
         therapist.tenant_id = tenant_id
         therapist.active = True
-        therapist.email = therapist.email or "clara.demo@demo-clinic.local"
+        therapist.email = DEMO_CLARA_EMAIL
         therapist.specialties = ["anxiety", "work stress", "adjustment"]
         therapist.age_groups = ["adult"]
         therapist.languages = ["Portuguese", "English"]
@@ -1672,6 +2279,11 @@ def draft_missing_info_request(
     missing_fields = list(referral.missing_fields or [])
     if not missing_fields:
         raise ValueError("Referral has no recorded missing fields.")
+    if str(referral.source_channel or "").strip().lower() == "email":
+        if _existing_slot_contact_draft(session, referral):
+            raise ValueError("Email referral already has a first-response draft with a held appointment.")
+        if _open_inbound_reply_task(session, referral):
+            raise ValueError("Resolve the latest patient reply before drafting another missing-information email.")
 
     patient = _ensure_patient_for_referral(session, referral)
     _ensure_admin_missing_info_task(session, referral)
@@ -1932,6 +2544,7 @@ def record_missing_info_reply(
     notes: str = "",
     source_metadata: dict[str, Any] | None = None,
     storage_uri: str | None = None,
+    prepare_followup: bool = True,
 ) -> dict[str, Any]:
     referral = session.get(Referral, referral_id)
     if referral is None:
@@ -1984,6 +2597,18 @@ def record_missing_info_reply(
             status="completed",
             reason="Missing information has been resolved.",
         )
+        if prepare_followup and str(referral.source_channel or "").strip().lower() == "email" and not _email_followup_has_clinical_blocker(referral):
+            try:
+                prepare_email_referral_followup(session, referral.id)
+            except Exception as exc:
+                write_audit(
+                    session,
+                    tenant_id=referral.tenant_id,
+                    action="email_followup_prepare_failed",
+                    entity_type="referral",
+                    entity_id=referral.id,
+                    after={"source": "missing_info_reply", "error": str(exc)},
+                )
     else:
         _ensure_admin_missing_info_task(session, referral)
     write_audit(
@@ -2116,38 +2741,27 @@ def ingest_gmail_message(
         "snippet": snippet,
         "date": str(message.get("date") or "").strip(),
     }
+    attachments = [dict(item) for item in (message.get("attachments") or []) if isinstance(item, dict)]
+    if attachments:
+        metadata["attachments"] = json_safe(attachments)
     storage_uri = _gmail_storage_uri(message_id)
     referral, match_reason = _match_gmail_reply(session, thread_id, subject, note, sender_email)
 
     if referral is not None:
-        if _is_missing_info_referral(referral):
-            record_missing_info_reply(
-                session,
-                referral.id,
-                source="patient",
-                updates={},
-                notes=note,
-                source_metadata={**metadata, "match_reason": match_reason},
-                storage_uri=storage_uri,
-            )
-            action = "missing_info_reply"
-        else:
-            record_patient_reply(
-                session,
-                referral.id,
-                source="patient",
-                notes=note,
-                reply_type="unclassified",
-                source_metadata={**metadata, "match_reason": match_reason},
-                storage_uri=storage_uri,
-            )
-            action = "patient_reply"
+        outcome = _handle_gmail_patient_reply(
+            session,
+            referral,
+            note=note,
+            thread_id=thread_id,
+            source_metadata={**metadata, "match_reason": match_reason},
+            storage_uri=storage_uri,
+        )
         return {
             "status": "processed",
             "message_id": message_id,
             "referral_id": referral.id,
             "match_reason": match_reason,
-            "action": action,
+            **outcome,
         }
 
     document = Document(
@@ -2186,6 +2800,1070 @@ def ingest_gmail_message(
         "task_id": task.id,
         "match_reason": match_reason,
     }
+
+
+def _handle_gmail_patient_reply(
+    session: Session,
+    referral: Referral,
+    *,
+    note: str,
+    thread_id: str | None,
+    source_metadata: dict[str, Any],
+    storage_uri: str | None,
+) -> dict[str, Any]:
+    attachments = source_metadata.get("attachments") or []
+    if _is_intake_submission_reply(session, referral, thread_id, attachments):
+        return _handle_intake_submission_reply(
+            session,
+            referral,
+            note=note,
+            thread_id=thread_id,
+            source_metadata=source_metadata,
+            storage_uri=storage_uri,
+            attachments=[dict(item) for item in attachments if isinstance(item, dict)],
+        )
+
+    choices = _slot_choice_context(session, referral, thread_id)
+    reply_type, appointment_id = _classify_patient_reply(note, choices)
+    missing_updates = _extract_missing_info_updates_from_text(note, referral.missing_fields or [])
+    sender_email = str(source_metadata.get("sender_email") or "").strip()
+    if (
+        sender_email
+        and _is_valid_email(sender_email)
+        and "contact_email" not in missing_updates
+        and ("contact_email" in (referral.missing_fields or []) or not referral.contact_email)
+    ):
+        missing_updates["contact_email"] = sender_email
+    missing_reply: dict[str, Any] | None = None
+    if missing_updates or (_is_missing_info_referral(referral) and reply_type not in {"accepted_slot", "alternative_requested", "declined"}):
+        missing_reply = record_missing_info_reply(
+            session,
+            referral.id,
+            source="patient",
+            updates=missing_updates,
+            notes=note,
+            source_metadata=source_metadata,
+            storage_uri=storage_uri,
+            prepare_followup=reply_type not in {"accepted_slot", "alternative_requested", "declined"},
+        )
+        if not missing_updates and referral.missing_fields:
+            task = _ensure_reply_resolution_task(
+                session,
+                referral,
+                note=note,
+                source_metadata=source_metadata,
+                storage_uri=storage_uri,
+                reason="Patient reply was received but could not be mapped to the remaining missing fields.",
+            )
+            return {
+                "action": "reply_resolution_required",
+                "reply_type": "missing_info_reply",
+                "appointment_id": None,
+                "task_id": task.id,
+                "missing_updates": {},
+            }
+
+    if reply_type == "accepted_slot" and appointment_id:
+        acceptance = record_patient_slot_acceptance(
+            session,
+            referral.id,
+            appointment_id=appointment_id,
+            notes=note,
+            source_metadata=source_metadata,
+            storage_uri=storage_uri,
+            auto_approve=True,
+        )
+        action = "appointment_auto_confirmed" if acceptance.get("auto_approved") else "appointment_confirmation_requested"
+        task = acceptance.get("task") or {}
+        return {
+            "action": action,
+            "reply_type": reply_type,
+            "appointment_id": appointment_id,
+            "task_id": task.get("id"),
+            "auto_approved": bool(acceptance.get("auto_approved")),
+            "missing_updates": missing_updates,
+        }
+
+    if missing_reply and reply_type == "unclear":
+        return {
+            "action": "missing_info_reply",
+            "reply_type": "missing_info_reply",
+            "appointment_id": None,
+            "task_id": None,
+            "missing_updates": missing_updates,
+        }
+
+    reply = record_patient_reply(
+        session,
+        referral.id,
+        source="patient",
+        notes=note,
+        reply_type=reply_type,
+        source_metadata=source_metadata,
+        storage_uri=storage_uri,
+    )
+    task = reply.get("task") or {}
+    replacement: dict[str, Any] | None = None
+    if reply_type in {"alternative_requested", "declined"}:
+        _supersede_proposed_appointments_for_referral(session, referral, reason=f"Patient reply classified as {reply_type}.")
+        if reply_type == "alternative_requested" and _patient_availability_constraints(note):
+            replacement = prepare_email_referral_followup(
+                session,
+                referral.id,
+                availability_text=note,
+                force_new_draft=True,
+            )
+    return {
+        "action": "rebooking_requested" if reply_type in {"alternative_requested", "declined"} else "patient_reply",
+        "reply_type": reply_type,
+        "appointment_id": appointment_id,
+        "task_id": task.get("id"),
+        "missing_updates": missing_updates,
+        "replacement": replacement,
+    }
+
+
+def _is_intake_submission_reply(
+    session: Session,
+    referral: Referral,
+    thread_id: str | None,
+    attachments: Any,
+) -> bool:
+    if canonical_referral_status(referral.status) not in INTAKE_REPLY_STATUSES:
+        return False
+    if attachments:
+        return True
+    if not thread_id:
+        return True
+    draft = session.scalar(
+        select(CommunicationDraft)
+        .where(
+            CommunicationDraft.referral_id == referral.id,
+            CommunicationDraft.gmail_thread_id == thread_id,
+        )
+        .order_by(CommunicationDraft.created_at.desc())
+    )
+    if draft is None:
+        return True
+    subject = _normal(draft.subject or "")
+    body = _normal(draft.body or "")
+    return "intake" in subject or "reply to this same email thread" in body
+
+
+def _handle_intake_submission_reply(
+    session: Session,
+    referral: Referral,
+    *,
+    note: str,
+    thread_id: str | None,
+    source_metadata: dict[str, Any],
+    storage_uri: str | None,
+    attachments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    patient = _ensure_patient_for_referral(session, referral)
+    parent = Document(
+        tenant_id=referral.tenant_id,
+        patient_id=patient.id,
+        document_type="intake_submission_reply",
+        title="Patient intake reply",
+        storage_uri=storage_uri,
+        metadata_json={
+            "referral_id": referral.id,
+            "patient_id": patient.id,
+            "reply_text": note,
+            "gmail_thread_id": thread_id,
+            "source_metadata": json_safe(source_metadata),
+            "attachments": json_safe(attachments),
+        },
+    )
+    session.add(parent)
+    session.flush()
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="create",
+        entity_type="document",
+        entity_id=parent.id,
+        after=document_to_dict(parent),
+    )
+
+    documents: list[Document] = []
+    attachment_errors: list[dict[str, Any]] = []
+    for attachment in attachments:
+        if attachment.get("download_status") == "stored" and attachment.get("storage_uri"):
+            document = Document(
+                tenant_id=referral.tenant_id,
+                patient_id=patient.id,
+                document_type="intake_submission",
+                title=str(attachment.get("file_name") or "Intake attachment"),
+                storage_uri=str(attachment.get("storage_uri")),
+                metadata_json={
+                    **json_safe(attachment),
+                    "referral_id": referral.id,
+                    "patient_id": patient.id,
+                    "reply_document_id": parent.id,
+                    "gmail_thread_id": thread_id,
+                },
+            )
+            session.add(document)
+            session.flush()
+            documents.append(document)
+            extracted_text = str(attachment.get("extracted_text") or "")
+            if extracted_text.strip():
+                _index_text_chunks(
+                    session,
+                    tenant_id=referral.tenant_id,
+                    patient_id=patient.id,
+                    document_id=document.id,
+                    source_type=document.document_type,
+                    source_id=document.id,
+                    text=extracted_text,
+                    metadata={"title": document.title, "referral_id": referral.id},
+                )
+            write_audit(
+                session,
+                tenant_id=referral.tenant_id,
+                action="create",
+                entity_type="document",
+                entity_id=document.id,
+                after=document_to_dict(document),
+            )
+        else:
+            attachment_errors.append(
+                {
+                    "file_name": attachment.get("file_name") or "attachment",
+                    "mime_type": attachment.get("mime_type") or attachment.get("content_type"),
+                    "error": attachment.get("error") or "Attachment could not be stored.",
+                }
+            )
+
+    parent.metadata_json = {
+        **(parent.metadata_json or {}),
+        "document_ids": [document.id for document in documents],
+        "attachment_errors": json_safe(attachment_errors),
+    }
+    parent.updated_at = utc_now()
+
+    tasks: list[HumanReviewTask] = []
+    for document in documents:
+        tasks.append(
+            create_review_task(
+                session,
+                tenant_id=referral.tenant_id,
+                workflow_run_id=referral.workflow_run_id,
+                referral_id=referral.id,
+                patient_id=patient.id,
+                task_type="intake_submission_review",
+                reason="Patient returned an intake attachment; map it to the matching checklist item, consent, or questionnaire.",
+                payload_key=f"intake_submission:{document.id[:8]}",
+                source_payload=_intake_submission_review_payload(
+                    session,
+                    referral,
+                    reply_document=parent,
+                    documents=[document],
+                    attachment_errors=[],
+                    note=note,
+                    source_metadata=source_metadata,
+                ),
+            )
+        )
+    if not tasks or attachment_errors:
+        tasks.append(
+            create_review_task(
+                session,
+                tenant_id=referral.tenant_id,
+                workflow_run_id=referral.workflow_run_id,
+                referral_id=referral.id,
+                patient_id=patient.id,
+                task_type="intake_submission_review",
+                reason=(
+                    "Patient replied to the intake request but no usable attachment was received."
+                    if not documents
+                    else "One or more intake attachments could not be stored and need admin review."
+                ),
+                payload_key=f"intake_submission_error:{parent.id[:8]}",
+                source_payload=_intake_submission_review_payload(
+                    session,
+                    referral,
+                    reply_document=parent,
+                    documents=[],
+                    attachment_errors=attachment_errors or [{"error": "No attachments were included."}],
+                    note=note,
+                    source_metadata=source_metadata,
+                ),
+                draft_text=note,
+            )
+        )
+
+    if canonical_referral_status(referral.status) != "first_session_ready":
+        transition_referral_status(
+            session,
+            referral,
+            "intake_incomplete",
+            reason="Patient intake submission received for admin review.",
+        )
+
+    return {
+        "action": "intake_submission_review",
+        "reply_type": "intake_submission",
+        "task_id": tasks[0].id if tasks else None,
+        "task_ids": [task.id for task in tasks],
+        "document_ids": [document.id for document in documents],
+        "reply_document_id": parent.id,
+        "attachment_errors": attachment_errors,
+    }
+
+
+def _intake_submission_review_payload(
+    session: Session,
+    referral: Referral,
+    *,
+    reply_document: Document,
+    documents: list[Document],
+    attachment_errors: list[dict[str, Any]],
+    note: str,
+    source_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    context = _intake_review_context(session, referral)
+    return {
+        "reply_document_id": reply_document.id,
+        "reply_text": note,
+        "source_metadata": json_safe(source_metadata),
+        "documents": [document_to_dict(document) for document in documents],
+        "document_ids": [document.id for document in documents],
+        "document_id": documents[0].id if documents else None,
+        "attachment_errors": json_safe(attachment_errors),
+        "missing_intake_items": context["missing_items"],
+        "missing_consents": context["missing_consents"],
+    }
+
+
+def _intake_review_context(session: Session, referral: Referral) -> dict[str, Any]:
+    items = list(
+        session.scalars(
+            select(IntakeChecklistItem)
+            .where(IntakeChecklistItem.referral_id == referral.id)
+            .order_by(IntakeChecklistItem.created_at)
+        )
+    )
+    consents: list[ConsentRecord] = []
+    if referral.patient_id:
+        consents = list(
+            session.scalars(
+                select(ConsentRecord)
+                .where(ConsentRecord.tenant_id == referral.tenant_id, ConsentRecord.patient_id == referral.patient_id)
+                .order_by(ConsentRecord.scope)
+            )
+        )
+    return {
+        "missing_items": [intake_item_to_dict(item) for item in items if not _intake_done(item.status)],
+        "missing_consents": [consent_record_to_dict(consent) for consent in consents if not _intake_done(consent.status)],
+    }
+
+
+def _ensure_reply_resolution_task(
+    session: Session,
+    referral: Referral,
+    *,
+    note: str,
+    source_metadata: dict[str, Any],
+    storage_uri: str | None,
+    reason: str,
+) -> HumanReviewTask:
+    message_id = str(source_metadata.get("gmail_message_id") or storage_uri or "")[:80]
+    return create_review_task(
+        session,
+        tenant_id=referral.tenant_id,
+        workflow_run_id=referral.workflow_run_id,
+        referral_id=referral.id,
+        patient_id=referral.patient_id,
+        task_type="inbound_reply_review",
+        reason=reason,
+        payload_key=f"reply_resolution:{message_id or referral.id[:8]}",
+        source_payload={
+            "remaining_missing_fields": list(referral.missing_fields or []),
+            "reply_text": note,
+            "source_metadata": json_safe(source_metadata),
+            "storage_uri": storage_uri,
+        },
+        draft_text=note,
+    )
+
+
+def record_patient_slot_acceptance(
+    session: Session,
+    referral_id: str,
+    *,
+    appointment_id: str,
+    notes: str,
+    source_metadata: dict[str, Any] | None = None,
+    storage_uri: str | None = None,
+    auto_approve: bool = True,
+    reviewer_id: str | None = DEMO_USER_ID,
+) -> dict[str, Any]:
+    referral = session.get(Referral, referral_id)
+    if referral is None:
+        raise KeyError(f"Unknown referral: {referral_id}")
+    appointment = session.get(Appointment, appointment_id)
+    if appointment is None:
+        raise KeyError(f"Unknown appointment: {appointment_id}")
+    if appointment.referral_id != referral.id:
+        raise ValueError("Appointment does not belong to this referral.")
+
+    patient = _ensure_patient_for_referral(session, referral)
+    clean_notes = notes.strip() or "Patient accepted a proposed slot."
+    metadata = {
+        "referral_id": referral.id,
+        "source": "patient",
+        "reply_type": "accepted_slot",
+        "appointment_id": appointment.id,
+        "notes": clean_notes,
+    }
+    if source_metadata:
+        metadata["source_metadata"] = json_safe(source_metadata)
+
+    before = referral_summary(referral)
+    document = Document(
+        tenant_id=referral.tenant_id,
+        patient_id=patient.id,
+        document_type="patient_reply",
+        title="Patient reply from patient",
+        storage_uri=storage_uri,
+        metadata_json=metadata,
+    )
+    session.add(document)
+    session.flush()
+    transition_referral_status(
+        session,
+        referral,
+        "awaiting_patient_reply",
+        reason="Patient accepted a proposed slot; confirmation required.",
+    )
+    task = create_review_task(
+        session,
+        tenant_id=referral.tenant_id,
+        workflow_run_id=referral.workflow_run_id,
+        referral_id=referral.id,
+        patient_id=patient.id,
+        task_type="appointment_confirmation_approval",
+        reason="Patient accepted a proposed slot; approve to confirm the appointment record.",
+        payload_key=f"appointment_confirmation:{appointment.id[:8]}",
+        source_payload={
+            "reply_type": "accepted_slot",
+            "appointment_id": appointment.id,
+            "patient_reply_document_id": document.id,
+            "notes": clean_notes,
+        },
+    )
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="record_patient_reply",
+        entity_type="referral",
+        entity_id=referral.id,
+        before=before,
+        after=referral_summary(referral),
+    )
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        action="create",
+        entity_type="document",
+        entity_id=document.id,
+        after=document_to_dict(document),
+    )
+
+    auto_approved = False
+    if auto_approve:
+        try:
+            task = apply_review_action(
+                session,
+                task_id=task.id,
+                action="approve",
+                reviewer_id=reviewer_id,
+            )
+            auto_approved = task.status == "approved"
+        except Exception as exc:
+            _record_task_provider_failure(session, task, str(exc))
+
+    return {
+        "reply": document_to_dict(document),
+        "task": review_task_to_dict(task),
+        "auto_approved": auto_approved,
+    }
+
+
+def _slot_choice_context(
+    session: Session,
+    referral: Referral,
+    thread_id: str | None,
+) -> list[dict[str, Any]]:
+    appointment_ids: list[str] = []
+    if thread_id:
+        draft = session.scalar(
+            select(CommunicationDraft)
+            .where(CommunicationDraft.gmail_thread_id == thread_id)
+            .order_by(CommunicationDraft.created_at.desc())
+            .limit(1)
+        )
+        appointment_ids = list((draft.proposed_slots or [])) if draft else []
+
+    if not appointment_ids:
+        recent_drafts = list(
+            session.scalars(
+                select(CommunicationDraft)
+                .where(CommunicationDraft.referral_id == referral.id)
+                .order_by(CommunicationDraft.created_at.desc())
+                .limit(5)
+            )
+        )
+        for draft in recent_drafts:
+            if draft.proposed_slots:
+                appointment_ids = list(draft.proposed_slots)
+                break
+
+    appointments: list[Appointment] = []
+    if appointment_ids:
+        for appointment_id in appointment_ids:
+            appointment = session.get(Appointment, appointment_id)
+            if appointment is not None:
+                appointments.append(appointment)
+    if not appointments:
+        appointments = list(
+            session.scalars(
+                select(Appointment)
+                .where(Appointment.referral_id == referral.id, Appointment.status == "proposed")
+                .order_by(Appointment.starts_at)
+            )
+        )
+
+    choices = []
+    for index, appointment in enumerate(appointments[:3], start=1):
+        choices.append(
+            {
+                "index": index,
+                "appointment": appointment,
+                "code": _appointment_choice_code(appointment.id),
+            }
+        )
+    return choices
+
+
+def _appointment_choice_code(appointment_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", appointment_id)[:6].upper()
+
+
+def _classify_patient_reply(
+    note: str,
+    choices: list[dict[str, Any]],
+) -> tuple[str, str | None]:
+    appointment_id = _match_slot_choice(note, choices)
+    if appointment_id:
+        return "accepted_slot", appointment_id
+
+    text = _normalize_reply_text(note)
+    if _contains_any(
+        text,
+        [
+            "alternative",
+            "alternatives",
+            "another time",
+            "other time",
+            "different time",
+            "other option",
+            "other options",
+            "none of these",
+            "neither",
+            "not available",
+            "cant do",
+            "cannot do",
+            "can't do",
+        ],
+    ):
+        return "alternative_requested", None
+    if _contains_any(text, ["decline", "not interested", "no thanks", "cancel", "stop", "do not contact"]):
+        return "declined", None
+    if len(choices) == 1 and _contains_any(
+        text,
+        [
+            "yes",
+            "confirm",
+            "i can attend",
+            "can attend",
+            "that works",
+            "this works",
+            "works for me",
+            "i can do",
+            "i will attend",
+            "please book",
+            "book it",
+            "i accept",
+            "accepted",
+            "have this appointment",
+        ],
+    ):
+        appointment = choices[0].get("appointment")
+        return ("accepted_slot", appointment.id) if appointment else ("accepted_slot", None)
+    if "?" in text or _contains_any(text, ["question", "wondering", "can you", "could you", "what about"]):
+        return "asked_question", None
+    return "unclear", None
+
+
+def _match_slot_choice(note: str, choices: list[dict[str, Any]]) -> str | None:
+    if not note or not choices:
+        return None
+    text = _normalize_reply_text(note)
+    for choice in choices:
+        code = str(choice.get("code") or "").lower()
+        if code and code in text:
+            appointment = choice.get("appointment")
+            return appointment.id if appointment else None
+
+    word_map = {"first": 1, "second": 2, "third": 3}
+    for choice in choices:
+        index = int(choice.get("index") or 0)
+        if not index:
+            continue
+        if re.search(rf"\b(option|opt|slot|choice|opcao)\s*{index}\b", text):
+            appointment = choice.get("appointment")
+            return appointment.id if appointment else None
+        if re.search(rf"\b{index}(st|nd|rd|th)\b", text):
+            appointment = choice.get("appointment")
+            return appointment.id if appointment else None
+        for word, mapped in word_map.items():
+            if mapped == index and re.search(rf"\b{word}\b", text):
+                appointment = choice.get("appointment")
+                return appointment.id if appointment else None
+
+    for choice in choices:
+        appointment = choice.get("appointment")
+        if appointment and appointment.starts_at and _reply_mentions_slot(text, appointment):
+            return appointment.id
+    return None
+
+
+def _reply_mentions_slot(text: str, appointment: Appointment) -> bool:
+    date_token = appointment.starts_at.date().isoformat()
+    time_token = appointment.starts_at.strftime("%H:%M")
+    if date_token in text and time_token in text:
+        return True
+    if time_token.startswith("0") and date_token in text and time_token[1:] in text:
+        return True
+    return False
+
+
+def _normalize_reply_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").lower()).strip()
+
+
+def _contains_any(text: str, phrases: list[str]) -> bool:
+    return any(phrase in text for phrase in phrases)
+
+
+def _extract_missing_info_updates_from_text(text: str, missing_fields: list[str] | None = None) -> dict[str, str]:
+    value = _strip_quoted_reply(str(text or ""))
+    updates: dict[str, str] = {}
+
+    patient_name = _extract_patient_name(value)
+    if patient_name:
+        updates["patient_name"] = patient_name
+
+    email = _extract_email_address(value)
+    if email:
+        updates["contact_email"] = email
+
+    dob = _extract_date_of_birth(value)
+    if dob:
+        updates["date_of_birth"] = dob
+
+    phone = _extract_phone_number(value)
+    if phone:
+        updates["contact_phone"] = phone
+
+    insurer = _extract_insurer(value)
+    if insurer:
+        updates["insurer"] = insurer
+
+    referring_entity = _extract_referring_entity(value)
+    if referring_entity:
+        updates["referring_entity"] = referring_entity
+
+    wanted = set(missing_fields or [])
+    if wanted:
+        aliases = {
+            "contact_phone_or_date_of_birth": {"contact_phone", "date_of_birth"},
+            "dob": {"date_of_birth"},
+            "email": {"contact_email"},
+            "phone": {"contact_phone"},
+            "insurance": {"insurer"},
+            "name": {"patient_name"},
+            "referrer": {"referring_entity"},
+            "referring_entity": {"referring_entity"},
+        }
+        allowed = set(wanted)
+        for field in wanted:
+            allowed.update(aliases.get(field, set()))
+        updates = {
+            key: item
+            for key, item in updates.items()
+            if key in allowed or not wanted
+        }
+    return updates
+
+
+def _strip_quoted_reply(text: str) -> str:
+    lines = []
+    for line in str(text or "").splitlines():
+        clean = line.strip()
+        if clean.startswith(">"):
+            continue
+        if re.match(r"^on .+ wrote:\s*$", clean, re.I):
+            break
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _extract_patient_name(text: str) -> str | None:
+    patterns = [
+        r"\bmy name is\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ' .-]{1,80})",
+        r"\bpatient name\s*(?:is|:|-)?\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ' .-]{1,80})",
+        r"\bname\s*(?:is|:|-)\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ' .-]{1,80})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            return _clean_extracted_text_value(match.group(1), max_words=6)
+    return None
+
+
+def _extract_date_of_birth(text: str) -> str | None:
+    label_pattern = re.compile(
+        r"\b(?:dob|date of birth|birth date|data de nascimento|nascimento)\b\s*(?:is|:|-)?\s*"
+        r"(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+        re.I,
+    )
+    match = label_pattern.search(text)
+    if not match:
+        return None
+    raw = match.group(1)
+    if re.match(r"\d{4}-\d{1,2}-\d{1,2}$", raw):
+        year, month, day = raw.split("-")
+        return _normalise_date_of_birth_parts(year, month, day)
+    parts = re.split(r"[/-]", raw)
+    if len(parts) != 3:
+        return raw
+    day, month, year = parts
+    if len(year) == 2:
+        year = f"19{year}" if int(year) > 30 else f"20{year}"
+    return _normalise_date_of_birth_parts(year, month, day)
+
+
+def _normalise_date_of_birth_parts(year: str, month: str, day: str) -> str | None:
+    try:
+        parsed = datetime(int(year), int(month), int(day), tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    now = utc_now()
+    if parsed.date() > now.date() or parsed.year < now.year - 120:
+        return None
+    return f"{parsed.year:04d}-{parsed.month:02d}-{parsed.day:02d}"
+
+
+def _extract_phone_number(text: str) -> str | None:
+    match = re.search(r"\b(?:phone|telephone|telemovel|telemóvel|contact number)\b\s*(?:is|:|-)?\s*([+\d][\d\s().-]{6,})", text, re.I)
+    if not match:
+        return None
+    phone = re.sub(r"\s+", " ", match.group(1)).strip(" .")
+    digits = re.sub(r"\D", "", phone)
+    return phone if len(digits) >= 7 else None
+
+
+def _extract_insurer(text: str) -> str | None:
+    known = ["Multicare", "AdvanceCare", "Médis", "Medis", "Allianz", "Fidelidade", "Tranquilidade"]
+    lowered = text.lower()
+    for name in known:
+        if name.lower() in lowered:
+            return "Médis" if name == "Medis" else name
+    match = re.search(r"\b(?:insurer|insurance|seguradora|seguro)\b\s*(?:is|:|-)?\s*([A-Za-zÀ-ÿ0-9 &.-]{2,60})", text, re.I)
+    if not match:
+        return None
+    return match.group(1).strip(" .")
+
+
+def _extract_referring_entity(text: str) -> str | None:
+    patterns = [
+        r"\breferring entity\b\s*(?:(?:is|was)\s+|[:\-]\s*)?([A-Za-zÀ-ÿ0-9 &\"'()./-]{2,100})",
+        r"\breferrer\b\s*(?:(?:is|was)\s+|[:\-]\s*)?([A-Za-zÀ-ÿ0-9 &\"'()./-]{2,100})",
+        r"\breferred by\s+([A-Za-zÀ-ÿ0-9 &\"'()./-]{2,100})",
+        r"\bgp\b\s*(?:(?:is|was)\s+|[:\-]\s*)?([A-Za-zÀ-ÿ0-9 &\"'()./-]{2,100})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if not match:
+            continue
+        value = _clean_extracted_text_value(match.group(1), max_words=8)
+        if not value:
+            continue
+        if _normal(value) in {"none", "no", "n/a", "na", "self", "self referral", "self-referral"}:
+            return "Self-referral"
+        return value
+    return None
+
+
+def _clean_extracted_text_value(value: str, *, max_words: int = 12) -> str | None:
+    clean = re.split(r"[\r\n]", str(value or ""), maxsplit=1)[0]
+    clean = re.split(r"\s{2,}|[.;]", clean, maxsplit=1)[0]
+    clean = clean.strip(" \"'.,:-")
+    words = clean.split()
+    if max_words and len(words) > max_words:
+        clean = " ".join(words[:max_words])
+    return clean or None
+
+
+def _supersede_proposed_appointments_for_referral(session: Session, referral: Referral, *, reason: str) -> None:
+    appointments = list(
+        session.scalars(
+            select(Appointment).where(
+                Appointment.referral_id == referral.id,
+                Appointment.status == "proposed",
+            )
+        )
+    )
+    for appointment in appointments:
+        before = appointment_to_dict(appointment)
+        appointment.status = "cancelled"
+        appointment.updated_at = utc_now()
+        write_audit(
+            session,
+            tenant_id=appointment.tenant_id,
+            action="supersede_proposed_appointment",
+            entity_type="appointment",
+            entity_id=appointment.id,
+            before=before,
+            after={**appointment_to_dict(appointment), "reason": reason},
+        )
+    if appointments:
+        session.flush()
+
+
+def list_inbound_gmail_messages(
+    session: Session,
+    *,
+    tenant_id: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    query = select(Document).where(Document.storage_uri.like(f"{INBOUND_GMAIL_STORAGE_PREFIX}%"))
+    if tenant_id:
+        query = query.where(Document.tenant_id == tenant_id)
+    query = query.order_by(Document.created_at.desc()).limit(max(1, min(limit, 200)))
+    messages = []
+    for document in session.scalars(query):
+        metadata = document.metadata_json or {}
+        referral_id = _gmail_metadata_value(metadata, "referral_id")
+        status = "unmatched" if document.document_type == "inbound_email_unmatched" else "linked"
+        if document.document_type in {"missing_info_reply", "patient_reply"}:
+            status = "reply"
+        if metadata.get("converted_to_referral"):
+            status = "converted"
+        messages.append(
+            {
+                "document_id": document.id,
+                "tenant_id": document.tenant_id,
+                "document_type": document.document_type,
+                "status": status,
+                "message_id": _gmail_metadata_value(metadata, "gmail_message_id")
+                or _gmail_message_id_from_storage(document.storage_uri),
+                "thread_id": _gmail_metadata_value(metadata, "gmail_thread_id"),
+                "from": _gmail_metadata_value(metadata, "from"),
+                "sender_email": _gmail_metadata_value(metadata, "sender_email"),
+                "subject": _gmail_metadata_value(metadata, "subject") or document.title,
+                "date": _gmail_metadata_value(metadata, "date"),
+                "snippet": _gmail_metadata_value(metadata, "snippet"),
+                "body": _gmail_inbox_body(metadata),
+                "reply_type": _gmail_metadata_value(metadata, "reply_type"),
+                "match_reason": _gmail_metadata_value(metadata, "match_reason"),
+                "referral_id": referral_id,
+                "created_at": iso_or_none(document.created_at),
+                "updated_at": iso_or_none(document.updated_at),
+            }
+        )
+    return messages
+
+
+def gmail_referral_workflow_input(
+    session: Session,
+    *,
+    document_id: str,
+    tenant_id: str,
+) -> dict[str, Any]:
+    document = session.get(Document, document_id)
+    if document is None:
+        raise KeyError(f"Unknown inbound email document: {document_id}")
+    if document.tenant_id != tenant_id:
+        raise ValueError("Inbound email document does not match the tenant.")
+    if document.document_type != "inbound_email_unmatched":
+        raise ValueError("Inbound email document is not eligible for conversion.")
+
+    metadata = dict(document.metadata_json or {})
+    referral_id = _gmail_metadata_value(metadata, "referral_id")
+    if referral_id:
+        referral = session.get(Referral, referral_id)
+        return {
+            "status": "already_converted",
+            "referral_id": referral_id,
+            "job_id": _gmail_metadata_value(metadata, "workflow_job_id"),
+            "referral": referral_summary(referral) if referral else None,
+            "document": document_to_dict(document),
+        }
+
+    sender = _gmail_metadata_value(metadata, "sender_email") or _gmail_metadata_value(metadata, "from") or ""
+    subject = _gmail_metadata_value(metadata, "subject") or document.title or "Email referral"
+    body = _gmail_inbox_body(metadata)
+    if not body.strip():
+        raise ValueError("Inbound email is missing a usable body.")
+
+    raw_text = _email_referral_raw_text(sender=sender, subject=subject, body=body)
+    return {
+        "status": "ready",
+        "document": document_to_dict(document),
+        "raw_input": {
+            "source_channel": "email",
+            "raw_text": raw_text,
+            "sender": sender,
+            "subject": subject,
+            "contact_email": _extract_email_address(sender),
+            "gmail_message_id": _gmail_metadata_value(metadata, "gmail_message_id")
+            or _gmail_message_id_from_storage(document.storage_uri),
+            "gmail_thread_id": _gmail_metadata_value(metadata, "gmail_thread_id"),
+            "inbound_document_id": document.id,
+        },
+    }
+
+
+def mark_inbound_gmail_referral_workflow_started(
+    session: Session,
+    *,
+    document_id: str,
+    tenant_id: str,
+    referral_id: str | None,
+    job_id: str,
+    actor_user_id: str | None = DEMO_USER_ID,
+) -> dict[str, Any]:
+    document = session.get(Document, document_id)
+    if document is None:
+        raise KeyError(f"Unknown inbound email document: {document_id}")
+    if document.tenant_id != tenant_id:
+        raise ValueError("Inbound email document does not match the tenant.")
+    metadata = dict(document.metadata_json or {})
+    metadata.update(
+        {
+            "referral_id": referral_id,
+            "workflow_job_id": job_id,
+            "converted_to_referral": True,
+            "converted_at": iso_or_none(utc_now()),
+        }
+    )
+    document.metadata_json = json_safe(metadata)
+    document.updated_at = utc_now()
+    write_audit(
+        session,
+        tenant_id=document.tenant_id,
+        actor_user_id=actor_user_id if session.get(User, actor_user_id or "") else None,
+        action="start_inbound_email_workflow",
+        entity_type="document",
+        entity_id=document.id,
+        after=document_to_dict(document),
+    )
+    return document_to_dict(document)
+
+
+def convert_inbound_gmail_to_referral(
+    session: Session,
+    *,
+    document_id: str,
+    tenant_id: str,
+    actor_user_id: str | None = DEMO_USER_ID,
+) -> dict[str, Any]:
+    document = session.get(Document, document_id)
+    if document is None:
+        raise KeyError(f"Unknown inbound email document: {document_id}")
+    if document.tenant_id != tenant_id:
+        raise ValueError("Inbound email document does not match the tenant.")
+    if document.document_type != "inbound_email_unmatched":
+        raise ValueError("Inbound email document is not eligible for conversion.")
+
+    metadata = dict(document.metadata_json or {})
+    referral_id = _gmail_metadata_value(metadata, "referral_id")
+    if referral_id:
+        referral = session.get(Referral, referral_id)
+        return {"referral": referral_summary(referral) if referral else None, "document": document_to_dict(document)}
+
+    sender = _gmail_metadata_value(metadata, "sender_email") or _gmail_metadata_value(metadata, "from") or ""
+    subject = _gmail_metadata_value(metadata, "subject") or document.title or "Email referral"
+    body = _gmail_inbox_body(metadata)
+    if not body.strip():
+        raise ValueError("Inbound email is missing a usable body.")
+
+    result = create_email_referral(
+        session,
+        tenant_id=tenant_id,
+        sender=sender,
+        subject=subject,
+        body=body,
+        actor_user_id=actor_user_id,
+    )
+    metadata.update(
+        {
+            "referral_id": result["referral"]["id"],
+            "converted_to_referral": True,
+            "converted_at": iso_or_none(utc_now()),
+        }
+    )
+    document.metadata_json = json_safe(metadata)
+    document.updated_at = utc_now()
+    write_audit(
+        session,
+        tenant_id=document.tenant_id,
+        actor_user_id=actor_user_id if session.get(User, actor_user_id or "") else None,
+        action="convert_inbound_email",
+        entity_type="document",
+        entity_id=document.id,
+        after=document_to_dict(document),
+    )
+    return {"referral": result["referral"], "document": document_to_dict(document)}
+
+
+def _gmail_message_id_from_storage(storage_uri: str | None) -> str | None:
+    if not storage_uri:
+        return None
+    if storage_uri.startswith(INBOUND_GMAIL_STORAGE_PREFIX):
+        return storage_uri[len(INBOUND_GMAIL_STORAGE_PREFIX) :]
+    return None
+
+
+def _gmail_metadata_value(metadata: dict[str, Any], key: str) -> Any:
+    if not metadata:
+        return None
+    value = metadata.get(key)
+    if value not in (None, ""):
+        return value
+    source_metadata = metadata.get("source_metadata") if isinstance(metadata.get("source_metadata"), dict) else {}
+    return source_metadata.get(key)
+
+
+def _gmail_inbox_body(metadata: dict[str, Any]) -> str:
+    if not metadata:
+        return ""
+    source_metadata = metadata.get("source_metadata") if isinstance(metadata.get("source_metadata"), dict) else {}
+    return (
+        metadata.get("notes")
+        or metadata.get("body")
+        or source_metadata.get("notes")
+        or source_metadata.get("body")
+        or metadata.get("snippet")
+        or source_metadata.get("snippet")
+        or ""
+    )
 
 
 def _gmail_storage_uri(message_id: str) -> str:
@@ -2344,21 +4022,27 @@ def draft_first_contact_message(
     )
     if not appointments:
         raise ValueError("First-contact draft requires proposed appointment slots.")
-    slot_lines = [
-        f"- {iso_or_none(appointment.starts_at)} to {iso_or_none(appointment.ends_at)}"
-        for appointment in appointments[:3]
-    ]
+    slot_lines = []
+    for index, appointment in enumerate(appointments[:3], start=1):
+        code = _appointment_choice_code(appointment.id)
+        slot_lines.append(
+            f"- Option {index} (code {code}): {iso_or_none(appointment.starts_at)} to {iso_or_none(appointment.ends_at)}"
+        )
+    missing_lines = [f"- {field.replace('_', ' ')}" for field in (referral.missing_fields or [])]
+    missing_section = ["", "Before we can confirm, please provide:", *missing_lines] if missing_lines else []
     note_lines = ["", "Clinic note:", note.strip()] if note.strip() else []
     body = "\n".join(
         [
             f"Hello {referral.patient_name or patient.display_name or 'there'},",
             "",
-            "We have reviewed your referral and can offer the following first-session options:",
+            "We have tentatively held the following appointment time based on current availability:",
             "",
             *slot_lines,
+            *missing_section,
             *note_lines,
             "",
-            "Please reply with the option that works best. This prototype records replies manually or through simulation.",
+            "Please reply with the option number or code to confirm that you can attend this date and time.",
+            "If this time does not work, reply with a few alternative times that do.",
         ]
     )
     draft = CommunicationDraft(
@@ -2429,14 +4113,29 @@ def draft_intake_packet(
     if workspace["status"] == "not_started":
         workspace = start_intake_for_referral(session, referral_id, template_id)
     patient = _ensure_patient_for_referral(session, referral)
+    template = session.get(IntakeTemplate, template_id) if template_id else None
+    if template is None:
+        item_template_id = next((item.get("template_id") for item in workspace["items"] if item.get("template_id")), None)
+        template = session.get(IntakeTemplate, item_template_id) if item_template_id else None
+    if template is None and workspace.get("template"):
+        template = session.get(IntakeTemplate, workspace["template"]["id"])
+    attachment_state = _intake_template_attachment_state(session, template)
     item_lines = [f"- {item['label']}" for item in workspace["items"] if not _intake_done(item["status"])]
     consent_lines = [f"- {consent['scope'].replace('_', ' ')} consent" for consent in workspace["consents"] if not _intake_done(consent["status"])]
+    attachment_lines = [
+        f"- {item['item_label']}: {item['file_name']}"
+        for item in attachment_state["outbound_attachment_manifest"]
+    ]
     note_lines = ["", "Clinic note:", note.strip()] if note.strip() else []
     body = "\n".join(
         [
             f"Hello {referral.patient_name or patient.display_name or 'there'},",
             "",
-            "Before your first session, please complete the intake items below.",
+            "Before your first session, please complete the attached intake files and reply to this same email thread with the completed files attached.",
+            "For this demo, you can attach the mock intake files directly as TXT, PDF, DOCX, CSV, XLSX, or JSON files.",
+            "",
+            "Attached blank files:",
+            *(attachment_lines or ["- Clinic staff will provide any required blank files separately."]),
             "",
             "Required forms and documents:",
             *(item_lines or ["- No document checklist items are outstanding."]),
@@ -2444,6 +4143,8 @@ def draft_intake_packet(
             "Required consents:",
             *(consent_lines or ["- No consent records are outstanding."]),
             *note_lines,
+            "",
+            "Once we receive the attachments, clinic staff will review them and confirm that your referral is ready for the first session.",
             "",
             "This intake packet is a draft and must be approved by clinic staff before sending.",
         ]
@@ -2463,6 +4164,13 @@ def draft_intake_packet(
     )
     session.add(draft)
     session.flush()
+    draft_payload = {
+        **communication_draft_to_dict(draft),
+        "intake_template_id": template.id if template else None,
+        "outbound_attachment_manifest": attachment_state["outbound_attachment_manifest"],
+        "missing_template_files": attachment_state["missing_template_files"],
+        "sent_attachment_records": [],
+    }
     referral.communication_draft_id = draft.id
     write_audit(
         session,
@@ -2481,10 +4189,10 @@ def draft_intake_packet(
         task_type="send_approval",
         reason="Intake packet requires staff approval before simulated/manual send.",
         payload_key=f"intake_packet_draft:{draft.id[:8]}",
-        source_payload=communication_draft_to_dict(draft),
+        source_payload=json_safe(draft_payload),
         draft_text=draft.body,
     )
-    return communication_draft_to_dict(draft)
+    return draft_payload
 
 
 def list_intake_tracker(session: Session, tenant_id: str | None = None) -> list[dict[str, Any]]:
@@ -2542,6 +4250,10 @@ def apply_review_action(
     final_text: str | None = None,
     rejection_reason: str | None = None,
     reviewer_id: str | None = DEMO_USER_ID,
+    document_id: str | None = None,
+    intake_item_id: str | None = None,
+    consent_id: str | None = None,
+    questionnaire_name: str | None = None,
 ) -> HumanReviewTask:
     task = session.get(HumanReviewTask, task_id)
     if task is None:
@@ -2553,6 +4265,12 @@ def apply_review_action(
     task.updated_at = utc_now()
 
     referral = session.get(Referral, task.referral_id) if task.referral_id else None
+    if action == "approve" and referral and task.task_type == "send_approval":
+        blocker = _slot_contact_send_blocker(session, task, referral)
+        if blocker:
+            _record_task_provider_failure(session, task, blocker)
+            return task
+
     if action == "approve" and referral and google_workspace.is_enabled():
         if task.task_type in GMAIL_APPROVAL_TASK_TYPES:
             if not _prepare_google_send_approval(session, task, referral, final_text or task.draft_text):
@@ -2634,6 +4352,15 @@ def apply_review_action(
                 _approve_appointment_reschedule(session, task, referral)
             elif action == "approve" and task.task_type == "intake_exception_approval":
                 _approve_intake_exception(session, task)
+            elif action == "approve" and task.task_type == "intake_submission_review":
+                _approve_intake_submission_review(
+                    session,
+                    task,
+                    document_id=document_id,
+                    intake_item_id=intake_item_id,
+                    consent_id=consent_id,
+                    questionnaire_name=questionnaire_name,
+                )
             elif action == "escalate":
                 transition_referral_status(
                     session,
@@ -2855,12 +4582,49 @@ def _prepare_google_send_approval(
         _clear_task_provider_error(task)
         return True
 
+    send_attachments: list[dict[str, Any]] | None = None
+    intake_manifest: list[dict[str, Any]] = []
+    if _is_intake_packet_send_task(task):
+        attachment_state = _intake_packet_attachment_state_for_task(session, task, referral)
+        intake_manifest = attachment_state["outbound_attachment_manifest"]
+        task.source_payload = json_safe(
+            {
+                **(task.source_payload if isinstance(task.source_payload, dict) else {}),
+                "intake_template_id": attachment_state.get("template_id"),
+                "outbound_attachment_manifest": intake_manifest,
+                "missing_template_files": attachment_state["missing_template_files"],
+                "sent_attachment_records": [],
+            }
+        )
+        if attachment_state["missing_template_files"]:
+            labels = ", ".join(item["item_label"] for item in attachment_state["missing_template_files"])
+            error = f"Intake packet is missing required blank template files: {labels}. Upload the missing files and retry send approval."
+            draft.last_provider_error = error
+            draft.updated_at = utc_now()
+            _record_task_provider_failure(session, task, error, entity_type="communication_draft", entity_id=draft.id)
+            return False
+        send_attachments, attachment_errors = _load_manifest_attachments(intake_manifest)
+        if attachment_errors:
+            labels = ", ".join(item["item_label"] for item in attachment_errors)
+            error = f"Intake packet attachment files are missing from local storage: {labels}. Re-upload the missing files and retry send approval."
+            draft.last_provider_error = error
+            draft.updated_at = utc_now()
+            task.source_payload = json_safe(
+                {
+                    **(task.source_payload if isinstance(task.source_payload, dict) else {}),
+                    "missing_template_files": attachment_errors,
+                }
+            )
+            _record_task_provider_failure(session, task, error, entity_type="communication_draft", entity_id=draft.id)
+            return False
+
     before = communication_draft_to_dict(draft)
     try:
         result = google_workspace.send_approved_draft(
             recipient_email=recipient_email,
             subject=draft.subject,
             body=draft.body,
+            attachments=send_attachments,
         )
         message_id = str(result.get("message_id") or "").strip()
         if not message_id:
@@ -2882,6 +4646,25 @@ def _prepare_google_send_approval(
     draft.gmail_message_id = message_id
     draft.gmail_thread_id = str(result.get("thread_id") or "").strip() or None
     draft.last_provider_error = None
+    if _is_intake_packet_send_task(task):
+        sent_at = utc_now()
+        sent_records = [
+            {
+                **item,
+                "gmail_message_id": message_id,
+                "gmail_thread_id": draft.gmail_thread_id,
+                "sent_at": iso_or_none(sent_at),
+            }
+            for item in intake_manifest
+        ]
+        task.source_payload = json_safe(
+            {
+                **(task.source_payload if isinstance(task.source_payload, dict) else {}),
+                "outbound_attachment_manifest": intake_manifest,
+                "missing_template_files": [],
+                "sent_attachment_records": sent_records,
+            }
+        )
     _clear_task_provider_error(task)
     write_audit(
         session,
@@ -2894,6 +4677,59 @@ def _prepare_google_send_approval(
         after=communication_draft_to_dict(draft),
     )
     return True
+
+
+def _is_intake_packet_send_task(task: HumanReviewTask) -> bool:
+    return task.task_type == "send_approval" and str(task.payload_key or "").startswith("intake_packet_draft")
+
+
+def _intake_packet_attachment_state_for_task(
+    session: Session,
+    task: HumanReviewTask,
+    referral: Referral,
+) -> dict[str, Any]:
+    payload = task.source_payload if isinstance(task.source_payload, dict) else {}
+    template_id = str(payload.get("intake_template_id") or "").strip()
+    template = session.get(IntakeTemplate, template_id) if template_id else None
+    if template is None:
+        item = session.scalar(
+            select(IntakeChecklistItem)
+            .where(IntakeChecklistItem.referral_id == referral.id, IntakeChecklistItem.template_id.is_not(None))
+            .order_by(IntakeChecklistItem.created_at)
+        )
+        template = session.get(IntakeTemplate, item.template_id) if item and item.template_id else None
+    if template is None:
+        template = _select_intake_template(session, referral, None)
+    return _intake_template_attachment_state(session, template)
+
+
+def _load_manifest_attachments(
+    manifest: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    attachments: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for item in manifest:
+        path = _local_document_path(str(item.get("storage_uri") or ""))
+        if path is None or not path.exists() or not path.is_file():
+            errors.append(
+                {
+                    **item,
+                    "required": True,
+                    "reason": "The active template file is missing from local storage.",
+                }
+            )
+            continue
+        attachments.append(
+            {
+                "document_id": item.get("document_id"),
+                "item_key": item.get("item_key"),
+                "item_label": item.get("item_label"),
+                "file_name": item.get("file_name") or path.name,
+                "content_type": item.get("mime_type") or "application/octet-stream",
+                "content": path.read_bytes(),
+            }
+        )
+    return attachments, errors
 
 
 def _prepare_google_appointment_confirmation(session: Session, task: HumanReviewTask, referral: Referral) -> bool:
@@ -3117,6 +4953,35 @@ def _draft_for_review_task(session: Session, task: HumanReviewTask) -> Communica
     return draft
 
 
+def _slot_contact_send_blocker(session: Session, task: HumanReviewTask, referral: Referral) -> str | None:
+    draft = _draft_for_review_task(session, task)
+    if draft is None or not draft.proposed_slots:
+        return None
+    match_approved = bool(
+        session.scalar(
+            select(HumanReviewTask.id).where(
+                HumanReviewTask.referral_id == referral.id,
+                HumanReviewTask.task_type == "match_approval",
+                HumanReviewTask.status == "approved",
+            )
+        )
+    )
+    slot_approved = bool(
+        session.scalar(
+            select(HumanReviewTask.id).where(
+                HumanReviewTask.referral_id == referral.id,
+                HumanReviewTask.task_type == "slot_offer_approval",
+                HumanReviewTask.status == "approved",
+            )
+        )
+    )
+    if not match_approved:
+        return "Patient contact cannot be sent until the therapist match is approved."
+    if not slot_approved:
+        return "Patient contact cannot be sent until the held appointment slot is approved."
+    return None
+
+
 def _appointment_for_confirmation_task(session: Session, task: HumanReviewTask) -> Appointment | None:
     payload = task.source_payload if isinstance(task.source_payload, dict) else {}
     appointment_id = str(payload.get("appointment_id") or "").strip()
@@ -3231,6 +5096,191 @@ def _approve_intake_exception(session: Session, task: HumanReviewTask) -> None:
     raise ValueError("Unsupported intake exception task target.")
 
 
+def _approve_intake_submission_review(
+    session: Session,
+    task: HumanReviewTask,
+    *,
+    document_id: str | None,
+    intake_item_id: str | None,
+    consent_id: str | None,
+    questionnaire_name: str | None,
+) -> None:
+    referral = session.get(Referral, task.referral_id) if task.referral_id else None
+    if referral is None:
+        raise KeyError("Intake submission review task is not linked to a referral.")
+    payload = task.source_payload if isinstance(task.source_payload, dict) else {}
+    candidate_document_id = (
+        document_id
+        or payload.get("document_id")
+        or next(iter(payload.get("document_ids") or []), None)
+    )
+    if not candidate_document_id:
+        task.source_payload = json_safe(
+            {
+                **payload,
+                "review_outcome": "reviewed_without_usable_attachment",
+                "reviewed_at": iso_or_none(utc_now()),
+            }
+        )
+        return
+    if not intake_item_id and not consent_id:
+        raise ValueError("Select an intake item, consent record, or questionnaire before approving this submission.")
+
+    document = session.get(Document, str(candidate_document_id))
+    if document is None:
+        raise KeyError("Selected intake document was not found.")
+    metadata = document.metadata_json or {}
+    if metadata.get("referral_id") != referral.id:
+        raise ValueError("Selected intake document does not belong to this referral.")
+
+    completed: list[dict[str, str]] = []
+    if intake_item_id:
+        item = _complete_intake_item_from_document(session, referral, document, intake_item_id)
+        completed.append({"type": "intake_item", "id": item.id, "label": item.label})
+        if item.item_type == "questionnaire":
+            _maybe_save_questionnaire_from_document(session, referral, document, item, questionnaire_name)
+    if consent_id:
+        consent = _complete_consent_from_document(session, referral, document, consent_id)
+        completed.append({"type": "consent", "id": consent.id, "scope": consent.scope})
+
+    before_document = document_to_dict(document)
+    document.metadata_json = json_safe(
+        {
+            **metadata,
+            "linked_intake_item_id": intake_item_id,
+            "linked_consent_id": consent_id,
+            "questionnaire_name": questionnaire_name,
+            "review_task_id": task.id,
+            "review_outcome": "approved",
+        }
+    )
+    document.updated_at = utc_now()
+    task.source_payload = json_safe(
+        {
+            **payload,
+            "selected_document_id": document.id,
+            "selected_intake_item_id": intake_item_id,
+            "selected_consent_id": consent_id,
+            "questionnaire_name": questionnaire_name,
+            "completed": completed,
+        }
+    )
+    write_audit(
+        session,
+        tenant_id=referral.tenant_id,
+        actor_user_id=task.reviewer_id,
+        action="map_intake_submission",
+        entity_type="document",
+        entity_id=document.id,
+        before=before_document,
+        after=document_to_dict(document),
+    )
+    _refresh_referral_intake_status(session, referral.id)
+
+
+def _complete_intake_item_from_document(
+    session: Session,
+    referral: Referral,
+    document: Document,
+    item_id: str,
+) -> IntakeChecklistItem:
+    item = session.get(IntakeChecklistItem, item_id)
+    if item is None:
+        raise KeyError("Selected intake checklist item was not found.")
+    if item.tenant_id != referral.tenant_id or item.referral_id != referral.id:
+        raise ValueError("Selected intake item does not belong to this referral.")
+    before = intake_item_to_dict(item)
+    item.source_document_id = document.id
+    item.status = "completed"
+    item.completed_at = utc_now()
+    item.notes = f"Completed from intake submission: {document.title}"
+    item.updated_at = utc_now()
+    write_audit(
+        session,
+        tenant_id=item.tenant_id,
+        action="complete_by_upload",
+        entity_type="intake_checklist_item",
+        entity_id=item.id,
+        before=before,
+        after=intake_item_to_dict(item),
+    )
+    if item.item_type == "consent":
+        _complete_matching_consent_for_item(session, item, document.id)
+    return item
+
+
+def _complete_consent_from_document(
+    session: Session,
+    referral: Referral,
+    document: Document,
+    consent_id: str,
+) -> ConsentRecord:
+    consent = session.get(ConsentRecord, consent_id)
+    if consent is None:
+        raise KeyError("Selected consent record was not found.")
+    if consent.tenant_id != referral.tenant_id or consent.patient_id != referral.patient_id:
+        raise ValueError("Selected consent record does not belong to this referral.")
+    before = consent_record_to_dict(consent)
+    consent.status = "completed"
+    consent.source_document_id = document.id
+    consent.updated_at = utc_now()
+    scope = _normal(consent.scope)
+    for item in session.scalars(
+        select(IntakeChecklistItem).where(
+            IntakeChecklistItem.tenant_id == referral.tenant_id,
+            IntakeChecklistItem.referral_id == referral.id,
+            IntakeChecklistItem.patient_id == consent.patient_id,
+            IntakeChecklistItem.item_type == "consent",
+        )
+    ):
+        if _intake_done(item.status):
+            continue
+        item_key = _normal(item.item_key)
+        item_label = _normal(item.label)
+        if scope and (scope in item_key or scope in item_label or item_key in scope):
+            item.source_document_id = document.id
+            item.status = "completed"
+            item.completed_at = utc_now()
+            item.notes = f"Completed from consent submission: {document.title}"
+            item.updated_at = utc_now()
+    write_audit(
+        session,
+        tenant_id=consent.tenant_id,
+        action="complete_by_upload",
+        entity_type="consent_record",
+        entity_id=consent.id,
+        before=before,
+        after=consent_record_to_dict(consent),
+    )
+    return consent
+
+
+def _maybe_save_questionnaire_from_document(
+    session: Session,
+    referral: Referral,
+    document: Document,
+    item: IntakeChecklistItem,
+    questionnaire_name: str | None,
+) -> None:
+    metadata = document.metadata_json or {}
+    extracted_text = str(metadata.get("extracted_text") or "").strip()
+    if not extracted_text:
+        return
+    try:
+        payload = json.loads(extracted_text)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(payload, dict):
+        return
+    answers = payload.get("answers") if isinstance(payload.get("answers"), dict) else None
+    if answers is None and all(isinstance(key, str) for key in payload.keys()):
+        answers = payload
+    if not isinstance(answers, dict) or not answers:
+        return
+    name = str(questionnaire_name or payload.get("questionnaire_name") or payload.get("name") or item.item_key).strip()
+    save_questionnaire_response(session, referral.id, name or "intake_questionnaire", answers)
+
+
 def list_therapists(session: Session, tenant_id: str | None = None) -> list[dict[str, Any]]:
     query = select(Therapist).order_by(Therapist.name)
     if tenant_id:
@@ -3326,11 +5376,17 @@ def therapist_facts_for_tenant(session: Session, tenant_id: str) -> list[dict[st
     ]
 
 
-def deterministic_match_for_referral(session: Session, referral_id: str) -> dict[str, Any]:
+def deterministic_match_for_referral(
+    session: Session,
+    referral_id: str,
+    *,
+    allow_noncritical_missing: bool = False,
+) -> dict[str, Any]:
     referral = session.get(Referral, referral_id)
     if referral is None:
         raise KeyError(f"Unknown referral: {referral_id}")
-    if referral.missing_fields:
+    blocking_missing = _matching_blocking_missing_fields(referral) if allow_noncritical_missing else list(referral.missing_fields or [])
+    if blocking_missing:
         raise ValueError("Missing information must be resolved before matching.")
     if referral.duplicate_candidates:
         raise ValueError("Duplicate candidates must be resolved before matching.")
@@ -3382,7 +5438,7 @@ def deterministic_match_for_referral(session: Session, referral_id: str) -> dict
         entity_id=referral.id,
         after=referral_summary(referral),
     )
-    if included:
+    if included and not _review_task_exists(session, referral.id, "match_approval", statuses=("open", "approved")):
         create_review_task(
             session,
             tenant_id=referral.tenant_id,
@@ -3402,6 +5458,7 @@ def propose_appointment_slots(
     referral_id: str,
     therapist_id: str | None = None,
     limit: int = 3,
+    availability_text: str | None = None,
 ) -> list[dict[str, Any]]:
     referral = session.get(Referral, referral_id)
     if referral is None:
@@ -3422,6 +5479,8 @@ def propose_appointment_slots(
     search_start = utc_now()
     search_end = search_start + timedelta(days=29)
     google_busy = _google_busy_intervals_for_slot_proposal(search_start, search_end) if google_workspace.is_enabled() else []
+    availability_source = "\n".join(part for part in [referral.raw_text or "", availability_text or ""] if part.strip())
+    availability = _patient_availability_constraints(availability_source)
     proposals = []
     existing = list(
         session.scalars(
@@ -3434,6 +5493,13 @@ def propose_appointment_slots(
         )
     )
     for appointment in existing:
+        if (
+            availability
+            and appointment.starts_at
+            and appointment.ends_at
+            and not _slot_matches_patient_availability(appointment.starts_at, appointment.ends_at, availability)
+        ):
+            continue
         if appointment.starts_at and appointment.ends_at and _overlaps_busy(appointment.starts_at, _with_session_buffer(appointment.ends_at), google_busy):
             continue
         if appointment.starts_at and appointment.ends_at and not _therapist_has_weekly_capacity(
@@ -3452,6 +5518,8 @@ def propose_appointment_slots(
         for starts_at, ends_at, block in _generate_slots(therapist.availability_blocks, limit * 16):
             if len(proposals) >= limit:
                 break
+            if availability and not _slot_matches_patient_availability(starts_at, ends_at, availability):
+                continue
             if _appointment_conflicts(session, therapist.id, starts_at, ends_at):
                 continue
             if _overlaps_busy(starts_at, _with_session_buffer(ends_at), google_busy):
@@ -3486,17 +5554,18 @@ def propose_appointment_slots(
             "slot_options_ready",
             reason="Appointment slot options generated from therapist availability.",
         )
-        create_review_task(
-            session,
-            tenant_id=referral.tenant_id,
-            workflow_run_id=referral.workflow_run_id,
-            referral_id=referral.id,
-            patient_id=referral.patient_id,
-            task_type="slot_offer_approval",
-            reason="Proposed appointment slots require admin approval before being offered to the patient.",
-            payload_key="slot_options",
-            source_payload={"appointments": proposals},
-        )
+        if not _review_task_exists(session, referral.id, "slot_offer_approval", statuses=("open", "approved")):
+            create_review_task(
+                session,
+                tenant_id=referral.tenant_id,
+                workflow_run_id=referral.workflow_run_id,
+                referral_id=referral.id,
+                patient_id=referral.patient_id,
+                task_type="slot_offer_approval",
+                reason="Proposed appointment slots require admin approval before being offered to the patient.",
+                payload_key="slot_options",
+                source_payload={"appointments": proposals},
+            )
     return proposals
 
 
@@ -3746,7 +5815,99 @@ def list_intake_templates(session: Session, tenant_id: str | None = None) -> lis
     query = select(IntakeTemplate).order_by(IntakeTemplate.name)
     if tenant_id:
         query = query.where(IntakeTemplate.tenant_id == tenant_id)
-    return [intake_template_to_dict(template) for template in session.scalars(query)]
+    return [
+        intake_template_to_dict(template, attachment_state=_intake_template_attachment_state(session, template))
+        for template in session.scalars(query)
+    ]
+
+
+def create_intake_template_file(
+    session: Session,
+    *,
+    template_id: str,
+    item_key: str,
+    title: str,
+    storage_uri: str,
+    metadata: dict[str, Any],
+    actor_user_id: str | None = None,
+) -> dict[str, Any]:
+    template = session.get(IntakeTemplate, template_id)
+    if template is None:
+        raise KeyError(f"Unknown intake template: {template_id}")
+    spec = _intake_template_item_spec(template, item_key)
+    if spec is None:
+        raise ValueError("Intake template item was not found.")
+    key = _intake_template_item_key(spec)
+    previous_document_id: str | None = None
+    for document in _intake_template_file_documents(session, template):
+        document_metadata = dict(document.metadata_json or {})
+        if document_metadata.get("item_key") != key or not document_metadata.get("active"):
+            continue
+        previous_document_id = document.id
+        document.metadata_json = json_safe(
+            {
+                **document_metadata,
+                "active": False,
+                "replaced_at": iso_or_none(utc_now()),
+            }
+        )
+        document.updated_at = utc_now()
+
+    file_name = str(metadata.get("file_name") or title or "intake-template-file").strip()
+    document = Document(
+        tenant_id=template.tenant_id,
+        patient_id=None,
+        document_type=INTAKE_TEMPLATE_FILE_DOCUMENT_TYPE,
+        title=file_name,
+        storage_uri=storage_uri,
+        metadata_json=json_safe(
+            {
+                **metadata,
+                "template_id": template.id,
+                "template_name": template.name,
+                "item_key": key,
+                "item_label": str(spec.get("label") or key.replace("_", " ").title()),
+                "item_type": str(spec.get("type") or "form"),
+                "filename": file_name,
+                "mime_type": metadata.get("content_type") or metadata.get("mime_type"),
+                "checksum": metadata.get("sha256") or metadata.get("checksum"),
+                "storage_path": storage_uri,
+                "active": True,
+                "previous_document_id": previous_document_id,
+            }
+        ),
+    )
+    session.add(document)
+    session.flush()
+    write_audit(
+        session,
+        tenant_id=template.tenant_id,
+        actor_user_id=actor_user_id,
+        action="upload_intake_template_file",
+        entity_type="document",
+        entity_id=document.id,
+        before={"previous_document_id": previous_document_id} if previous_document_id else None,
+        after=document_to_dict(document),
+    )
+    return document_to_dict(document)
+
+
+def document_download_info(session: Session, document_id: str) -> dict[str, Any]:
+    document = session.get(Document, document_id)
+    if document is None:
+        raise KeyError(f"Unknown document: {document_id}")
+    path = _local_document_path(document.storage_uri)
+    if path is None:
+        raise ValueError("Document is not backed by a downloadable local file.")
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError("Document file is missing from local storage.")
+    metadata = document.metadata_json or {}
+    return {
+        "document": document_to_dict(document),
+        "path": path,
+        "file_name": str(metadata.get("file_name") or metadata.get("filename") or document.title or "document"),
+        "media_type": str(metadata.get("content_type") or metadata.get("mime_type") or "application/octet-stream"),
+    }
 
 
 def create_referral_document(
@@ -3912,6 +6073,10 @@ def intake_workspace(session: Session, referral_id: str) -> dict[str, Any]:
             .order_by(IntakeChecklistItem.created_at)
         )
     )
+    item_template_id = next((item.template_id for item in items if item.template_id), None)
+    if item_template_id:
+        template = session.get(IntakeTemplate, item_template_id) or template
+    attachment_state = _intake_template_attachment_state(session, template)
     responses = list(
         session.scalars(
             select(QuestionnaireResponse)
@@ -3954,12 +6119,25 @@ def intake_workspace(session: Session, referral_id: str) -> dict[str, Any]:
         ]
     return {
         "referral": referral_summary(referral),
-        "template": intake_template_to_dict(template) if template else None,
+        "template": intake_template_to_dict(template, attachment_state=attachment_state) if template else None,
+        "outbound_attachment_manifest": attachment_state["outbound_attachment_manifest"],
+        "missing_template_files": attachment_state["missing_template_files"],
         "items": [intake_item_to_dict(item) for item in items],
         "consents": [consent_record_to_dict(consent) for consent in consents],
         "questionnaires": [questionnaire_response_to_dict(response) for response in responses],
         "documents": [document_to_dict(document) for document in documents],
-        "communication_drafts": [communication_draft_to_dict(draft) for draft in drafts],
+        "communication_drafts": [_intake_communication_draft_to_dict(session, draft) for draft in drafts],
+        "intake_submission_reviews": [
+            review_task_to_dict(task)
+            for task in session.scalars(
+                select(HumanReviewTask)
+                .where(
+                    HumanReviewTask.referral_id == referral.id,
+                    HumanReviewTask.task_type == "intake_submission_review",
+                )
+                .order_by(HumanReviewTask.created_at.desc())
+            )
+        ],
         "prep_briefs": [prep_brief_to_dict(brief) for brief in briefs],
         "status": _intake_status(items, consents),
     }
@@ -4756,6 +6934,11 @@ def update_referral_from_result(session: Session, run: WorkflowRun) -> None:
     referral.insurer = referral_output.get("insurer") or referral.insurer
     referral.referring_entity = referral_output.get("referring_entity") or referral.referring_entity
     referral.duplicate_candidates = [str(item) for item in referral_output.get("dedupe_candidates") or referral.duplicate_candidates]
+    raw_input = (run.request_payload or {}).get("raw_input") if isinstance(run.request_payload, dict) else {}
+    source_channel = str((raw_input or {}).get("source_channel") or referral.source_channel or "").strip().lower()
+    if source_channel == "email":
+        _apply_deterministic_email_referral_facts(session, referral, raw_input=raw_input or None)
+        _clear_email_demo_duplicate_candidates(session, referral)
 
     signals = outputs.get("clinical_signals") or {}
     referral.language_preference = signals.get("language_preference") or referral.language_preference
@@ -4861,6 +7044,10 @@ def _linked_communication_draft_payload(session: Session, run: WorkflowRun, sour
 def approval_payload_for_task(session: Session, task: HumanReviewTask) -> dict[str, Any] | None:
     if not task.workflow_run_id:
         return None
+    if task.task_type == "match_approval" and task.referral_id:
+        referral = session.get(Referral, task.referral_id)
+        if referral and referral.source_channel == "email" and _existing_slot_contact_draft(session, referral):
+            return None
     run = session.get(WorkflowRun, task.workflow_run_id)
     if run is None:
         return None
@@ -5274,6 +7461,36 @@ def communication_draft_to_dict(draft: CommunicationDraft) -> dict[str, Any]:
     }
 
 
+def _intake_communication_draft_to_dict(session: Session, draft: CommunicationDraft) -> dict[str, Any]:
+    data = communication_draft_to_dict(draft)
+    if not draft.referral_id:
+        return data
+    tasks = list(
+        session.scalars(
+            select(HumanReviewTask)
+            .where(
+                HumanReviewTask.referral_id == draft.referral_id,
+                HumanReviewTask.task_type.in_(["send_approval", "intake_reminder_approval"]),
+            )
+            .order_by(HumanReviewTask.created_at.desc())
+        )
+    )
+    for task in tasks:
+        payload = task.source_payload if isinstance(task.source_payload, dict) else {}
+        if payload.get("id") != draft.id:
+            continue
+        for key in (
+            "outbound_attachment_manifest",
+            "missing_template_files",
+            "sent_attachment_records",
+            "provider_error",
+        ):
+            if key in payload:
+                data[key] = json_safe(payload.get(key))
+        break
+    return data
+
+
 def document_to_dict(document: Document) -> dict[str, Any]:
     return {
         "id": document.id,
@@ -5472,7 +7689,26 @@ def appointment_to_dict(appointment: Appointment) -> dict[str, Any]:
     }
 
 
-def intake_template_to_dict(template: IntakeTemplate) -> dict[str, Any]:
+def intake_template_to_dict(
+    template: IntakeTemplate,
+    *,
+    attachment_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    required_items = json_safe(template.required_items)
+    if attachment_state:
+        files_by_key = {
+            str(item.get("item_key") or ""): item
+            for item in attachment_state.get("template_files", [])
+            if isinstance(item, dict)
+        }
+        enriched_items = []
+        for item in required_items:
+            if not isinstance(item, dict):
+                enriched_items.append(item)
+                continue
+            key = str(item.get("key") or item.get("label") or "").strip()
+            enriched_items.append({**item, "template_file": files_by_key.get(key)})
+        required_items = enriched_items
     return {
         "id": template.id,
         "tenant_id": template.tenant_id,
@@ -5482,9 +7718,12 @@ def intake_template_to_dict(template: IntakeTemplate) -> dict[str, Any]:
         "age_band": template.age_band,
         "modality": template.modality,
         "source_channel": template.source_channel,
-        "required_items": json_safe(template.required_items),
+        "required_items": required_items,
         "questionnaire_schema": json_safe(template.questionnaire_schema),
         "active": template.active,
+        "template_files": json_safe((attachment_state or {}).get("template_files", [])),
+        "missing_template_files": json_safe((attachment_state or {}).get("missing_template_files", [])),
+        "outbound_attachment_manifest": json_safe((attachment_state or {}).get("outbound_attachment_manifest", [])),
         "created_at": iso_or_none(template.created_at),
         "updated_at": iso_or_none(template.updated_at),
     }
@@ -5860,6 +8099,123 @@ def _generate_slots(blocks: list[dict], max_candidates: int) -> list[tuple[datet
     return slots
 
 
+def _patient_availability_constraints(raw_text: str) -> dict[str, Any] | None:
+    text = str(raw_text or "").lower()
+    if not text.strip():
+        return None
+    weekdays = _extract_weekday_constraints(text)
+    windows = _extract_time_windows(text)
+    if not weekdays and not windows:
+        return None
+    return {"weekdays": sorted(weekdays), "windows": windows}
+
+
+def _extract_weekday_constraints(text: str) -> set[int]:
+    day_map = {
+        "monday": 0,
+        "mon": 0,
+        "tuesday": 1,
+        "tue": 1,
+        "wednesday": 2,
+        "wed": 2,
+        "thursday": 3,
+        "thu": 3,
+        "friday": 4,
+        "fri": 4,
+        "saturday": 5,
+        "sat": 5,
+        "sunday": 6,
+        "sun": 6,
+        "segunda": 0,
+        "terca": 1,
+        "quarta": 2,
+        "quinta": 3,
+        "sexta": 4,
+        "sabado": 5,
+        "domingo": 6,
+    }
+    tokens = re.findall(r"[a-z]+", text)
+    days = {day_map[token] for token in tokens if token in day_map}
+    if "weekday" in text or "weekdays" in text:
+        days.update({0, 1, 2, 3, 4})
+    if "weekend" in text or "weekends" in text:
+        days.update({5, 6})
+    return days
+
+
+def _extract_time_windows(text: str) -> list[tuple[int, int]]:
+    normalized = re.sub(r"(\d{1,2})h(\d{2})?", lambda m: f"{m.group(1)}:{m.group(2) or '00'}", text)
+    windows = []
+    keywords = {
+        "morning": (8 * 60, 12 * 60),
+        "afternoon": (12 * 60, 17 * 60),
+        "evening": (17 * 60, 21 * 60),
+        "manha": (8 * 60, 12 * 60),
+        "tarde": (12 * 60, 17 * 60),
+        "noite": (17 * 60, 21 * 60),
+    }
+    for key, window in keywords.items():
+        if key in normalized:
+            windows.append(window)
+
+    range_pattern = re.compile(
+        r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:-|to|until|through|thru|ate|as)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?"
+    )
+    for match in range_pattern.finditer(normalized):
+        start_ampm = match.group(3)
+        end_ampm = match.group(6) or start_ampm
+        start_minutes = _parse_clock_value(match.group(1), match.group(2), start_ampm)
+        end_minutes = _parse_clock_value(match.group(4), match.group(5), end_ampm)
+        if start_minutes is None or end_minutes is None:
+            continue
+        if end_minutes <= start_minutes:
+            continue
+        windows.append((start_minutes, end_minutes))
+
+    deduped = list(dict.fromkeys(windows))
+    return deduped
+
+
+def _parse_clock_value(hour_text: str, minute_text: str | None, ampm: str | None) -> int | None:
+    try:
+        hour = int(hour_text)
+        minute = int(minute_text or 0)
+    except ValueError:
+        return None
+    if hour < 0 or hour > 24 or minute < 0 or minute >= 60:
+        return None
+    if ampm:
+        ampm_clean = ampm.lower()
+        if ampm_clean == "pm" and hour < 12:
+            hour += 12
+        if ampm_clean == "am" and hour == 12:
+            hour = 0
+    if hour == 24:
+        hour = 0
+    return hour * 60 + minute
+
+
+def _slot_matches_patient_availability(
+    starts_at: datetime,
+    ends_at: datetime,
+    availability: dict[str, Any] | None,
+) -> bool:
+    if not availability:
+        return True
+    weekdays = availability.get("weekdays") or []
+    if weekdays and starts_at.weekday() not in weekdays:
+        return False
+    windows = availability.get("windows") or []
+    if not windows:
+        return True
+    start_minutes = starts_at.hour * 60 + starts_at.minute
+    end_minutes = ends_at.hour * 60 + ends_at.minute
+    for window_start, window_end in windows:
+        if start_minutes >= window_start and end_minutes <= window_end:
+            return True
+    return False
+
+
 def _appointment_conflicts(
     session: Session,
     therapist_id: str,
@@ -6087,7 +8443,10 @@ def _therapist_calendar_capacity_summary(
                 }
             )
 
-    last_sync = max((appointment.google_calendar_synced_at for appointment in appointments if appointment.google_calendar_synced_at), default=None)
+    last_sync = max(
+        (_aware_utc(appointment.google_calendar_synced_at) for appointment in appointments if appointment.google_calendar_synced_at),
+        default=None,
+    )
     available_slots = _available_slots_for_therapist(session, therapist, busy_periods, limit=8)
     status = "manual"
     if google_enabled:
@@ -6375,7 +8734,33 @@ def _clean_missing_info_updates(updates: dict[str, Any]) -> dict[str, str]:
         normalised_key = str(key or "").strip()
         text = str(value or "").strip()
         if normalised_key in allowed and text:
-            clean[normalised_key] = text
+            clean[normalised_key] = _validate_missing_info_update(normalised_key, text)
+    return clean
+
+
+def _validate_missing_info_update(key: str, value: str) -> str:
+    clean = str(value or "").strip()
+    placeholder_values = {"already captured", "captured", "same as above", "unknown", "tbc"}
+    if _normal(clean) in placeholder_values:
+        raise ValueError(f"{key.replace('_', ' ')} must contain the actual value, not '{clean}'.")
+    target = {"dob": "date_of_birth", "email": "contact_email", "phone": "contact_phone"}.get(key, key)
+    if target == "contact_email":
+        email = _extract_email_address(clean)
+        if not _is_valid_email(email):
+            raise ValueError("contact email must be a valid email address.")
+        return email or clean
+    if target == "date_of_birth":
+        parsed = _extract_date_of_birth(f"date of birth: {clean}")
+        if not parsed:
+            raise ValueError("date of birth must be a valid past date.")
+        return parsed
+    if target == "contact_phone":
+        digits = re.sub(r"\D", "", clean)
+        if len(digits) < 7:
+            raise ValueError("contact phone must include at least 7 digits.")
+        return clean
+    if target == "referring_entity" and _normal(clean) in {"none", "no", "n/a", "na", "self", "self referral", "self-referral"}:
+        return "Self-referral"
     return clean
 
 
@@ -6403,6 +8788,17 @@ def _remaining_missing_fields(existing: list[str], updates: dict[str, str]) -> l
         resolved.add("contact_phone_or_date_of_birth")
     remaining = [field for field in existing or [] if field not in resolved]
     return list(dict.fromkeys(remaining))
+
+
+def _matching_blocking_missing_fields(referral: Referral) -> list[str]:
+    missing = []
+    for field in referral.missing_fields or []:
+        clean = str(field or "").strip()
+        if clean and clean not in EMAIL_FOLLOWUP_NON_BLOCKING_MISSING_FIELDS:
+            missing.append(clean)
+    if not (referral.contact_email or referral.contact_phone) and "contact_email" not in missing:
+        missing.append("contact_email")
+    return list(dict.fromkeys(missing))
 
 
 def _next_admin_gate_status(referral: Referral) -> str:
@@ -6493,6 +8889,137 @@ def _select_intake_template(session: Session, referral: Referral, template_id: s
         return score
 
     return sorted(candidates, key=_score, reverse=True)[0]
+
+
+def _intake_template_item_key(spec: dict[str, Any]) -> str:
+    return str(spec.get("key") or spec.get("label") or "").strip()
+
+
+def _intake_template_item_spec(template: IntakeTemplate, item_key: str) -> dict[str, Any] | None:
+    wanted = str(item_key or "").strip()
+    for spec in template.required_items or []:
+        if not isinstance(spec, dict):
+            continue
+        key = _intake_template_item_key(spec)
+        if key == wanted:
+            return dict(spec)
+    return None
+
+
+def _intake_template_required_item_specs(template: IntakeTemplate) -> list[dict[str, Any]]:
+    specs: list[dict[str, Any]] = []
+    for spec in template.required_items or []:
+        if not isinstance(spec, dict):
+            continue
+        key = _intake_template_item_key(spec)
+        if key:
+            specs.append(dict(spec))
+    return specs
+
+
+def _intake_template_file_documents(session: Session, template: IntakeTemplate) -> list[Document]:
+    documents = list(
+        session.scalars(
+            select(Document)
+            .where(
+                Document.tenant_id == template.tenant_id,
+                Document.document_type == INTAKE_TEMPLATE_FILE_DOCUMENT_TYPE,
+            )
+            .order_by(Document.created_at.desc())
+        )
+    )
+    return [
+        document
+        for document in documents
+        if (document.metadata_json or {}).get("template_id") == template.id
+    ]
+
+
+def _active_intake_template_files_by_key(session: Session, template: IntakeTemplate) -> dict[str, Document]:
+    files_by_key: dict[str, Document] = {}
+    for document in _intake_template_file_documents(session, template):
+        metadata = document.metadata_json or {}
+        if not metadata.get("active"):
+            continue
+        key = str(metadata.get("item_key") or "").strip()
+        if key and key not in files_by_key:
+            files_by_key[key] = document
+    return files_by_key
+
+
+def _intake_template_attachment_state(session: Session, template: IntakeTemplate | None) -> dict[str, Any]:
+    if template is None:
+        return {
+            "template_files": [],
+            "missing_template_files": [],
+            "outbound_attachment_manifest": [],
+        }
+    files_by_key = _active_intake_template_files_by_key(session, template)
+    template_files: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    for spec in _intake_template_required_item_specs(template):
+        key = _intake_template_item_key(spec)
+        document = files_by_key.get(key)
+        if document is None:
+            missing.append(_missing_template_file_entry(template, spec))
+            continue
+        template_files.append(_template_file_manifest_entry(document, spec))
+    return {
+        "template_id": template.id,
+        "template_name": template.name,
+        "template_files": template_files,
+        "missing_template_files": missing,
+        "outbound_attachment_manifest": template_files,
+    }
+
+
+def _template_file_manifest_entry(document: Document, spec: dict[str, Any]) -> dict[str, Any]:
+    metadata = document.metadata_json or {}
+    key = str(metadata.get("item_key") or _intake_template_item_key(spec)).strip()
+    return {
+        "document_id": document.id,
+        "template_id": metadata.get("template_id"),
+        "item_key": key,
+        "item_label": metadata.get("item_label") or spec.get("label") or key.replace("_", " ").title(),
+        "item_type": metadata.get("item_type") or spec.get("type") or "form",
+        "file_name": metadata.get("file_name") or metadata.get("filename") or document.title,
+        "mime_type": metadata.get("content_type") or metadata.get("mime_type") or "application/octet-stream",
+        "size_bytes": metadata.get("size_bytes"),
+        "checksum": metadata.get("sha256") or metadata.get("checksum"),
+        "storage_uri": document.storage_uri,
+        "uploaded_at": iso_or_none(document.created_at),
+        "active": bool(metadata.get("active")),
+    }
+
+
+def _missing_template_file_entry(template: IntakeTemplate, spec: dict[str, Any]) -> dict[str, Any]:
+    key = _intake_template_item_key(spec)
+    return {
+        "template_id": template.id,
+        "template_name": template.name,
+        "item_key": key,
+        "item_label": str(spec.get("label") or key.replace("_", " ").title()),
+        "item_type": str(spec.get("type") or "form"),
+        "required": True,
+        "reason": "No active blank template file is configured for this intake item.",
+    }
+
+
+def _local_document_path(storage_uri: str | None) -> Path | None:
+    if not storage_uri:
+        return None
+    storage_text = str(storage_uri)
+    if storage_text.startswith(f"{INBOUND_GMAIL_STORAGE_PREFIX}"):
+        return None
+    candidate = (REPO_ROOT / storage_text).resolve()
+    root = REPO_ROOT.resolve()
+    try:
+        if not candidate.is_relative_to(root):
+            return None
+    except AttributeError:  # pragma: no cover - Python < 3.9 compatibility
+        if root not in candidate.parents and candidate != root:
+            return None
+    return candidate
 
 
 def _intake_done(status: str | None) -> bool:
@@ -6594,6 +9121,12 @@ def _refresh_referral_intake_status(session: Session, referral_id: str) -> None:
         )
     intake_status = _intake_status(items, consents)
     if intake_status == "complete":
+        has_prep_brief = session.scalar(
+            select(func.count(TherapistPrepBrief.id)).where(TherapistPrepBrief.referral_id == referral.id)
+        )
+        if not has_prep_brief and not _pre_prep_readiness_blockers(session, referral):
+            generate_prep_brief(session, referral.id)
+            return
         if _maybe_mark_first_session_ready(session, referral):
             return
         if status != "prep_brief_ready":
@@ -6645,10 +9178,10 @@ def _referral_status_from_result(result: dict[str, Any], run_status: str, approv
     risk = outputs.get("risk_review") or {}
     if "clinical_review" in review_gates or risk.get("required_handoff") in {"clinician_review", "director_review"}:
         return "needs_clinical_review"
-    if "match_approval" in review_gates:
-        return "match_recommended"
     if "send_approval" in review_gates:
         return "awaiting_patient_contact"
+    if "match_approval" in review_gates:
+        return "match_recommended"
     if run_status == "completed" and (approvals or {}).get("send_approval"):
         return "contact_sent"
     if run_status == "completed":

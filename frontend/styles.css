@@ -584,6 +584,13 @@ h3 {
   padding: 15px 16px;
 }
 
+.panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .panel-stat {
   display: inline-flex;
   align-items: center;
@@ -1409,6 +1416,43 @@ textarea:focus {
   align-items: flex-start;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+.email-workflow-panel {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  background: #fff;
+  padding: 14px;
+}
+
+.email-workflow-body {
+  display: grid;
+  gap: 12px;
+}
+
+.missing-reply-form .field {
+  min-width: 0;
+}
+
+.intake-review-stack {
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+}
+
+.intake-template-files {
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+}
+
+.inline-review-form {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  padding: 10px 0 0;
+}
+
+.inline-review-form button {
+  min-width: 0;
 }
 
 .more-actions {

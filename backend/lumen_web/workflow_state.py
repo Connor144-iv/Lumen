@@ -103,6 +103,14 @@ NEXT_ACTION_LABELS = {
     "generate_prep_brief": "Generate prep brief",
     "ready": "Ready for first session",
     "closed": "Closed",
+    "retry_extraction": "Retry extraction",
+    "wait_extraction": "Agent extraction running",
+    "review_first_response": "Review first response",
+    "send_email": "Send email to patient",
+    "sync_replies": "Sync replies",
+    "resolve_reply": "Resolve patient reply",
+    "resolve_match": "Resolve therapist match",
+    "continue_email_workflow": "Continue from email",
 }
 
 

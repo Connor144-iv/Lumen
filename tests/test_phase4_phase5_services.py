@@ -3,7 +3,16 @@ from __future__ import annotations
 import pytest
 
 from backend.lumen_web.db import SessionLocal
-from backend.lumen_web.models import Appointment, CommunicationDraft, HumanReviewTask, IntakeTemplate, Referral, Tenant, Therapist
+from backend.lumen_web.models import (
+    Appointment,
+    CommunicationDraft,
+    HumanReviewTask,
+    IntakeTemplate,
+    Referral,
+    Tenant,
+    Therapist,
+    TherapistPrepBrief,
+)
 from backend.lumen_web.repositories import (
     apply_review_action,
     create_clinical_escalation_review,
@@ -100,7 +109,7 @@ def test_phase4_matching_and_phase5_intake_services() -> None:
             notes="Patient replied with missing fields.",
         )
         assert missing_reply["reply"]["document_type"] == "missing_info_reply"
-        assert missing_referral.status == "ready_for_matching"
+        assert missing_referral.status == "awaiting_patient_contact"
         assert session.query(HumanReviewTask).filter_by(
             referral_id=missing_referral.id,
             task_type="admin_missing_info_review",
@@ -266,10 +275,10 @@ def test_phase4_matching_and_phase5_intake_services() -> None:
         id_document = next(item for item in intake["items"] if item["item_key"] == "id_document")
         item_exception = request_intake_item_exception(session, id_document["id"], reason="ID verified manually.")
         apply_review_action(session, task_id=item_exception.id, action="approve")
-        assert referral.status == "intake_complete"
+        assert referral.status == "first_session_ready"
 
-        brief = generate_prep_brief(session, referral.id)
-        assert "Therapist Prep Brief" in brief["body"]
+        brief = session.query(TherapistPrepBrief).filter_by(referral_id=referral.id).one()
+        assert "Therapist Prep Brief" in brief.body
         assert referral.status == "first_session_ready"
         tracker = list_intake_tracker(session, tenant_id=tenant.id)
         assert any(row["referral"]["id"] == referral.id for row in tracker)

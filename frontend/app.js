@@ -50,6 +50,9 @@ const referralImportForm = document.querySelector("#referral-import-form");
 const importBatchList = document.querySelector("#import-batch-list");
 const integrationHealthList = document.querySelector("#integration-health-list");
 const googleWorkspaceList = document.querySelector("#google-workspace-list");
+const gmailInboxList = document.querySelector("#gmail-inbox-list");
+const gmailSyncButton = document.querySelector("#gmail-sync-button");
+const gmailInboxRefreshButton = document.querySelector("#gmail-inbox-refresh");
 const securityPostureList = document.querySelector("#security-posture-list");
 const feedbackMetricsList = document.querySelector("#feedback-metrics-list");
 const pageTitle = document.querySelector("#page-title");
@@ -93,6 +96,7 @@ let selectedReferralId = null;
 let selectedTherapistId = null;
 let selectedCalendarTherapistFilter = null;
 let therapistCalendarWeekStart = null;
+let therapistCalendarWeekPinnedByUser = false;
 let lastReviewOutcome = null;
 
 document.querySelectorAll("[data-nav]").forEach((link) => {
@@ -271,6 +275,18 @@ referralImportForm.addEventListener("submit", async (event) => {
   referralImportForm.reset();
   await Promise.all([loadImportBatches(), loadReferrals()]);
 });
+
+if (gmailSyncButton) {
+  gmailSyncButton.addEventListener("click", async () => {
+    await syncGmailInbox();
+  });
+}
+
+if (gmailInboxRefreshButton) {
+  gmailInboxRefreshButton.addEventListener("click", async () => {
+    await loadGmailInbox();
+  });
+}
 
 function navigate(path) {
   const route = routes[path] || routes["/"];
@@ -847,6 +863,7 @@ async function loadReferralDetail(referralId) {
   const workbenchState = referral.workbench_state || {};
   const header = renderWorkbenchSummary(referral, workbenchState);
   const progress = renderReferralProgress(referral, workbenchState);
+  const emailWorkflow = workbenchState.email_workflow || null;
 
   const disclosure = { collapsible: true, open: true };
   const readinessSection = operationSection("First-session readiness", disclosure);
@@ -874,6 +891,10 @@ async function loadReferralDetail(referralId) {
     "No missing fields recorded.",
     (field) => recordItem({ title: field.replaceAll("_", " "), status: "missing", body: "Admin review field", meta: [] }),
   );
+
+  const missingReplySection = operationSection("Record patient reply", { collapsible: true, open: Boolean(referral.missing_fields?.length) });
+  missingReplySection.section.id = "referral-missing-reply";
+  renderMissingInfoReplyForm(missingReplySection.body, referral);
 
   const riskSection = operationSection("Risk and suitability", disclosure);
   riskSection.body.append(
@@ -919,25 +940,52 @@ async function loadReferralDetail(referralId) {
   const activitySection = operationSection("Activity timeline", { collapsible: true, open: false });
   renderActivityTimeline(activitySection.body, workbenchState.activity || []);
 
-  referralDetail.append(
-    header,
-    progress,
-    readinessSection.section,
-    fieldsSection.section,
-    missingSection.section,
-    riskSection.section,
-    taskSection.section,
-    outputSection.section,
-    matchSection.section,
-    appointmentSection.section,
-    documentSection.section,
-    communicationSection.section,
-    intakeSection.section,
-    briefSection.section,
-    raw,
-    activitySection.section,
-  );
-  await loadReferralOperations(referral.id, appointmentSection.body, intakeSection.body, briefSection.body);
+  if (emailWorkflow) {
+    const emailPanel = renderEmailWorkflowPanel(referral, emailWorkflow);
+    const technical = document.createElement("details");
+    technical.className = "handoff";
+    const technicalSummary = document.createElement("summary");
+    technicalSummary.textContent = "Technical details";
+    technical.append(
+      technicalSummary,
+      outputSection.section,
+      matchSection.section,
+      documentSection.section,
+      communicationSection.section,
+      raw,
+      activitySection.section,
+    );
+    referralDetail.append(
+      header,
+      emailPanel,
+      missingReplySection.section,
+      appointmentSection.section,
+      intakeSection.section,
+      briefSection.section,
+      technical,
+    );
+  } else {
+    referralDetail.append(
+      header,
+      progress,
+      readinessSection.section,
+      fieldsSection.section,
+      missingSection.section,
+      missingReplySection.section,
+      riskSection.section,
+      taskSection.section,
+      outputSection.section,
+      matchSection.section,
+      appointmentSection.section,
+      documentSection.section,
+      communicationSection.section,
+      intakeSection.section,
+      briefSection.section,
+      raw,
+      activitySection.section,
+    );
+  }
+  await loadReferralOperations(referral.id, appointmentSection.body, intakeSection.body, briefSection.body, referral);
 }
 
 async function loadScheduling() {
@@ -1072,7 +1120,7 @@ async function requestDraggedAppointmentReschedule(appointmentId, slot) {
   }
 }
 
-async function loadReferralOperations(referralId, appointmentBody, intakeBody, briefBody) {
+async function loadReferralOperations(referralId, appointmentBody, intakeBody, briefBody, referral = null) {
   const [appointmentResponse, intakeResponse] = await Promise.all([
     fetch(`/api/appointments?referral_id=${encodeURIComponent(referralId)}`),
     fetch(`/api/referrals/${referralId}/intake`),
@@ -1084,9 +1132,140 @@ async function loadReferralOperations(referralId, appointmentBody, intakeBody, b
   if (intakeResponse.ok) {
     const data = await readResponseBody(intakeResponse);
     renderIntakeWorkspace(intakeBody, data, false);
+    renderIntakeSubmissionReviews(intakeBody, referral?.review_tasks || [], data);
     renderIntakeWorkspace(intakeWorkspace, data, true);
     renderPrepBriefs(briefBody, data.prep_briefs || []);
   }
+}
+
+function renderEmailWorkflowPanel(referral, workflow) {
+  const section = document.createElement("section");
+  section.className = "operation-section email-workflow-panel";
+  section.id = "email-workflow-panel";
+
+  const title = document.createElement("div");
+  title.className = "section-heading";
+  title.append(
+    heading("Email referral"),
+    metaRow([workflow.status?.replaceAll("_", " "), workflow.next_action_label]),
+  );
+
+  const steps = [
+    ["email_received", "Email received"],
+    ["facts_extracted", "Facts extracted"],
+    ["first_response_prepared", "First response prepared"],
+    ["waiting_for_reply", "Waiting for reply"],
+    ["appointment_confirmation", "Appointment confirmation"],
+    ["confirmed", "Confirmed"],
+  ];
+  const progress = document.createElement("section");
+  progress.className = "progress-path";
+  const currentIndex = steps.findIndex(([key]) => !workflow.progress?.[key]);
+  steps.forEach(([key, label], index) => {
+    const item = document.createElement("div");
+    item.className = "progress-step";
+    const complete = Boolean(workflow.progress?.[key]);
+    item.dataset.state = complete ? "complete" : index === currentIndex ? "current" : "pending";
+    const marker = document.createElement("span");
+    marker.className = "progress-marker";
+    marker.textContent = complete ? "OK" : String(index + 1);
+    const text = document.createElement("strong");
+    text.textContent = label;
+    item.append(marker, text);
+    progress.appendChild(item);
+  });
+
+  const facts = workflow.facts || {};
+  const factsGrid = document.createElement("div");
+  factsGrid.className = "workbench-state-grid";
+  factsGrid.append(
+    keyValue("Patient", facts.patient_name || "Missing"),
+    keyValue("DOB", facts.date_of_birth || "Missing"),
+    keyValue("Contact", [facts.contact_email, facts.contact_phone].filter(Boolean).join(" | ") || "Missing"),
+    keyValue("Insurer", facts.insurer || "Missing"),
+    keyValue("Referrer", facts.referring_entity || "Not recorded"),
+    keyValue("Held appointment", workflow.held_appointment?.starts_at ? formatDate(workflow.held_appointment.starts_at) : "Not held"),
+  );
+
+  const body = document.createElement("div");
+  body.className = "email-workflow-body";
+  body.append(progress, factsGrid);
+
+  if (workflow.no_match) {
+    body.appendChild(recordItem({
+      title: "Therapist matching needs review",
+      status: "blocked",
+      body: workflow.no_match.label,
+      meta: [`${workflow.no_match.excluded_count || 0} excluded therapists`],
+    }));
+  }
+
+  if (workflow.held_appointment) {
+    body.appendChild(recordItem({
+      title: "Held appointment",
+      status: workflow.held_appointment.status,
+      body: `${formatDate(workflow.held_appointment.starts_at)} to ${formatDate(workflow.held_appointment.ends_at)}`,
+      meta: [
+        workflow.held_appointment.therapist_id ? `therapist ${shortId(workflow.held_appointment.therapist_id)}` : null,
+        workflow.held_appointment.google_calendar_event_id ? "Google Calendar linked" : "local hold",
+      ],
+    }));
+  }
+
+  if (workflow.draft) {
+    const draft = recordItem({
+      title: workflow.draft.subject || "Patient email draft",
+      status: workflow.draft.status,
+      body: workflow.draft.body,
+      meta: [
+        workflow.draft.recipient_email,
+        workflow.gmail?.message_id ? `gmail ${shortId(workflow.gmail.message_id)}` : null,
+        workflow.gmail?.sent_at ? `sent ${formatDate(workflow.gmail.sent_at)}` : null,
+      ],
+    });
+    body.appendChild(draft);
+  }
+
+  const taskWrap = document.createElement("div");
+  taskWrap.id = "email-workflow-review-tasks";
+  renderSimpleList(taskWrap, workflow.review_tasks || [], "No email workflow review tasks are open.", reviewTaskCard);
+  body.appendChild(taskWrap);
+
+  section.append(title, body);
+  return section;
+}
+
+function renderMissingInfoReplyForm(container, referral) {
+  const form = document.createElement("form");
+  form.className = "inline-form missing-reply-form";
+  form.append(
+    formField("Patient name", "patient_name", referral.patient_name || ""),
+    formField("Email", "contact_email", referral.contact_email || ""),
+    formField("Phone", "contact_phone", referral.contact_phone || ""),
+    formField("Date of birth", "date_of_birth", referral.date_of_birth || ""),
+    formField("Insurer", "insurer", referral.insurer || ""),
+    formField("Referring entity", "referring_entity", referral.referring_entity || ""),
+  );
+  const notes = formField("Reply notes", "notes", "", true);
+  form.appendChild(notes);
+  const actions = document.createElement("div");
+  actions.className = "actions tight";
+  actions.appendChild(actionButton("Apply patient reply", () => recordMissingInfoReply(referral.id, form)));
+  form.appendChild(actions);
+  container.appendChild(form);
+}
+
+function formField(labelText, name, value = "", multiline = false) {
+  const label = document.createElement("label");
+  label.className = "field";
+  const caption = document.createElement("span");
+  caption.textContent = labelText;
+  const input = document.createElement(multiline ? "textarea" : "input");
+  input.name = name;
+  input.value = value || "";
+  if (multiline) input.rows = 3;
+  label.append(caption, input);
+  return label;
 }
 
 function renderWorkbenchSummary(referral, state) {
@@ -1188,7 +1367,7 @@ function workbenchPrimaryButton(referral, state) {
   const primaryAction = state.primary_action || referral.next_action;
   const allowedActions = state.allowed_actions || [];
   const actionId = primaryAction === "revise_agent_output" ? allowedActions[0] : primaryAction;
-  if (!actionId || ["ready", "closed", "wait_patient_reply"].includes(actionId)) return null;
+  if (!actionId || ["ready", "closed", "wait_patient_reply", "wait_extraction"].includes(actionId)) return null;
   const action = workbenchActionDefinitions(referral)[actionId];
   if (!action) return null;
   const button = actionButton(state.primary_action_label || action.label, action.handler);
@@ -1199,7 +1378,7 @@ function workbenchPrimaryButton(referral, state) {
 function secondaryWorkbenchActions(referral, state) {
   const definitions = workbenchActionDefinitions(referral);
   const primaryAction = state.primary_action === "revise_agent_output" ? (state.allowed_actions || [])[0] : state.primary_action;
-  const allowed = new Set([...(state.allowed_actions || []), ...defaultWorkbenchActionIds()]);
+  const allowed = new Set(state.email_workflow ? [...(state.allowed_actions || [])] : [...(state.allowed_actions || []), ...defaultWorkbenchActionIds()]);
   allowed.delete(primaryAction);
   return [...allowed]
     .map((actionId) => definitions[actionId])
@@ -1226,11 +1405,18 @@ function defaultWorkbenchActionIds() {
 
 function workbenchActionDefinitions(referral) {
   return {
-    review_gate: { label: "Open review task", handler: () => scrollToDetailSection("referral-review-tasks") },
-    review_referral: { label: "Review referral", handler: () => scrollToDetailSection("referral-review-tasks") },
+    review_gate: { label: "Open review task", handler: () => scrollToDetailSection(document.getElementById("email-workflow-review-tasks") ? "email-workflow-review-tasks" : "referral-review-tasks") },
+    review_referral: { label: "Review referral", handler: () => scrollToDetailSection(document.getElementById("email-workflow-review-tasks") ? "email-workflow-review-tasks" : "referral-review-tasks") },
     review_missing_info: { label: "Resolve missing information", handler: () => draftMissingInfo(referral.id) },
     draft_missing_info: { label: "Draft missing info", handler: () => draftMissingInfo(referral.id) },
-    record_missing_reply: { label: "Record missing reply", handler: () => recordMissingInfoReply(referral.id) },
+    record_missing_reply: { label: "Record missing reply", handler: () => scrollToDetailSection("referral-missing-reply") },
+    retry_extraction: { label: "Retry extraction", handler: () => retryReferralExtraction(referral.id) },
+    continue_email_workflow: { label: "Continue from email", handler: () => continueEmailWorkflow(referral.id) },
+    review_first_response: { label: "Review first response", handler: () => scrollToDetailSection("email-workflow-review-tasks") },
+    send_email: { label: "Send email to patient", handler: () => scrollToDetailSection("email-workflow-review-tasks") },
+    sync_replies: { label: "Sync replies", handler: () => syncGmailForReferral(referral.id) },
+    resolve_reply: { label: "Resolve patient reply", handler: () => scrollToDetailSection("email-workflow-review-tasks") },
+    resolve_match: { label: "Resolve therapist match", handler: () => scrollToDetailSection("email-workflow-panel") },
     clinical_review: { label: "Clinical review", handler: () => requestClinicalReview(referral.id) },
     suitability_review: { label: "Suitability review", handler: () => requestSuitabilityReview(referral.id) },
     duplicate_review: { label: "Duplicate review", handler: () => requestDuplicateReview(referral.id) },
@@ -1332,17 +1518,18 @@ async function draftMissingInfo(referralId) {
   await loadReferralDetail(referralId);
 }
 
-async function recordMissingInfoReply(referralId) {
-  const email = window.prompt("Patient/referrer email from reply, if provided", "") || "";
-  const insurer = window.prompt("Insurer from reply, if provided", "") || "";
-  const phone = window.prompt("Phone from reply, if provided", "") || "";
-  const dob = window.prompt("Date of birth from reply, if provided", "") || "";
-  const notes = window.prompt("Reply notes", "") || "";
+async function recordMissingInfoReply(referralId, form = null) {
+  if (!form) {
+    scrollToDetailSection("referral-missing-reply");
+    return;
+  }
+  const formData = new FormData(form);
   const updates = {};
-  if (email) updates.contact_email = email;
-  if (insurer) updates.insurer = insurer;
-  if (phone) updates.contact_phone = phone;
-  if (dob) updates.date_of_birth = dob;
+  ["patient_name", "contact_email", "insurer", "contact_phone", "date_of_birth", "referring_entity"].forEach((key) => {
+    const value = String(formData.get(key) || "").trim();
+    if (value) updates[key] = value;
+  });
+  const notes = String(formData.get("notes") || "").trim();
   const response = await fetch(`/api/referrals/${referralId}/missing-info-replies`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1354,6 +1541,44 @@ async function recordMissingInfoReply(referralId) {
     return;
   }
   await refreshProductWorkspace();
+  await loadReferralDetail(referralId);
+}
+
+async function retryReferralExtraction(referralId) {
+  const response = await fetch(`/api/referrals/${referralId}/retry-extraction`, { method: "POST" });
+  const body = await readResponseBody(response);
+  if (!response.ok) {
+    window.alert(body.detail || "Could not retry extraction.");
+    return;
+  }
+  resetRunState();
+  jobIdLabel.textContent = body.job_id;
+  setActiveJob(body.job_id);
+  setStatus(body.status, `${statusLabel(body.status)} - ${shortId(body.job_id)}`);
+  openEventStream(body.job_id, body.events_url);
+  startPolling(body.status_url);
+  await loadReferralDetail(referralId);
+}
+
+async function continueEmailWorkflow(referralId) {
+  const response = await fetch(`/api/referrals/${referralId}/continue-email-workflow`, { method: "POST" });
+  const body = await readResponseBody(response);
+  if (!response.ok) {
+    window.alert(body.detail || "Could not continue the email workflow.");
+    return;
+  }
+  const result = body.result || {};
+  const statusText = result.reason ? `${body.status}: ${result.reason}` : `Email workflow ${body.status || "continued"}`;
+  setStatus(body.status === "blocked" ? "failed" : "completed", statusText);
+  if (body.status === "blocked" || body.status === "partial") {
+    window.alert(statusText);
+  }
+  await refreshProductWorkspace();
+  await loadReferralDetail(referralId);
+}
+
+async function syncGmailForReferral(referralId) {
+  await syncGmailInbox();
   await loadReferralDetail(referralId);
 }
 
@@ -1608,6 +1833,35 @@ async function uploadIntakeDocument(referralId, item) {
   input.click();
 }
 
+async function uploadIntakeTemplateFile(templateId, itemKey) {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = ".txt,.pdf,.docx,.csv,.xlsx,.json";
+  input.addEventListener("change", async () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    const payload = new FormData();
+    payload.append("file", file);
+    const response = await fetch(`/api/intake/templates/${encodeURIComponent(templateId)}/items/${encodeURIComponent(itemKey)}/file`, {
+      method: "POST",
+      body: payload,
+    });
+    const body = await readResponseBody(response);
+    if (!response.ok) {
+      window.alert(body.detail || "Could not upload template file.");
+      return;
+    }
+    if (selectedReferralId) await loadReferralDetail(selectedReferralId);
+    await loadIntakeTracker();
+  });
+  input.click();
+}
+
+function openDocumentDownload(documentId) {
+  if (!documentId) return;
+  window.open(`/api/documents/${encodeURIComponent(documentId)}/download`, "_blank", "noreferrer");
+}
+
 async function loadReviewTasks() {
   const response = await fetch("/api/review-tasks?status=open");
   if (!response.ok) return;
@@ -1716,6 +1970,9 @@ function reviewTaskCard(task) {
   if (task.provider_error) {
     item.appendChild(keyValue("Provider error", task.provider_error));
   }
+  if (task.source_payload) {
+    appendAttachmentSummary(item, task.source_payload);
+  }
 
   if (task.draft_text) {
     const editor = document.createElement("textarea");
@@ -1737,7 +1994,18 @@ function reviewTaskCard(task) {
     item.appendChild(actions);
     return item;
   }
-  const approve = actionButton("Approve", () => submitReviewAction(task.id, "approve"));
+  if (task.task_type === "intake_submission_review" && task.referral_id) {
+    actions.appendChild(actionButton("Open intake review", () => openReferralWorkbench(task.referral_id)));
+    item.appendChild(actions);
+    return item;
+  }
+  const approveLabel =
+    task.task_type === "send_approval"
+      ? "Send email to patient"
+      : task.task_type === "appointment_confirmation_approval"
+        ? "Create Google Calendar event"
+        : "Approve";
+  const approve = actionButton(approveLabel, () => submitReviewAction(task.id, "approve"));
   const reject = actionButton("Reject", () => {
     const reason = window.prompt("Reason for rejection");
     if (reason !== null) submitReviewAction(task.id, "reject", { rejection_reason: reason });
@@ -1866,6 +2134,7 @@ function renderTherapistList() {
     item.addEventListener("click", () => {
       selectedTherapistId = therapist.id;
       selectedCalendarTherapistFilter = therapist.id;
+      therapistCalendarWeekPinnedByUser = false;
       renderTherapistList();
       renderSelectedTherapist();
     });
@@ -2032,11 +2301,14 @@ function nextAvailabilityLabel(therapist) {
 
 function renderTherapistWeekCalendar(container, defaultTherapist) {
   container.replaceChildren();
-  const weekStart = therapistCalendarWeekStart || startOfWeek(new Date());
-  therapistCalendarWeekStart = weekStart;
-  const weekEnd = addDays(weekStart, 7);
   const filterValue = validCalendarTherapistFilter(selectedCalendarTherapistFilter || defaultTherapist.id);
   selectedCalendarTherapistFilter = filterValue;
+  let weekStart = therapistCalendarWeekStart || startOfWeek(new Date());
+  if (!therapistCalendarWeekPinnedByUser) {
+    weekStart = autoAlignedTherapistWeek(filterValue, weekStart);
+  }
+  therapistCalendarWeekStart = weekStart;
+  const weekEnd = addDays(weekStart, 7);
 
   const toolbar = document.createElement("div");
   toolbar.className = "calendar-toolbar";
@@ -2051,6 +2323,7 @@ function renderTherapistWeekCalendar(container, defaultTherapist) {
   filter.addEventListener("change", () => {
     selectedCalendarTherapistFilter = filter.value;
     if (filter.value !== "all") selectedTherapistId = filter.value;
+    therapistCalendarWeekPinnedByUser = false;
     renderTherapistList();
     renderSelectedTherapist();
   });
@@ -2058,14 +2331,17 @@ function renderTherapistWeekCalendar(container, defaultTherapist) {
   toolbar.append(
     calendarToolbarButton("Previous week", () => {
       therapistCalendarWeekStart = addDays(weekStart, -7);
+      therapistCalendarWeekPinnedByUser = true;
       renderSelectedTherapist();
     }),
     calendarToolbarButton("Today", () => {
       therapistCalendarWeekStart = startOfWeek(new Date());
+      therapistCalendarWeekPinnedByUser = true;
       renderSelectedTherapist();
     }),
     calendarToolbarButton("Next week", () => {
       therapistCalendarWeekStart = addDays(weekStart, 7);
+      therapistCalendarWeekPinnedByUser = true;
       renderSelectedTherapist();
     }),
     range,
@@ -2107,6 +2383,32 @@ function renderTherapistWeekCalendar(container, defaultTherapist) {
   if (latestTherapistCalendarCapacity?.provider_error) {
     container.appendChild(emptyState(latestTherapistCalendarCapacity.provider_error));
   }
+}
+
+function autoAlignedTherapistWeek(filterValue, currentWeekStart) {
+  if (!filterValue || filterValue === "all") return currentWeekStart;
+  const currentWeekEnd = addDays(currentWeekStart, 7);
+  const appointments = localCalendarAppointmentsForTherapist(filterValue);
+  const hasVisibleLocalAppointment = appointments.some((appointment) => {
+    const start = parseDate(appointment.starts_at);
+    const end = parseDate(appointment.ends_at);
+    return start && end && rangesOverlap(start, end, currentWeekStart, currentWeekEnd);
+  });
+  if (hasVisibleLocalAppointment) return currentWeekStart;
+  const now = new Date();
+  const nextAppointment = appointments
+    .map((appointment) => ({ appointment, start: parseDate(appointment.starts_at) }))
+    .filter((item) => item.start && item.start >= now)
+    .sort((a, b) => a.start - b.start)[0];
+  return nextAppointment?.start ? startOfWeek(nextAppointment.start) : currentWeekStart;
+}
+
+function localCalendarAppointmentsForTherapist(therapistId) {
+  const summary = therapistCalendarSummary(therapistId);
+  const source = summary?.active_appointments?.length
+    ? summary.active_appointments
+    : appointmentsForTherapist(therapistId);
+  return (source || []).filter((appointment) => ["proposed", "confirmed"].includes(appointment.status));
 }
 
 function validCalendarTherapistFilter(value) {
@@ -2491,6 +2793,7 @@ async function loadIntegrationHealth() {
   const checks = data.checks || [];
   renderCollection(integrationHealthList, checks, "No integration checks yet.", integrationHealthCard);
   await loadGoogleWorkspaceStatus();
+  await loadGmailInbox();
   if (overviewHealthStrip) {
     overviewHealthStrip.replaceChildren(...checks.map(integrationHealthCard));
   }
@@ -2511,6 +2814,99 @@ function integrationHealthCard(check) {
   });
 }
 
+async function loadGmailInbox() {
+  if (!gmailInboxList) return;
+  const response = await fetch("/api/integrations/gmail-inbox?limit=60");
+  if (!response.ok) {
+    gmailInboxList.replaceChildren(
+      recordItem({
+        title: "Inbound Gmail",
+        status: "failed",
+        body: "Inbound Gmail messages are unavailable.",
+        meta: [],
+      }),
+    );
+    return;
+  }
+  const data = await readResponseBody(response);
+  const messages = data.messages || [];
+  renderCollection(gmailInboxList, messages, "No inbound Gmail messages yet.", gmailInboxCard);
+}
+
+async function syncGmailInbox() {
+  if (gmailSyncButton) gmailSyncButton.disabled = true;
+  try {
+    const response = await fetch("/api/integrations/gmail-sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ max_results: 25, include_recent_read: true }),
+    });
+    const body = await readResponseBody(response);
+    if (!response.ok) {
+      window.alert(body.detail || "Gmail sync failed.");
+      return;
+    }
+    const processed = body.processed?.length || 0;
+    const skipped = body.skipped?.length || 0;
+    const errors = body.errors?.length || 0;
+    const total = body.total_seen || 0;
+    const unread = body.unread_seen || 0;
+    const recent = body.recent_seen || 0;
+    const firstError = body.errors?.[0]?.error ? `\nFirst error: ${body.errors[0].error}` : "";
+    const message = total
+      ? `Gmail sync finished. ${processed} processed, ${skipped} skipped, ${errors} errors. Checked ${unread} unread and ${recent} recent inbox messages.${firstError}`
+      : "Gmail sync finished. No unread or recent inbox messages were found.";
+    window.alert(message);
+    await Promise.all([loadGmailInbox(), loadReviewTasks(), loadReferrals()]);
+  } catch (error) {
+    window.alert(`Gmail sync failed before the server responded: ${error?.message || error}`);
+  } finally {
+    if (gmailSyncButton) gmailSyncButton.disabled = false;
+  }
+}
+
+function gmailInboxCard(message) {
+  const meta = [
+    message.sender_email || message.from || "unknown sender",
+    message.date ? formatDate(message.date) : null,
+    message.status || message.document_type,
+    message.reply_type ? `reply ${message.reply_type}` : null,
+    message.referral_id ? `referral ${shortId(message.referral_id)}` : null,
+  ];
+  const item = recordItem({
+    title: message.subject || "Inbound Gmail",
+    status: message.status || message.document_type,
+    body: message.body || message.snippet || "No message body captured.",
+    meta,
+  });
+  const actions = document.createElement("div");
+  actions.className = "actions tight";
+  if (message.referral_id) {
+    actions.appendChild(actionButton("Open referral", () => openReferralWorkbench(message.referral_id)));
+  } else if (message.document_id) {
+    actions.appendChild(actionButton("Create referral", () => convertGmailInboxMessage(message.document_id)));
+  }
+  item.appendChild(actions);
+  return item;
+}
+
+async function convertGmailInboxMessage(documentId) {
+  const response = await fetch("/api/integrations/gmail-inbox/convert", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ document_id: documentId }),
+  });
+  const body = await readResponseBody(response);
+  if (!response.ok) {
+    window.alert(body.detail || "Could not create a referral from the inbound email.");
+    return;
+  }
+  await refreshProductWorkspace();
+  if (body.referral?.id) {
+    await openReferralWorkbench(body.referral.id);
+  }
+}
+
 async function loadGoogleWorkspaceStatus() {
   if (!googleWorkspaceList) return;
   const response = await fetch("/api/integrations/google/status");
@@ -2526,9 +2922,12 @@ async function loadGoogleWorkspaceStatus() {
     return;
   }
   const status = await readResponseBody(response);
+  const accountMismatch = status.account_matches_expected === false;
   const connectionStatus = status.enabled
     ? status.authorized
-      ? "ready"
+      ? accountMismatch
+        ? "failed"
+        : "ready"
       : status.last_provider_error
         ? "failed"
         : "not_authorized"
@@ -2539,10 +2938,17 @@ async function loadGoogleWorkspaceStatus() {
       status: connectionStatus,
       body: status.enabled
         ? status.authorized
-          ? "Approved patient-facing drafts send through Gmail."
+          ? accountMismatch
+            ? `Connected to ${status.gmail_email_address || "unknown Gmail account"}; expected ${status.expected_gmail_account}.`
+            : "Approved patient-facing drafts send through Gmail."
           : "Run the local Google authorization script before enabling live send."
         : "Google Workspace is disabled; approvals use the local/manual workflow.",
-      meta: [status.token_present ? "token present" : "no token", status.configured_scopes?.includes("gmail.send") ? "gmail.send" : null],
+      meta: [
+        status.token_present ? "token present" : "no token",
+        status.gmail_email_address ? `gmail ${status.gmail_email_address}` : null,
+        status.expected_gmail_account ? `expected ${status.expected_gmail_account}` : null,
+        status.configured_scopes?.includes("gmail.send") ? "gmail.send" : null,
+      ],
     }),
     recordItem({
       title: "Google Calendar",
@@ -2963,6 +3369,8 @@ function renderIntakeWorkspace(container, data, includeActions) {
   }
   container.appendChild(header);
 
+  renderIntakeTemplateFiles(container, data, includeActions);
+
   (data.items || []).forEach((item) => {
     const row = recordItem({
       title: item.label,
@@ -3014,29 +3422,177 @@ function renderIntakeWorkspace(container, data, includeActions) {
   });
 
   (data.documents || []).forEach((documentRecord) => {
-    container.appendChild(
-      recordItem({
-        title: documentRecord.title,
-        status: "completed",
-        body: documentRecord.document_type.replaceAll("_", " "),
-        meta: [
-          documentRecord.metadata?.size_bytes ? `${documentRecord.metadata.size_bytes} bytes` : null,
-          documentRecord.metadata?.virus_scan?.status || "stored",
-        ],
-      }),
-    );
+    const row = recordItem({
+      title: documentRecord.title,
+      status: "completed",
+      body: documentRecord.document_type.replaceAll("_", " "),
+      meta: [
+        documentRecord.metadata?.size_bytes ? `${documentRecord.metadata.size_bytes} bytes` : null,
+        documentRecord.metadata?.virus_scan?.status || "stored",
+      ],
+    });
+    const actions = document.createElement("div");
+    actions.className = "actions tight";
+    actions.appendChild(actionButton("Download", () => openDocumentDownload(documentRecord.id)));
+    row.appendChild(actions);
+    container.appendChild(row);
   });
 
   (data.communication_drafts || []).slice(0, 2).forEach((draft) => {
-    container.appendChild(
-      recordItem({
-        title: draft.subject || "Intake reminder draft",
-        status: draft.status,
-        body: draft.body,
-        meta: [draft.channel, draft.requires_human_send ? "requires approval" : null],
-      }),
-    );
+    const row = recordItem({
+      title: draft.subject || "Intake reminder draft",
+      status: draft.status,
+      body: draft.body,
+      meta: [draft.channel, draft.requires_human_send ? "requires approval" : null],
+    });
+    appendAttachmentSummary(row, draft);
+    container.appendChild(row);
   });
+}
+
+function renderIntakeTemplateFiles(container, data, includeActions) {
+  const template = data.template;
+  if (!template) return;
+  const specs = template.required_items || [];
+  if (!specs.length) return;
+  const section = document.createElement("div");
+  section.className = "detail-stack intake-template-files";
+  section.appendChild(heading("Template files"));
+  specs.forEach((spec) => {
+    const file = spec.template_file;
+    const key = spec.key || spec.label;
+    const row = recordItem({
+      title: spec.label || key || "Template file",
+      status: file ? "configured" : "missing",
+      body: file ? file.file_name : "Upload the active blank file for this intake item.",
+      meta: [
+        spec.type || "form",
+        file?.size_bytes ? `${file.size_bytes} bytes` : null,
+        file?.uploaded_at ? `uploaded ${formatDate(file.uploaded_at)}` : null,
+      ],
+    });
+    if (includeActions && key) {
+      const actions = document.createElement("div");
+      actions.className = "actions tight";
+      actions.appendChild(actionButton(file ? "Replace file" : "Upload file", () => uploadIntakeTemplateFile(template.id, key)));
+      if (file?.document_id) actions.appendChild(actionButton("Download", () => openDocumentDownload(file.document_id)));
+      row.appendChild(actions);
+    }
+    section.appendChild(row);
+  });
+  container.appendChild(section);
+}
+
+function appendAttachmentSummary(container, payload) {
+  const manifest = payload.outbound_attachment_manifest || [];
+  const missing = payload.missing_template_files || [];
+  const sent = payload.sent_attachment_records || [];
+  if (manifest.length) {
+    container.appendChild(keyValue("Attachments", manifest.map((item) => item.file_name).join(", ")));
+  }
+  if (sent.length) {
+    container.appendChild(keyValue("Sent attachments", sent.map((item) => item.file_name).join(", ")));
+  }
+  missing.forEach((item) => {
+    container.appendChild(keyValue("Setup warning", `${item.item_label || item.item_key}: ${item.reason || "Missing template file"}`));
+  });
+}
+
+function renderIntakeSubmissionReviews(container, tasks, intakeData) {
+  const openTasks = (tasks || []).filter((task) => task.task_type === "intake_submission_review" && task.status === "open");
+  if (!openTasks.length) return;
+  const section = document.createElement("div");
+  section.className = "detail-stack intake-review-stack";
+  section.appendChild(heading("Intake submissions to review"));
+  openTasks.forEach((task) => section.appendChild(intakeSubmissionReviewCard(task, intakeData)));
+  container.appendChild(section);
+}
+
+function intakeSubmissionReviewCard(task, intakeData) {
+  const payload = task.source_payload || {};
+  const documents = payload.documents || [];
+  const documentRecord = documents[0] || {};
+  const attachmentErrors = payload.attachment_errors || [];
+  const card = recordItem({
+    title: documentRecord.title || "Patient intake reply",
+    status: "needs mapping",
+    body: task.reason,
+    meta: [
+      documentRecord.document_type?.replaceAll("_", " "),
+      documentRecord.metadata?.file_name || null,
+      documentRecord.metadata?.size_bytes ? `${documentRecord.metadata.size_bytes} bytes` : null,
+    ],
+  });
+
+  if (payload.reply_text) {
+    const details = document.createElement("details");
+    details.className = "handoff";
+    const summary = document.createElement("summary");
+    summary.textContent = "Patient reply";
+    const pre = document.createElement("pre");
+    pre.textContent = payload.reply_text;
+    details.append(summary, pre);
+    card.appendChild(details);
+  }
+  attachmentErrors.forEach((error) => {
+    card.appendChild(keyValue(error.file_name || "Attachment", error.error || "Could not store attachment"));
+  });
+
+  if (!documentRecord.id && !payload.document_id) {
+    const actions = document.createElement("div");
+    actions.className = "actions tight";
+    actions.appendChild(actionButton("Mark reviewed", () => submitReviewAction(task.id, "approve")));
+    card.appendChild(actions);
+    return card;
+  }
+
+  const form = document.createElement("form");
+  form.className = "inline-review-form";
+  const documentActions = document.createElement("div");
+  documentActions.className = "actions tight";
+  documentActions.appendChild(actionButton("Download file", () => openDocumentDownload(documentRecord.id || payload.document_id)));
+  card.appendChild(documentActions);
+
+  const itemSelect = document.createElement("select");
+  itemSelect.appendChild(new Option("Map to checklist item", ""));
+  (intakeData.items || []).forEach((item) => {
+    const label = `${item.label} (${item.item_type}, ${item.status})`;
+    itemSelect.appendChild(new Option(label, item.id));
+  });
+
+  const consentSelect = document.createElement("select");
+  consentSelect.appendChild(new Option("Map to consent", ""));
+  (intakeData.consents || []).forEach((consent) => {
+    const label = `${consent.scope.replaceAll("_", " ")} (${consent.status})`;
+    consentSelect.appendChild(new Option(label, consent.id));
+  });
+
+  const questionnaireInput = document.createElement("input");
+  questionnaireInput.type = "text";
+  questionnaireInput.placeholder = "Questionnaire name for JSON answers";
+  questionnaireInput.value = "intake_questionnaire";
+
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.className = "secondary compact";
+  submit.textContent = "Approve mapping";
+
+  form.append(itemSelect, consentSelect, questionnaireInput, submit);
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (!itemSelect.value && !consentSelect.value) {
+      window.alert("Select a checklist item or consent before approving.");
+      return;
+    }
+    submitReviewAction(task.id, "approve", {
+      document_id: documentRecord.id || payload.document_id,
+      intake_item_id: itemSelect.value || null,
+      consent_id: consentSelect.value || null,
+      questionnaire_name: questionnaireInput.value.trim() || null,
+    });
+  });
+  card.appendChild(form);
+  return card;
 }
 
 function renderPrepBriefs(container, briefs) {
@@ -3199,6 +3755,7 @@ function friendlyTaskType(value) {
     appointment_reschedule_approval: "Appointment reschedule approval",
     intake_reminder_approval: "Intake reminder approval",
     intake_exception_approval: "Intake exception approval",
+    intake_submission_review: "Intake submission review",
     inbound_reply_review: "Inbound reply review",
     therapist_note_approval: "Therapist note approval",
     post_session_risk_review: "Post-session risk review",

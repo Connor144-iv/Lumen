@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from sqlalchemy import select
 
+import app as app_module
 from backend.lumen_web import google_workspace
 from backend.lumen_web.db import Base, SessionLocal, engine
 from backend.lumen_web.models import HumanReviewTask, IntakeTemplate, Referral, Tenant, Therapist
@@ -11,12 +12,12 @@ from backend.lumen_web.repositories import (
     apply_review_action,
     complete_consent_record,
     complete_intake_item,
+    create_intake_template_file,
     create_suitability_review,
     deterministic_match_for_referral,
     draft_first_contact_message,
     draft_intake_packet,
     draft_missing_info_request,
-    generate_prep_brief,
     intake_workspace,
     propose_appointment_slots,
     record_missing_info_reply,
@@ -105,6 +106,19 @@ def test_clean_referral_demo_path_reaches_first_session_ready(monkeypatch) -> No
         )
         session.add_all([therapist, referral, template])
         session.flush()
+        for item_key, file_name in [
+            ("privacy_notice", "privacy-notice.txt"),
+            ("intake_form", "clinical-intake-form.txt"),
+        ]:
+            file_meta = app_module.store_uploaded_document(_id("template-file"), file_name, "text/plain", b"Blank form")
+            create_intake_template_file(
+                session,
+                template_id=template.id,
+                item_key=item_key,
+                title=str(file_meta["file_name"]),
+                storage_uri=str(file_meta["storage_uri"]),
+                metadata=file_meta,
+            )
 
         draft_missing_info_request(session, referral.id, note="Please confirm date of birth.")
         apply_review_action(
@@ -153,13 +167,16 @@ def test_clean_referral_demo_path_reaches_first_session_ready(monkeypatch) -> No
             complete_intake_item(session, item["id"], notes="Completed in clean demo smoke path.")
         for consent in intake["consents"]:
             complete_consent_record(session, consent["id"])
-        assert referral.status == "intake_complete"
+        assert referral.status == "first_session_ready"
 
-        generate_prep_brief(session, referral.id)
         detail = referral_detail(session, referral.id)
 
         assert referral.status == "first_session_ready"
         assert len(send_calls) == 3
+        assert [item["file_name"] for item in send_calls[2]["attachments"]] == [
+            "privacy-notice.txt",
+            "clinical-intake-form.txt",
+        ]
         assert len(calendar_calls) == 1
         assert detail["readiness_blockers"] == []
         assert detail["workbench_state"]["progress"]["contacted"] is True

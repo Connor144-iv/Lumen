@@ -11,7 +11,8 @@ Add a minimal, safe Gmail reply ingestion path to capture patient replies (missi
 ## Phase 1 (Minimal Ingestion)
 - Read unread Gmail messages and attempt matching.
 - Process missing-info replies into the existing missing-info flow.
-- For scheduling or unclear replies, store and route to admin review (no auto-classification).
+- Auto-parse explicit slot confirmations (Option/code/time) and auto-approve the appointment confirmation task.
+- For scheduling or unclear replies, store and route to admin review.
 - Only mark messages as processed after the DB write succeeds.
 
 ## Reply Matching Order (Updated)
@@ -31,6 +32,7 @@ Add a minimal, safe Gmail reply ingestion path to capture patient replies (missi
   - Uses the matching order above.
   - Calls `record_missing_info_reply()` for missing-info replies.
   - Adds a real `record_patient_reply()` path for Gmail replies (do not reuse `record_simulated_patient_reply()`).
+  - Auto-creates an appointment confirmation task and immediately approves it when the reply matches a slot.
   - Stores Gmail message ID in the document metadata for idempotency.
 - **Unmatched inbound**: Store as a document record (e.g., `document_type="inbound_email_unmatched"`) with Gmail metadata for admin review.
 
