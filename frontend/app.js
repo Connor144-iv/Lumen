@@ -11,6 +11,18 @@ const routes = {
   "/clinical": { page: "clinical", title: "Clinical", label: "Documentation" },
   "/integrations": { page: "integrations", title: "Integrations", label: "Channels" },
   "/system": { page: "system", title: "System / Agents", label: "Agent control" },
+  "/documentation": {
+    page: "documentation",
+    title: "Documentation",
+    label: "Therapist workspace",
+    therapistOnly: true,
+  },
+  "/my-patients": {
+    page: "my-patients",
+    title: "My patients",
+    label: "Therapist workspace",
+    therapistOnly: true,
+  },
 };
 
 const form = document.querySelector("#workflow-form");
@@ -55,6 +67,9 @@ const gmailSyncButton = document.querySelector("#gmail-sync-button");
 const gmailInboxRefreshButton = document.querySelector("#gmail-inbox-refresh");
 const securityPostureList = document.querySelector("#security-posture-list");
 const feedbackMetricsList = document.querySelector("#feedback-metrics-list");
+const therapistContextLabel = document.querySelector("#therapist-context-label");
+const myPatientsList = document.querySelector("#my-patients-list");
+const myPatientsCount = document.querySelector("#my-patients-count");
 const pageTitle = document.querySelector("#page-title");
 const sectionLabel = document.querySelector("#section-label");
 const recentWorkflowList = document.querySelector("#recent-workflow-list");
@@ -92,6 +107,10 @@ let latestTherapists = [];
 let latestTherapistCalendarCapacity = null;
 let latestWorkflows = [];
 let latestAppointments = [];
+let latestSecurityContext = null;
+let currentTherapist = null;
+let currentTherapistPatients = [];
+let securityContextLoaded = false;
 let selectedReferralId = null;
 let selectedTherapistId = null;
 let selectedCalendarTherapistFilter = null;
@@ -298,7 +317,13 @@ function navigate(path) {
 }
 
 function applyRoute(path) {
-  const route = routes[path] || routes["/"];
+  let route = routes[path] || routes["/"];
+  if (route.therapistOnly && securityContextLoaded && !hasTherapistWorkspaceAccess()) {
+    route = routes["/"];
+    if (window.location.pathname !== "/") {
+      window.history.replaceState({}, "", "/");
+    }
+  }
   document.querySelectorAll("[data-page]").forEach((page) => {
     page.classList.toggle("is-active", page.dataset.page === route.page);
   });
@@ -308,6 +333,13 @@ function applyRoute(path) {
   pageTitle.textContent = route.title;
   sectionLabel.textContent = route.label;
   document.title = `Lumen | ${route.title}`;
+  if (route.page === "my-patients" && hasTherapistWorkspaceAccess()) {
+    loadMyTherapistPatients();
+  }
+}
+
+function hasTherapistWorkspaceAccess() {
+  return latestSecurityContext?.user?.role === "therapist" && Boolean(currentTherapist);
 }
 
 function updateWorkflowSections(workflowType) {
@@ -589,6 +621,104 @@ async function refreshProductWorkspace() {
     loadFeedbackMetrics(),
   ]);
   await loadReferralJourney();
+}
+
+async function loadSecurityContext() {
+  try {
+    const response = await fetch("/api/security/context");
+    const data = await readResponseBody(response);
+    if (!response.ok) throw new Error(data.detail || "Security context is unavailable.");
+    latestSecurityContext = data;
+    securityContextLoaded = true;
+    if (latestSecurityContext?.user?.role === "therapist") {
+      await loadMyTherapist();
+    } else {
+      currentTherapist = null;
+      currentTherapistPatients = [];
+      renderMyTherapistPatients();
+    }
+  } catch (error) {
+    latestSecurityContext = null;
+    currentTherapist = null;
+    currentTherapistPatients = [];
+    securityContextLoaded = true;
+    renderMyTherapistPatients(friendlyClientError(error));
+  }
+  renderRoleAwareNavigation();
+  applyRoute(window.location.pathname);
+}
+
+async function loadMyTherapist() {
+  try {
+    const response = await fetch("/api/me/therapist");
+    const data = await readResponseBody(response);
+    if (!response.ok) throw new Error(data.detail || "Therapist profile is unavailable.");
+    currentTherapist = data.therapist || null;
+    renderTherapistWorkspaceContext();
+  } catch (error) {
+    currentTherapist = null;
+    renderTherapistWorkspaceContext(friendlyClientError(error));
+  }
+}
+
+async function loadMyTherapistPatients() {
+  if (!myPatientsList || !hasTherapistWorkspaceAccess()) return;
+  myPatientsList.replaceChildren(emptyState("Loading patients..."));
+  try {
+    const response = await fetch("/api/me/therapist/patients");
+    const data = await readResponseBody(response);
+    if (!response.ok) throw new Error(data.detail || "Patients are unavailable.");
+    currentTherapistPatients = data.patients || [];
+    renderMyTherapistPatients();
+  } catch (error) {
+    currentTherapistPatients = [];
+    renderMyTherapistPatients(friendlyClientError(error));
+  }
+}
+
+function renderRoleAwareNavigation() {
+  const enabled = hasTherapistWorkspaceAccess();
+  document.querySelectorAll("[data-therapist-only]").forEach((element) => {
+    element.hidden = !enabled;
+  });
+  renderTherapistWorkspaceContext();
+}
+
+function renderTherapistWorkspaceContext(errorMessage) {
+  if (!therapistContextLabel) return;
+  if (errorMessage) {
+    therapistContextLabel.textContent = "Unavailable";
+  } else if (currentTherapist?.name) {
+    therapistContextLabel.textContent = currentTherapist.name;
+  } else {
+    therapistContextLabel.textContent = "Therapist context";
+  }
+}
+
+function renderMyTherapistPatients(errorMessage) {
+  if (!myPatientsList) return;
+  const patients = currentTherapistPatients || [];
+  if (myPatientsCount) {
+    myPatientsCount.textContent = errorMessage ? "Unavailable" : `${patients.length} patient${patients.length === 1 ? "" : "s"}`;
+  }
+  if (errorMessage) {
+    myPatientsList.replaceChildren(emptyState(errorMessage));
+    return;
+  }
+  if (!patients.length) {
+    myPatientsList.replaceChildren(emptyState("No patients are assigned yet."));
+    return;
+  }
+  myPatientsList.replaceChildren(...patients.map((patient) => myPatientCard(patient)));
+}
+
+function myPatientCard(patient) {
+  return recordItem({
+    title: patient.display_name || patient.name || `Patient ${shortId(patient.id)}`,
+    status: patient.status || "active",
+    body: patient.contact_email || "No contact email recorded.",
+    meta: [patient.language, patient.next_appointment_at ? `next ${formatDate(patient.next_appointment_at)}` : null],
+  });
 }
 
 async function loadWorkflows() {
@@ -3811,6 +3941,7 @@ async function readResponseBody(response) {
 }
 
 applyRoute(window.location.pathname);
+loadSecurityContext();
 loadExamples();
 loadModelHealth();
 refreshProductWorkspace();

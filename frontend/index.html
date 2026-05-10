@@ -24,6 +24,8 @@
           <a href="/therapists" data-nav data-page-link="therapists">Therapists</a>
           <a href="/integrations" data-nav data-page-link="integrations">Integrations</a>
           <a href="/system" data-nav data-page-link="system">System / Agents</a>
+          <a href="/documentation" data-nav data-page-link="documentation" data-therapist-only hidden>Documentation</a>
+          <a href="/my-patients" data-nav data-page-link="my-patients" data-therapist-only hidden>My patients</a>
         </nav>
 
         <div class="sidebar-footer">
@@ -739,6 +741,42 @@
                   </div>
                 </div>
                 <div id="feedback-metrics-list" class="record-list"></div>
+              </section>
+            </div>
+          </section>
+
+          <section class="page" data-page="documentation" aria-labelledby="documentation-title" data-therapist-page>
+            <div class="workspace-grid">
+              <section class="panel" aria-labelledby="documentation-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Therapist workspace</p>
+                    <h2 id="documentation-title">Documentation</h2>
+                  </div>
+                  <span class="panel-stat" id="therapist-context-label">Therapist context</span>
+                </div>
+                <div id="documentation-placeholder" class="record-list">
+                  <article class="record-item" data-status="configured">
+                    <h4>Documentation workspace</h4>
+                    <span class="pill">placeholder</span>
+                    <p>Therapist documentation will live here after the documentation MVP is ported.</p>
+                  </article>
+                </div>
+              </section>
+            </div>
+          </section>
+
+          <section class="page" data-page="my-patients" aria-labelledby="my-patients-title" data-therapist-page>
+            <div class="workspace-grid">
+              <section class="panel" aria-labelledby="my-patients-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Therapist workspace</p>
+                    <h2 id="my-patients-title">My patients</h2>
+                  </div>
+                  <span class="panel-stat" id="my-patients-count">-</span>
+                </div>
+                <div id="my-patients-list" class="record-list"></div>
               </section>
             </div>
           </section>
