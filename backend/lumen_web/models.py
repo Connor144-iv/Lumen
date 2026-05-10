@@ -392,6 +392,54 @@ class ReportDraft(Base, TimestampMixin):
     signed_off_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
 
 
+class DocumentationSession(Base, TimestampMixin):
+    __tablename__ = "documentation_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), nullable=False, index=True)
+    patient_id: Mapped[str] = mapped_column(ForeignKey("patients.id"), nullable=False, index=True)
+    therapist_id: Mapped[str] = mapped_column(ForeignKey("therapists.id"), nullable=False, index=True)
+    referral_id: Mapped[str | None] = mapped_column(ForeignKey("referrals.id"), index=True)
+    appointment_id: Mapped[str | None] = mapped_column(ForeignKey("appointments.id"), index=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    patient_label_snapshot: Mapped[str | None] = mapped_column(String(255))
+    therapist_label_snapshot: Mapped[str | None] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(40), default="active", nullable=False, index=True)
+
+
+class DocumentationSessionText(Base, TimestampMixin):
+    __tablename__ = "documentation_session_texts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), nullable=False, index=True)
+    documentation_session_id: Mapped[str] = mapped_column(
+        ForeignKey("documentation_sessions.id"), nullable=False, index=True
+    )
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    input_type: Mapped[str] = mapped_column(String(80), default="session_text", nullable=False, index=True)
+    source_metadata: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    raw_source_stored: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
+class DocumentationSessionNote(Base, TimestampMixin):
+    __tablename__ = "documentation_session_notes"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), nullable=False, index=True)
+    documentation_session_id: Mapped[str] = mapped_column(
+        ForeignKey("documentation_sessions.id"), nullable=False, index=True
+    )
+    source_text_id: Mapped[str | None] = mapped_column(ForeignKey("documentation_session_texts.id"), index=True)
+    note_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    reviewed_json: Mapped[dict | None] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(40), default="draft", nullable=False, index=True)
+    generator: Mapped[str | None] = mapped_column(String(80))
+    model: Mapped[str | None] = mapped_column(String(255))
+    generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reviewer_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
+
+
 class ReferralImportBatch(Base, TimestampMixin):
     __tablename__ = "referral_import_batches"
 
