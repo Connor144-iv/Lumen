@@ -5603,6 +5603,34 @@ def list_appointments(
     return [appointment_to_dict(item) for item in session.scalars(query)]
 
 
+def list_patients_for_therapist(session: Session, therapist_id: str) -> list[dict[str, Any]]:
+    appointments = session.scalars(
+        select(Appointment)
+        .where(
+            Appointment.therapist_id == therapist_id,
+            Appointment.status != "cancelled",
+        )
+        .order_by(Appointment.starts_at.asc(), Appointment.created_at.asc())
+    )
+    patient_ids: list[str] = []
+    seen_patient_ids: set[str] = set()
+    for appointment in appointments:
+        patient_id = appointment.patient_id
+        if patient_id is None and appointment.referral_id:
+            referral = session.get(Referral, appointment.referral_id)
+            patient_id = referral.patient_id if referral is not None else None
+        if patient_id and patient_id not in seen_patient_ids:
+            patient_ids.append(patient_id)
+            seen_patient_ids.add(patient_id)
+
+    if not patient_ids:
+        return []
+
+    patients = session.scalars(select(Patient).where(Patient.id.in_(patient_ids)))
+    patients_by_id = {patient.id: patient for patient in patients}
+    return [patient_to_dict(patients_by_id[patient_id]) for patient_id in patient_ids if patient_id in patients_by_id]
+
+
 def therapist_calendar_capacity(session: Session, tenant_id: str | None = None) -> dict[str, Any]:
     therapists = list(session.scalars(select(Therapist).where(Therapist.tenant_id == tenant_id).order_by(Therapist.name))) if tenant_id else list(
         session.scalars(select(Therapist).order_by(Therapist.name))

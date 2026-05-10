@@ -54,6 +54,7 @@ from backend.lumen_web.repositories import (
     list_intake_tracker,
     list_inbound_gmail_messages,
     gmail_referral_workflow_input,
+    list_patients_for_therapist,
     list_referral_import_batches,
     list_referral_import_errors,
     list_appointments,
@@ -84,10 +85,12 @@ from backend.lumen_web.repositories import (
     sign_off_report_draft,
     start_intake_for_referral,
     request_appointment_reschedule,
+    therapist_for_user,
     therapist_calendar_capacity,
     update_report_draft,
     update_therapist,
 )
+from backend.lumen_web.models import User
 from backend.lumen_web.seed import DEMO_TENANT_ID, DEMO_THERAPIST_USER_ID, DEMO_USER_ID
 from backend.lumen_web.workflow_jobs import TERMINAL_STATUSES, WorkflowJobManager, WorkflowRequest
 
@@ -685,6 +688,30 @@ def _review_action_message(action: str, task: dict[str, Any], referral: dict[str
 def therapists(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
     with session_scope() as session:
         return {"therapists": list_therapists(session, tenant_id=tenant_id)}
+
+
+def _current_active_therapist(session, request: Request) -> dict[str, Any]:
+    user_id = current_user_id(request, fallback=DEMO_USER_ID)
+    user = session.get(User, user_id)
+    if user is None or user.role != "therapist" or not user.active:
+        raise HTTPException(status_code=403, detail="Current user is not an active therapist.")
+    therapist = therapist_for_user(session, user)
+    if therapist is None or not therapist.get("active"):
+        raise HTTPException(status_code=404, detail="No active therapist record is linked to the current user.")
+    return therapist
+
+
+@app.get("/api/me/therapist")
+def my_therapist(request: Request) -> dict[str, Any]:
+    with session_scope() as session:
+        return {"therapist": _current_active_therapist(session, request)}
+
+
+@app.get("/api/me/therapist/patients")
+def my_therapist_patients(request: Request) -> dict[str, Any]:
+    with session_scope() as session:
+        therapist = _current_active_therapist(session, request)
+        return {"patients": list_patients_for_therapist(session, therapist["id"])}
 
 
 @app.get("/api/therapists/calendar-capacity")
