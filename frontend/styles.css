@@ -577,6 +577,64 @@ h3 {
   align-items: start;
 }
 
+.therapist-patients-grid {
+  grid-template-columns: minmax(280px, 0.55fr) minmax(0, 1.45fr);
+}
+
+.therapist-patient-list-panel .record-list {
+  max-height: calc(100vh - 290px);
+}
+
+.therapist-patient-dashboard-panel #patient-session-detail,
+.therapist-patient-dashboard-panel #patient-dashboard-progress {
+  max-height: none;
+}
+
+.therapist-patient-dashboard-panel #patient-dashboard-sessions {
+  max-height: calc(100vh - 560px);
+}
+
+.documentation-focus-grid {
+  grid-template-columns: minmax(310px, 0.48fr) minmax(0, 1.52fr);
+}
+
+.documentation-controls-panel .record-list {
+  max-height: 340px;
+}
+
+.documentation-controls-panel .filter-form {
+  grid-template-columns: 1fr;
+}
+
+.documentation-editor-panel .record-list {
+  max-height: none;
+}
+
+.documentation-note-form {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px 16px;
+}
+
+.documentation-note-form > h4,
+.documentation-note-form > .pill,
+.documentation-note-form > .actions,
+.documentation-note-form > details,
+.documentation-note-field.is-wide {
+  grid-column: 1 / -1;
+}
+
+.documentation-note-field textarea {
+  min-height: 118px;
+}
+
+.documentation-note-form > .pill {
+  justify-self: start;
+}
+
+.documentation-editor-panel .record-item textarea[name="text"] {
+  min-height: 320px;
+}
+
 .panel {
   min-width: 0;
   border: 1px solid var(--border);
@@ -882,6 +940,75 @@ textarea:focus {
   max-height: 510px;
 }
 
+.state-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) auto;
+  gap: 8px 12px;
+  align-items: center;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.state-row > span:not(.pill) {
+  color: var(--text-soft);
+  font-size: 0.88rem;
+}
+
+.state-row .actions {
+  grid-column: 1 / -1;
+}
+
+.dashboard-grid {
+  grid-template-columns: minmax(320px, 0.78fr) minmax(0, 1.22fr);
+}
+
+.subsection-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: #fbfcff;
+  padding: 12px 16px;
+}
+
+.subsection-header h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.dashboard-grid #patient-dashboard-sessions {
+  max-height: calc(100vh - 250px);
+}
+
+.dashboard-grid #patient-session-detail,
+.dashboard-grid #patient-dashboard-progress {
+  max-height: none;
+}
+
+.dashboard-note-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(220px, 1fr));
+  gap: 12px 16px;
+}
+
+.dashboard-note-grid .key-value strong {
+  white-space: pre-line;
+}
+
+@media (max-width: 980px) {
+  .dashboard-grid,
+  .therapist-patients-grid,
+  .workspace-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .dashboard-note-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .large-list,
 .review-list {
   max-height: calc(100vh - 190px);
@@ -1060,6 +1187,17 @@ textarea:focus {
   background: #fbfcff;
   box-shadow: 0 14px 34px rgba(22, 31, 45, 0.09);
   transform: translateY(-1px);
+}
+
+.record-item.is-selected {
+  border-color: #7894ff;
+  border-left-color: var(--accent);
+  background: #f8faff;
+  box-shadow: 0 14px 34px rgba(54, 91, 214, 0.14);
+}
+
+.documentation-controls-panel .record-item.is-selected {
+  padding: 15px;
 }
 
 .record-item[data-status="ok"],

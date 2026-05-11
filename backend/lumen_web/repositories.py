@@ -22,6 +22,9 @@ from .models import (
     ConsentRecord,
     Document,
     DocumentChunk,
+    DocumentationSession,
+    DocumentationSessionNote,
+    DocumentationSessionText,
     DraftFeedback,
     HumanReviewTask,
     IntakeChecklistItem,
@@ -262,6 +265,8 @@ DEMO_CLEAN_PATIENT_ID = "demo-clean-patient-001"
 DEMO_CLEAN_THERAPIST_ID = "demo-clean-therapist-001"
 DEMO_CLEAN_INTAKE_TEMPLATE_ID = "demo-clean-intake-template"
 DEMO_CLARA_PATIENT_APPOINTMENT_ID = "demo-clara-patient-appt-001"
+DEMO_CLARA_DOCUMENTATION_SESSION_PREFIX = "demo-clara-doc-session"
+DEMO_CLARA_DOCUMENTATION_TEXT_PREFIX = "demo-clara-doc-text"
 SESSION_LENGTH_MINUTES = 60
 SESSION_BUFFER_MINUTES = 10
 THERAPIST_WEEKLY_PATIENT_CONTACT_CAP_HOURS = 20
@@ -2181,6 +2186,210 @@ def _ensure_clara_demo_patient_appointment(session: Session, tenant_id: str) -> 
     return appointment
 
 
+CLARA_DEMO_DOCUMENTATION_TRANSCRIPTS: tuple[tuple[str, str], ...] = (
+    (
+        "Initial documentation session",
+        (
+            "Therapist: We reviewed what brought you in and what would make therapy useful right now. "
+            "Patient: I have been carrying a lot of work stress and I notice it most at night. "
+            "Patient described difficulty falling asleep, replaying unfinished tasks, and feeling tense before meetings. "
+            "Therapist introduced a brief grounding practice and asked the patient to notice physical cues of stress. "
+            "Risk and safety were not directly assessed during this session. "
+            "Plan: patient will track sleep timing and work-stress triggers before the next session."
+        ),
+    ),
+    (
+        "Sleep and work stress follow-up",
+        (
+            "Patient reported two nights of improved sleep after using the grounding practice before bed. "
+            "Patient also reported one difficult night after a late work email. "
+            "Therapist helped the patient separate urgent tasks from tasks that could wait until morning. "
+            "Patient responded that writing the next day's first task made the evening feel more manageable. "
+            "Risk and safety were not directly assessed during this session. "
+            "Plan: continue grounding and add a brief end-of-work shutdown note."
+        ),
+    ),
+    (
+        "Boundaries and evening routine",
+        (
+            "Patient described checking work messages repeatedly after dinner and feeling pulled back into work. "
+            "Therapist explored boundaries around phone notifications and supported the patient in choosing one realistic change. "
+            "Patient agreed to silence work notifications after 20:00 on three weekdays. "
+            "Therapist practiced a short breathing exercise with the patient. "
+            "Risk and safety were not directly assessed during this session. "
+            "Plan: test the notification boundary and record what gets easier or harder."
+        ),
+    ),
+    (
+        "Partner tension and repair",
+        (
+            "Patient shared recent tension with their partner about being distracted and unavailable in the evenings. "
+            "Therapist reflected the link between work rumination, withdrawal, and conflict at home. "
+            "Patient identified wanting to communicate earlier instead of waiting until frustration builds. "
+            "Therapist supported role-play of a short repair conversation. "
+            "Risk and safety were not directly assessed during this session. "
+            "Plan: patient will try one brief check-in conversation before the next session."
+        ),
+    ),
+    (
+        "Coping with activation",
+        (
+            "Patient reported feeling activated before a presentation and noticing tightness in the chest and shoulders. "
+            "Therapist guided the patient through naming sensations, orienting to the room, and slowing the pace of breathing. "
+            "Patient said the exercise reduced the intensity enough to return to planning. "
+            "Therapist emphasized practicing the skill before stress peaks. "
+            "Risk and safety were not directly assessed during this session. "
+            "Plan: patient will practice orienting once daily and before work presentations."
+        ),
+    ),
+    (
+        "Reviewing progress",
+        (
+            "Patient reported fewer late-night work checks and described feeling more present during two evenings at home. "
+            "Patient also reported frustration after one boundary was interrupted by an urgent request. "
+            "Therapist normalized the setback and reviewed what was inside and outside the patient's control. "
+            "Patient identified that the shutdown note was most helpful when written before leaving the desk. "
+            "Risk and safety were not directly assessed during this session. "
+            "Plan: keep the shutdown note and refine the notification boundary."
+        ),
+    ),
+    (
+        "Values and workload",
+        (
+            "Patient explored how responsibility and fear of disappointing others affect workload decisions. "
+            "Therapist used values clarification to distinguish being reliable from being constantly available. "
+            "Patient described wanting to be reliable without sacrificing sleep and relationships. "
+            "Therapist helped draft language for declining one non-urgent request. "
+            "Risk and safety were not directly assessed during this session. "
+            "Plan: patient will use the drafted language if a similar request appears."
+        ),
+    ),
+    (
+        "Preparing for a difficult meeting",
+        (
+            "Patient described an upcoming meeting with a manager and worry about sounding defensive. "
+            "Therapist supported rehearsal of a concise agenda, including what support the patient needs and what is realistic. "
+            "Patient practiced slowing down before answering and naming one concrete request. "
+            "Therapist reinforced observing body cues during the meeting. "
+            "Risk and safety were not directly assessed during this session. "
+            "Plan: patient will bring the agenda and use one grounding pause before the meeting starts."
+        ),
+    ),
+    (
+        "After the manager meeting",
+        (
+            "Patient reported the manager meeting went better than expected and that the agenda helped keep the conversation focused. "
+            "Patient noticed some tension but did not feel overwhelmed. "
+            "Therapist reviewed the patient's use of grounding and communication skills. "
+            "Patient identified feeling proud of asking for clearer priorities. "
+            "Risk and safety were not directly assessed during this session. "
+            "Plan: monitor whether the priority agreement changes evening rumination."
+        ),
+    ),
+    (
+        "Maintaining gains",
+        (
+            "Patient reported continued improvement in sleep on workdays when the shutdown routine is completed. "
+            "Patient described a remaining pattern of checking messages on Sunday evenings. "
+            "Therapist explored what Sunday checking is trying to prevent and whether another planning ritual could meet that need. "
+            "Patient agreed to a 15-minute Sunday planning window instead of repeated checking. "
+            "Risk and safety were not directly assessed during this session. "
+            "Plan: test the planning window and compare sleep quality."
+        ),
+    ),
+    (
+        "Stress spike and adjustment",
+        (
+            "Patient reported a stressful week with several deadlines and one return to late-night work. "
+            "Therapist helped the patient review the week without treating it as failure. "
+            "Patient identified that skipping meals and breaks made evening stress worse. "
+            "Therapist supported selecting one midday regulation practice. "
+            "Risk and safety were not directly assessed during this session. "
+            "Plan: patient will schedule one protected lunch break on high-demand days."
+        ),
+    ),
+    (
+        "Consolidation session",
+        (
+            "Patient summarized that sleep, evening availability, and work boundaries have improved since the first session. "
+            "Patient noted that stress still rises during deadline weeks but feels more workable. "
+            "Therapist reviewed skills that have been useful: grounding, shutdown notes, notification boundaries, agenda preparation, and repair conversations. "
+            "Patient identified wanting to keep practicing before stress becomes intense. "
+            "Risk and safety were not directly assessed during this session. "
+            "Plan: continue the current routine and revisit goals at the next session."
+        ),
+    ),
+)
+
+
+def seed_clara_demo_documentation_transcripts(session: Session, tenant_id: str = DEMO_TENANT_ID) -> dict[str, Any]:
+    reset_clean_demo_referral(session, tenant_id=tenant_id)
+    session_ids = [
+        item
+        for item in session.scalars(
+            select(DocumentationSession.id).where(
+                DocumentationSession.patient_id == DEMO_CLEAN_PATIENT_ID,
+                DocumentationSession.therapist_id == DEMO_CLEAN_THERAPIST_ID,
+            )
+        )
+    ]
+    session.execute(delete(DocumentationSessionNote).where(DocumentationSessionNote.documentation_session_id.in_(session_ids)))
+    session.execute(delete(DocumentationSessionText).where(DocumentationSessionText.documentation_session_id.in_(session_ids)))
+    session.execute(delete(DocumentationSession).where(DocumentationSession.id.in_(session_ids)))
+    base_time = utc_now() - timedelta(days=84)
+    created_sessions = []
+    for index, (title, transcript) in enumerate(CLARA_DEMO_DOCUMENTATION_TRANSCRIPTS, start=1):
+        created_at = base_time + timedelta(days=(index - 1) * 7)
+        doc_session = DocumentationSession(
+            id=f"{DEMO_CLARA_DOCUMENTATION_SESSION_PREFIX}-{index:03d}",
+            tenant_id=tenant_id,
+            patient_id=DEMO_CLEAN_PATIENT_ID,
+            therapist_id=DEMO_CLEAN_THERAPIST_ID,
+            referral_id=DEMO_CLEAN_REFERRAL_ID,
+            appointment_id=DEMO_CLARA_PATIENT_APPOINTMENT_ID,
+            title=title,
+            patient_label_snapshot="Clean Demo Patient",
+            therapist_label_snapshot="Dr. Clara Demo",
+            status="active",
+            created_at=created_at,
+            updated_at=created_at,
+        )
+        source_text = DocumentationSessionText(
+            id=f"{DEMO_CLARA_DOCUMENTATION_TEXT_PREFIX}-{index:03d}",
+            tenant_id=tenant_id,
+            documentation_session_id=doc_session.id,
+            text=transcript,
+            input_type="manual_text",
+            source_metadata={
+                "source": "synthetic_admin_seed",
+                "seed": "clara_demo_documentation_transcripts",
+                "raw_source_stored": False,
+            },
+            raw_source_stored=False,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+        session.add_all([doc_session, source_text])
+        created_sessions.append(doc_session)
+    session.flush()
+    return {
+        "patient_id": DEMO_CLEAN_PATIENT_ID,
+        "therapist_id": DEMO_CLEAN_THERAPIST_ID,
+        "session_count": len(created_sessions),
+        "text_count": len(created_sessions),
+        "sessions": [
+            {
+                "id": item.id,
+                "title": item.title,
+                "patient_id": item.patient_id,
+                "therapist_id": item.therapist_id,
+                "created_at": iso_or_none(item.created_at),
+            }
+            for item in created_sessions
+        ],
+    }
+
+
 def _delete_clean_demo_referral_rows(session: Session) -> None:
     workflow_ids = [
         item
@@ -2200,6 +2409,24 @@ def _delete_clean_demo_referral_rows(session: Session) -> None:
         session.execute(delete(WorkflowRun).where(WorkflowRun.id.in_(workflow_ids)))
     if document_ids:
         session.execute(delete(DocumentChunk).where(DocumentChunk.document_id.in_(document_ids)))
+    documentation_session_ids = [
+        item
+        for item in session.scalars(
+            select(DocumentationSession.id).where(DocumentationSession.referral_id == DEMO_CLEAN_REFERRAL_ID)
+        )
+    ]
+    if documentation_session_ids:
+        session.execute(
+            delete(DocumentationSessionNote).where(
+                DocumentationSessionNote.documentation_session_id.in_(documentation_session_ids)
+            )
+        )
+        session.execute(
+            delete(DocumentationSessionText).where(
+                DocumentationSessionText.documentation_session_id.in_(documentation_session_ids)
+            )
+        )
+        session.execute(delete(DocumentationSession).where(DocumentationSession.id.in_(documentation_session_ids)))
     session.execute(delete(HumanReviewTask).where(HumanReviewTask.referral_id == DEMO_CLEAN_REFERRAL_ID))
     session.execute(delete(CommunicationDraft).where(CommunicationDraft.referral_id == DEMO_CLEAN_REFERRAL_ID))
     session.execute(delete(Appointment).where(Appointment.referral_id == DEMO_CLEAN_REFERRAL_ID))

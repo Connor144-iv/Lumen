@@ -23,10 +23,33 @@ const routes = {
     label: "Therapist workspace",
     therapistOnly: true,
   },
+  "/patients/:patientKey/dashboard": {
+    page: "my-patients",
+    title: "Patient dashboard",
+    label: "Therapist workspace",
+    therapistOnly: true,
+  },
 };
 
 const DEV_USER_STORAGE_KEY = "lumen.devUserId";
+const DEV_SWITCHER_STORAGE_KEY = "lumen.enableDevUserSwitcher";
+const DOCUMENTATION_SESSION_STORAGE_KEY = "lumen.documentation.selectedSession";
+const DOCUMENTATION_NOTE_LIST_FIELDS = [
+  ["key_points_discussed", "Key points discussed"],
+  ["presenting_topics", "Presenting topics"],
+  ["subjective", "Subjective"],
+  ["objective_observations", "Objective observations"],
+  ["observed_behavior_patterns", "Observed behavior patterns"],
+  ["interventions", "Interventions"],
+  ["patient_response", "Patient response"],
+  ["recommendations", "Recommendations"],
+  ["follow_up_items", "Follow-up items"],
+  ["plan", "Plan"],
+  ["uncertainty_flags", "Uncertainty flags"],
+];
+const DOCUMENTATION_NOTE_VERSION = "session_note_v0.1";
 const nativeFetch = window.fetch.bind(window);
+const DEV_IDENTITY_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 
 window.fetch = (input, init = {}) => {
   const devUserId = localStorage.getItem(DEV_USER_STORAGE_KEY);
@@ -90,8 +113,18 @@ const documentationMessage = document.querySelector("#documentation-message");
 const documentationSessionList = document.querySelector("#documentation-session-list");
 const documentationDetail = document.querySelector("#documentation-detail");
 const documentationSessionStatus = document.querySelector("#documentation-session-status");
+const documentationBackDashboard = document.querySelector("#documentation-back-dashboard");
 const myPatientsList = document.querySelector("#my-patients-list");
 const myPatientsCount = document.querySelector("#my-patients-count");
+const myPatientsSearch = document.querySelector("#my-patients-search");
+const myPatientsMessage = document.querySelector("#my-patients-message");
+const patientDashboardTitle = document.querySelector("#patient-dashboard-title");
+const patientDashboardCount = document.querySelector("#patient-dashboard-count");
+const patientDashboardMessage = document.querySelector("#patient-dashboard-message");
+const patientDashboardProgress = document.querySelector("#patient-dashboard-progress");
+const patientDashboardSessions = document.querySelector("#patient-dashboard-sessions");
+const patientSessionDetail = document.querySelector("#patient-session-detail");
+const patientSessionStatus = document.querySelector("#patient-session-status");
 const pageTitle = document.querySelector("#page-title");
 const sectionLabel = document.querySelector("#section-label");
 const recentWorkflowList = document.querySelector("#recent-workflow-list");
@@ -138,6 +171,8 @@ let latestDocumentationDetail = null;
 let latestDocumentationSessionsByPatient = new Map();
 let selectedDocumentationPatientId = null;
 let selectedDocumentationSessionId = null;
+let latestPatientDashboard = null;
+let selectedDashboardPatientKey = null;
 let securityContextLoaded = false;
 let selectedReferralId = null;
 let selectedTherapistId = null;
@@ -158,6 +193,15 @@ document.querySelectorAll("[data-nav]").forEach((link) => {
 window.addEventListener("popstate", () => applyRoute(window.location.pathname));
 
 if (devUserSelect) {
+  const devSwitcherRequested = new URLSearchParams(window.location.search).get("devUserSwitcher") === "1";
+  if (devSwitcherRequested && DEV_IDENTITY_HOSTS.has(window.location.hostname)) {
+    localStorage.setItem(DEV_SWITCHER_STORAGE_KEY, "true");
+  }
+  const devSwitcherEnabled = DEV_IDENTITY_HOSTS.has(window.location.hostname)
+    && localStorage.getItem(DEV_SWITCHER_STORAGE_KEY) === "true";
+  if (!devSwitcherEnabled) {
+    devUserSelect.closest(".dev-user-switcher")?.setAttribute("hidden", "");
+  }
   devUserSelect.value = localStorage.getItem(DEV_USER_STORAGE_KEY) || "";
   devUserSelect.addEventListener("change", async () => {
     if (devUserSelect.value) {
@@ -175,7 +219,7 @@ if (devUserSelect) {
     selectedDocumentationPatientId = null;
     selectedDocumentationSessionId = null;
     await loadSecurityContext();
-    await refreshProductWorkspace();
+    await refreshWorkspaceForCurrentRole();
   });
 }
 
@@ -238,7 +282,7 @@ exportButton.addEventListener("click", () => {
 });
 
 refreshHealthButton.addEventListener("click", () => loadModelHealth());
-refreshProductButton.addEventListener("click", () => refreshProductWorkspace());
+refreshProductButton.addEventListener("click", () => refreshWorkspaceForCurrentRole());
 
 referralFilterForm.addEventListener("change", () => renderReferralLists());
 
@@ -375,8 +419,19 @@ documentationSessionForm?.addEventListener("submit", async (event) => {
   await createDocumentationSession();
 });
 
+myPatientsSearch?.addEventListener("input", () => renderMyTherapistPatients());
+
+documentationBackDashboard?.addEventListener("click", () => {
+  const patientKey = selectedDashboardPatientKey || selectedDocumentationPatientId || latestDocumentationDetail?.session?.patient_id;
+  if (patientKey) {
+    navigate(`/patients/${encodeURIComponent(patientKey)}/dashboard`);
+  } else {
+    navigate("/my-patients");
+  }
+});
+
 function navigate(path) {
-  const route = routes[path] || routes["/"];
+  const route = routeForPath(path);
   const nextPath = path === "/overview" ? "/" : path;
   if (window.location.pathname !== nextPath) {
     window.history.pushState({}, "", nextPath);
@@ -385,7 +440,18 @@ function navigate(path) {
 }
 
 function applyRoute(path) {
-  let route = routes[path] || routes["/"];
+  let route = routeForPath(path);
+  if (securityContextLoaded) {
+    if (isTherapistUser() && !route.therapistOnly) {
+      route = routes["/documentation"];
+      path = "/documentation";
+      window.history.replaceState({}, "", path);
+    } else if (route.therapistOnly && isAdminUser()) {
+      route = routes["/"];
+      path = "/";
+      window.history.replaceState({}, "", path);
+    }
+  }
   document.querySelectorAll("[data-page]").forEach((page) => {
     page.classList.toggle("is-active", page.dataset.page === route.page);
   });
@@ -403,6 +469,7 @@ function applyRoute(path) {
     }
   }
   if (route.page === "my-patients") {
+    selectedDashboardPatientKey = route.params?.patientKey || selectedDashboardPatientKey;
     if (hasTherapistWorkspaceAccess()) {
       loadMyTherapistPatients();
     } else if (securityContextLoaded) {
@@ -411,8 +478,36 @@ function applyRoute(path) {
   }
 }
 
+function routeForPath(path) {
+  const patientDashboardMatch = path.match(/^\/patients\/([^/]+)\/dashboard$/);
+  if (patientDashboardMatch) {
+    return { ...routes["/patients/:patientKey/dashboard"], params: { patientKey: decodeURIComponent(patientDashboardMatch[1]) } };
+  }
+  return routes[path] || routes["/"];
+}
+
 function hasTherapistWorkspaceAccess() {
   return latestSecurityContext?.user?.role === "therapist" && Boolean(currentTherapist);
+}
+
+function isTherapistUser() {
+  return latestSecurityContext?.user?.role === "therapist";
+}
+
+function isAdminUser() {
+  return latestSecurityContext?.user?.role === "admin";
+}
+
+async function refreshWorkspaceForCurrentRole() {
+  if (isTherapistUser()) {
+    if (routeForPath(window.location.pathname).page === "my-patients") {
+      await loadMyTherapistPatients();
+    } else {
+      await loadDocumentationWorkspace();
+    }
+    return;
+  }
+  await refreshProductWorkspace();
 }
 
 function updateWorkflowSections(workflowType) {
@@ -737,21 +832,64 @@ async function loadMyTherapist() {
 async function loadMyTherapistPatients() {
   if (!myPatientsList || !hasTherapistWorkspaceAccess()) return;
   myPatientsList.replaceChildren(emptyState("Loading patients..."));
+  setMyPatientsMessage("Loading patients...");
+  renderPatientDashboardUnavailable("Select a patient to view progress and sessions.");
   try {
-    await loadDocumentationPatients();
-    currentTherapistPatients = latestDocumentationPatients;
-    await loadDocumentationSessionsForPatients(currentTherapistPatients);
+    const response = await fetch("/api/documentation/therapists/all/patients/overview");
+    const data = await readResponseBody(response);
+    if (!response.ok) throw new Error(data.detail || "Patient overview is unavailable.");
+    currentTherapistPatients = data.patients || [];
+    latestDocumentationPatients = currentTherapistPatients;
+    latestDocumentationSessionsByPatient = new Map();
+    if (
+      selectedDashboardPatientKey &&
+      !currentTherapistPatients.some((patient) => stablePatientKey(patient) === selectedDashboardPatientKey)
+    ) {
+      selectedDashboardPatientKey = null;
+    }
+    if (!selectedDashboardPatientKey && currentTherapistPatients.length) {
+      selectedDashboardPatientKey = stablePatientKey(currentTherapistPatients[0]);
+    }
+    setMyPatientsMessage("");
     renderMyTherapistPatients();
+    if (selectedDashboardPatientKey) {
+      await loadPatientDashboard(selectedDashboardPatientKey, { autoGenerateProgress: true });
+    }
   } catch (error) {
     currentTherapistPatients = [];
     latestDocumentationSessionsByPatient = new Map();
+    setMyPatientsMessage(friendlyClientError(error), true);
     renderMyTherapistPatients(friendlyClientError(error));
+  }
+}
+
+async function loadPatientDashboard(patientKey, options = {}) {
+  if (!patientKey || !patientDashboardSessions) return;
+  setPatientDashboardMessage("Loading patient dashboard...");
+  patientDashboardSessions.replaceChildren(emptyState("Loading sessions..."));
+  patientSessionDetail?.replaceChildren(emptyState("Loading patient overview..."));
+  try {
+    const response = await fetch(`/api/documentation/patients/${encodeURIComponent(patientKey)}/dashboard`);
+    const data = await readResponseBody(response);
+    if (!response.ok) throw new Error(data.detail || "Patient dashboard is unavailable.");
+    latestPatientDashboard = data;
+    selectedDashboardPatientKey = data.patient?.patient_key || patientKey;
+    setPatientDashboardMessage("");
+    renderPatientDashboard();
+    if (options.autoGenerateProgress) {
+      await generatePatientProgressOverview({ auto: true });
+    }
+  } catch (error) {
+    latestPatientDashboard = null;
+    setPatientDashboardMessage(friendlyClientError(error), true);
+    renderPatientDashboardUnavailable(friendlyClientError(error));
   }
 }
 
 async function loadDocumentationWorkspace() {
   if (!hasTherapistWorkspaceAccess()) return;
   setDocumentationMessage("Loading documentation workspace...");
+  restoreDocumentationSelectionFromStorage();
   renderDocumentationTherapistSummary();
   try {
     await loadDocumentationPatients();
@@ -937,11 +1075,12 @@ async function saveDocumentationText(textRecord, textValue) {
 
 async function saveDocumentationReviewedNote(noteValue, sourceTextId) {
   if (!selectedDocumentationSessionId) return;
-  const cleanValue = noteValue.trim();
-  if (!cleanValue) throw new Error("Reviewed note is required.");
+  const noteJson =
+    noteValue && typeof noteValue === "object" ? noteValue : { summary: typeof noteValue === "string" ? noteValue.trim() : "" };
+  if (!String(noteJson.summary || "").trim()) throw new Error("Reviewed note is required.");
   const payload = {
     source_text_id: sourceTextId || null,
-    note_json: { summary: cleanValue },
+    note_json: noteJson,
   };
   const response = await fetch(
     `/api/documentation/sessions/${encodeURIComponent(selectedDocumentationSessionId)}/notes/reviewed`,
@@ -951,6 +1090,46 @@ async function saveDocumentationReviewedNote(noteValue, sourceTextId) {
       body: JSON.stringify(payload),
     },
   );
+  const data = await readResponseBody(response);
+  if (!response.ok) throw new Error(data.detail || "Reviewed note could not be saved.");
+  await loadDocumentationDetail(selectedDocumentationSessionId);
+}
+
+async function generateDocumentationNote(sourceTextId) {
+  if (!selectedDocumentationSessionId) return;
+  const response = await fetch(
+    `/api/documentation/sessions/${encodeURIComponent(selectedDocumentationSessionId)}/notes/generate`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source_text_id: sourceTextId || null }),
+    },
+  );
+  const data = await readResponseBody(response);
+  if (!response.ok) throw new Error(data.detail || "Draft note could not be generated.");
+  await loadDocumentationDetail(selectedDocumentationSessionId);
+}
+
+async function uploadDocumentationAudio(sessionId, file) {
+  if (!sessionId || !file) return;
+  const formData = new FormData();
+  formData.append("audio", file);
+  const response = await fetch(`/api/documentation/sessions/${encodeURIComponent(sessionId)}/audio/transcribe`, {
+    method: "POST",
+    body: formData,
+  });
+  const data = await readResponseBody(response);
+  if (!response.ok) throw new Error(data.detail || "Audio transcription failed.");
+  await loadDocumentationDetail(sessionId);
+}
+
+async function updateDocumentationReviewedNote(noteId, reviewedJson) {
+  if (!selectedDocumentationSessionId || !noteId) return;
+  const response = await fetch(`/api/documentation/notes/${encodeURIComponent(noteId)}/reviewed`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reviewed_json: reviewedJson }),
+  });
   const data = await readResponseBody(response);
   if (!response.ok) throw new Error(data.detail || "Reviewed note could not be saved.");
   await loadDocumentationDetail(selectedDocumentationSessionId);
@@ -1017,6 +1196,9 @@ function renderDocumentationDetail() {
   if (documentationSessionStatus) {
     documentationSessionStatus.textContent = session ? session.status || "active" : "No session selected";
   }
+  if (documentationBackDashboard) {
+    documentationBackDashboard.hidden = !session?.patient_id;
+  }
   if (!session) {
     documentationDetail.replaceChildren(emptyState("Select or create a documentation session."));
     return;
@@ -1038,14 +1220,45 @@ function renderDocumentationDetail() {
   const transcriptInput = document.createElement("textarea");
   transcriptInput.name = "text";
   transcriptInput.placeholder = "Enter transcript or session text.";
+  transcriptInput.rows = 16;
   transcriptInput.value = latestText?.text || "";
+  const audioLabel = documentationFieldLabel("Audio file");
+  const audioInput = document.createElement("input");
+  audioInput.type = "file";
+  audioInput.accept = "audio/*";
+  audioLabel.appendChild(audioInput);
   const transcriptActions = document.createElement("div");
   transcriptActions.className = "actions tight";
   const transcriptSubmit = document.createElement("button");
   transcriptSubmit.type = "submit";
   transcriptSubmit.textContent = latestText ? "Update transcript" : "Save transcript";
-  transcriptActions.appendChild(transcriptSubmit);
-  transcriptForm.append(transcriptInput, transcriptActions);
+  const transcribeButton = document.createElement("button");
+  transcribeButton.type = "button";
+  transcribeButton.className = "secondary compact";
+  transcribeButton.textContent = "Upload audio and transcribe";
+  transcribeButton.addEventListener("click", async () => {
+    if (!audioInput.files?.[0]) {
+      setDocumentationMessage("Choose an audio file before transcription.", true);
+      return;
+    }
+    setDocumentationMessage("Transcribing audio...");
+    transcribeButton.disabled = true;
+    transcriptSubmit.disabled = true;
+    audioInput.disabled = true;
+    transcribeButton.textContent = "Transcribing...";
+    try {
+      await uploadDocumentationAudio(session.id, audioInput.files[0]);
+      setDocumentationMessage("Audio transcribed. Review and edit the transcript text above.");
+    } catch (error) {
+      setDocumentationMessage(friendlyClientError(error), true);
+      transcribeButton.disabled = false;
+      transcriptSubmit.disabled = false;
+      audioInput.disabled = false;
+      transcribeButton.textContent = "Upload audio and transcribe";
+    }
+  });
+  transcriptActions.append(transcriptSubmit, transcribeButton);
+  transcriptForm.append(transcriptInput, audioLabel, transcriptActions);
   transcriptForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     setDocumentationMessage("Saving transcript...");
@@ -1057,33 +1270,182 @@ function renderDocumentationDetail() {
     }
   });
 
+  const notePanel = renderDocumentationNotePanel(latestText, latestNote);
+
+  documentationDetail.replaceChildren(header, transcriptForm, notePanel);
+}
+
+function renderDocumentationNotePanel(latestText, latestNote) {
   const noteForm = document.createElement("form");
-  noteForm.className = "record-item";
-  noteForm.dataset.status = latestNote ? "reviewed" : "pending";
-  noteForm.append(heading("Reviewed note"), pill(latestNote ? latestNote.status : "new"));
-  const noteInput = document.createElement("textarea");
-  noteInput.name = "note";
-  noteInput.placeholder = "Write a reviewed note summary.";
-  noteInput.value = latestNote?.reviewed_json?.summary || latestNote?.note_json?.summary || "";
-  const noteActions = document.createElement("div");
-  noteActions.className = "actions tight";
-  const noteSubmit = document.createElement("button");
-  noteSubmit.type = "submit";
-  noteSubmit.textContent = "Save reviewed note";
-  noteActions.appendChild(noteSubmit);
-  noteForm.append(noteInput, noteActions);
+  noteForm.className = "record-item documentation-note-form";
+  noteForm.dataset.status = latestNote ? latestNote.status : "pending";
+  noteForm.append(heading("Draft and reviewed note"), pill(latestNote ? latestNote.status : "no draft"));
+
+  const draftJson = latestNote?.reviewed_json || latestNote?.note_json || createEmptyDocumentationNoteJson();
+  const fields = createDocumentationNoteFields(draftJson);
+
+  const actions = document.createElement("div");
+  actions.className = "actions tight";
+  const generateButton = document.createElement("button");
+  generateButton.type = "button";
+  generateButton.className = "secondary compact";
+  generateButton.textContent = latestNote ? "Regenerate draft" : "Generate draft";
+  generateButton.disabled = !latestText;
+  generateButton.addEventListener("click", async () => {
+    setDocumentationMessage("Generating draft note...");
+    try {
+      await generateDocumentationNote(latestText?.id);
+      setDocumentationMessage("Draft note generated.");
+    } catch (error) {
+      setDocumentationMessage(friendlyClientError(error), true);
+    }
+  });
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.textContent = latestNote ? "Save reviewed note" : "Save manual reviewed note";
+  actions.append(generateButton, submit);
+
+  const raw = document.createElement("details");
+  const rawSummary = document.createElement("summary");
+  rawSummary.textContent = "Structured JSON";
+  const rawText = document.createElement("pre");
+  rawText.textContent = JSON.stringify(draftJson, null, 2);
+  raw.append(rawSummary, rawText);
+
+  noteForm.append(...fields.elements, actions, raw);
   noteForm.addEventListener("submit", async (event) => {
     event.preventDefault();
+    const reviewedJson = readDocumentationNoteFields(fields.inputs);
     setDocumentationMessage("Saving reviewed note...");
     try {
-      await saveDocumentationReviewedNote(noteInput.value, latestText?.id);
+      if (latestNote?.id) {
+        await updateDocumentationReviewedNote(latestNote.id, reviewedJson);
+      } else {
+        await saveDocumentationReviewedNote(reviewedJson, latestText?.id);
+      }
       setDocumentationMessage("Reviewed note saved.");
     } catch (error) {
       setDocumentationMessage(friendlyClientError(error), true);
     }
   });
+  return noteForm;
+}
 
-  documentationDetail.replaceChildren(header, transcriptForm, noteForm);
+function createDocumentationNoteFields(noteJson) {
+  const inputs = {};
+  const elements = [];
+  const summaryLabel = documentationFieldLabel("Summary");
+  summaryLabel.classList.add("documentation-note-field", "is-wide");
+  const summaryInput = document.createElement("textarea");
+  summaryInput.rows = 4;
+  summaryInput.value = noteJson.summary || "";
+  summaryInput.placeholder = "Reviewed session summary.";
+  summaryLabel.appendChild(summaryInput);
+  inputs.summary = summaryInput;
+  elements.push(summaryLabel);
+
+  DOCUMENTATION_NOTE_LIST_FIELDS.forEach(([key, label]) => {
+    const wrapper = documentationFieldLabel(label);
+    wrapper.classList.add("documentation-note-field");
+    const input = document.createElement("textarea");
+    input.rows = key === "uncertainty_flags" ? 3 : 4;
+    input.value = listToLines(noteJson[key]);
+    input.placeholder = "One item per line.";
+    wrapper.appendChild(input);
+    inputs[key] = input;
+    elements.push(wrapper);
+  });
+
+  const riskStatusLabel = documentationFieldLabel("Risk or safety status");
+  riskStatusLabel.classList.add("documentation-note-field");
+  const riskStatus = document.createElement("select");
+  ["not_assessed", "mentioned", "assessed_denied"].forEach((status) => {
+    riskStatus.appendChild(new Option(status.replace("_", " "), status));
+  });
+  riskStatus.value = noteJson.risk_or_safety?.status || "not_assessed";
+  riskStatusLabel.appendChild(riskStatus);
+  inputs.risk_status = riskStatus;
+  elements.push(riskStatusLabel);
+
+  const riskDetailsLabel = documentationFieldLabel("Risk or safety details");
+  riskDetailsLabel.classList.add("documentation-note-field");
+  const riskDetails = document.createElement("textarea");
+  riskDetails.rows = 3;
+  riskDetails.value = noteJson.risk_or_safety?.details || "";
+  riskDetails.placeholder = "Use source wording when risk or safety was discussed.";
+  riskDetailsLabel.appendChild(riskDetails);
+  inputs.risk_details = riskDetails;
+  elements.push(riskDetailsLabel);
+  return { elements, inputs };
+}
+
+function documentationFieldLabel(text) {
+  const label = document.createElement("label");
+  label.textContent = text;
+  return label;
+}
+
+function readDocumentationNoteFields(inputs) {
+  return {
+    version: DOCUMENTATION_NOTE_VERSION,
+    summary: inputs.summary.value.trim(),
+    source_basis: {
+      raw_source_stored: false,
+      input_used: "extracted_session_text",
+    },
+    key_points_discussed: linesToList(inputs.key_points_discussed.value),
+    presenting_topics: linesToList(inputs.presenting_topics.value),
+    subjective: linesToList(inputs.subjective.value),
+    objective_observations: linesToList(inputs.objective_observations.value),
+    observed_behavior_patterns: linesToList(inputs.observed_behavior_patterns.value),
+    interventions: linesToList(inputs.interventions.value),
+    patient_response: linesToList(inputs.patient_response.value),
+    recommendations: linesToList(inputs.recommendations.value),
+    follow_up_items: linesToList(inputs.follow_up_items.value),
+    risk_or_safety: {
+      status: inputs.risk_status.value,
+      details: inputs.risk_details.value.trim(),
+    },
+    plan: linesToList(inputs.plan.value),
+    uncertainty_flags: linesToList(inputs.uncertainty_flags.value),
+  };
+}
+
+function createEmptyDocumentationNoteJson() {
+  return {
+    version: DOCUMENTATION_NOTE_VERSION,
+    summary: "",
+    source_basis: {
+      raw_source_stored: false,
+      input_used: "extracted_session_text",
+    },
+    key_points_discussed: [],
+    presenting_topics: [],
+    subjective: [],
+    objective_observations: [],
+    observed_behavior_patterns: [],
+    interventions: [],
+    patient_response: [],
+    recommendations: [],
+    follow_up_items: [],
+    risk_or_safety: {
+      status: "not_assessed",
+      details: "",
+    },
+    plan: [],
+    uncertainty_flags: [],
+  };
+}
+
+function listToLines(value) {
+  return Array.isArray(value) ? value.join("\n") : "";
+}
+
+function linesToList(value) {
+  return String(value || "")
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function setDocumentationMessage(message, isError = false) {
@@ -1093,9 +1455,13 @@ function setDocumentationMessage(message, isError = false) {
 }
 
 function renderRoleAwareNavigation() {
-  const enabled = hasTherapistWorkspaceAccess();
+  const therapistEnabled = hasTherapistWorkspaceAccess();
+  const adminEnabled = isAdminUser();
   document.querySelectorAll("[data-therapist-only]").forEach((element) => {
-    element.hidden = !enabled;
+    element.hidden = !therapistEnabled;
+  });
+  document.querySelectorAll("[data-admin-only]").forEach((element) => {
+    element.hidden = !adminEnabled;
   });
   renderTherapistWorkspaceContext();
 }
@@ -1114,7 +1480,10 @@ function renderTherapistWorkspaceContext(errorMessage) {
 
 function renderMyTherapistPatients(errorMessage) {
   if (!myPatientsList) return;
-  const patients = currentTherapistPatients || [];
+  const query = String(myPatientsSearch?.value || "").trim().toLowerCase();
+  const patients = (currentTherapistPatients || []).filter((patient) =>
+    String(patient.patient_label || patient.display_name || patient.name || patient.id || "").toLowerCase().includes(query),
+  );
   if (myPatientsCount) {
     myPatientsCount.textContent = errorMessage ? "Unavailable" : `${patients.length} patient${patients.length === 1 ? "" : "s"}`;
   }
@@ -1130,33 +1499,327 @@ function renderMyTherapistPatients(errorMessage) {
 }
 
 function myPatientCard(patient) {
-  const sessions = latestDocumentationSessionsByPatient.get(patient.id) || [];
+  const patientKey = stablePatientKey(patient);
   const item = recordItem({
-    title: patient.display_name || patient.name || `Patient ${shortId(patient.id)}`,
+    title: patient.patient_label || patient.display_name || patient.name || `Patient ${shortId(patient.id)}`,
     status: patient.status || "active",
     body: patient.contact_email || "No contact email recorded.",
     meta: [
       patient.language,
-      `${sessions.length} documentation session${sessions.length === 1 ? "" : "s"}`,
-      patient.next_appointment_at ? `next ${formatDate(patient.next_appointment_at)}` : null,
+      `${patient.session_count || 0} session${patient.session_count === 1 ? "" : "s"}`,
+      patient.first_session_at ? `first ${formatDate(patient.first_session_at)}` : null,
+      patient.last_session_at ? `last ${formatDate(patient.last_session_at)}` : null,
     ],
+  });
+  if (patientKey === selectedDashboardPatientKey) item.classList.add("is-selected");
+  item.tabIndex = 0;
+  item.addEventListener("click", () => openPatientDashboard(patientKey));
+  item.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") openPatientDashboard(patientKey);
   });
   const actions = document.createElement("div");
   actions.className = "actions tight";
   actions.appendChild(
-    actionButton("Open documentation", () => {
-      selectedDocumentationPatientId = patient.id;
-      selectedDocumentationSessionId = null;
-      navigate("/documentation");
+    actionButton("View Dashboard", (event) => {
+      event.stopPropagation();
+      openPatientDashboard(patientKey);
     }),
   );
   item.appendChild(actions);
-  const sessionSummary = document.createElement("p");
-  sessionSummary.textContent = sessions.length
-    ? `Latest: ${sessions[0].title || "Documentation session"}`
-    : "No documentation sessions yet.";
-  item.appendChild(sessionSummary);
   return item;
+}
+
+function stablePatientKey(patient) {
+  return patient?.patient_id || patient?.id || patient?.patient_key || patient?.patient_label || patient?.display_name;
+}
+
+function openPatientDashboard(patientKey) {
+  if (!patientKey) return;
+  selectedDashboardPatientKey = patientKey;
+  renderMyTherapistPatients();
+  navigate(`/patients/${encodeURIComponent(patientKey)}/dashboard`);
+}
+
+function openDocumentationSessionFromDashboard(session) {
+  if (!session?.id) return;
+  const patient = latestPatientDashboard?.patient || {};
+  const patientId = session.patient_id || patient.patient_id || patient.id || null;
+  selectedDocumentationPatientId = patientId;
+  selectedDocumentationSessionId = session.id;
+  try {
+    sessionStorage.setItem(
+      DOCUMENTATION_SESSION_STORAGE_KEY,
+      JSON.stringify({ patientId, patientKey: selectedDashboardPatientKey || patient.patient_key || patientId, sessionId: session.id }),
+    );
+  } catch (_error) {
+    // Session handoff still works in-memory when storage is unavailable.
+  }
+  navigate("/documentation");
+}
+
+function restoreDocumentationSelectionFromStorage() {
+  try {
+    const raw = sessionStorage.getItem(DOCUMENTATION_SESSION_STORAGE_KEY);
+    if (!raw) return;
+    sessionStorage.removeItem(DOCUMENTATION_SESSION_STORAGE_KEY);
+    const selection = JSON.parse(raw);
+    selectedDocumentationPatientId = selection.patientId || selectedDocumentationPatientId;
+    selectedDashboardPatientKey = selection.patientKey || selectedDashboardPatientKey || selection.patientId || selectedDocumentationPatientId;
+    selectedDocumentationSessionId = selection.sessionId || selectedDocumentationSessionId;
+  } catch (_error) {
+    sessionStorage.removeItem(DOCUMENTATION_SESSION_STORAGE_KEY);
+  }
+}
+
+function renderPatientDashboardUnavailable(message) {
+  if (patientDashboardTitle) patientDashboardTitle.textContent = "Patient dashboard";
+  if (patientDashboardCount) patientDashboardCount.textContent = "Unavailable";
+  patientDashboardProgress?.replaceChildren(emptyState(message || "Patient dashboard is unavailable."));
+  patientDashboardSessions?.replaceChildren(emptyState(message || "Patient dashboard is unavailable."));
+  patientSessionDetail?.replaceChildren(emptyState(message || "Patient dashboard is unavailable."));
+  if (patientSessionStatus) patientSessionStatus.textContent = "Unavailable";
+}
+
+function renderPatientDashboard() {
+  if (!patientDashboardSessions || !latestPatientDashboard) return;
+  const patient = latestPatientDashboard.patient || {};
+  const sessions = [...(latestPatientDashboard.sessions || [])].sort((left, right) =>
+    String(left.session_date || left.created_at || "").localeCompare(String(right.session_date || right.created_at || "")),
+  );
+  if (patientDashboardTitle) patientDashboardTitle.textContent = patient.patient_label || patient.display_name || "Patient dashboard";
+  if (patientDashboardCount) patientDashboardCount.textContent = `${sessions.length} session${sessions.length === 1 ? "" : "s"}`;
+  renderPatientOverview(patient, sessions);
+  renderProgressOverview(latestPatientDashboard.progress_overview);
+  if (patientSessionStatus) patientSessionStatus.textContent = "Open a session";
+  if (!sessions.length) {
+    patientDashboardSessions.replaceChildren(emptyState("No sessions recorded for this patient."));
+  } else {
+    patientDashboardSessions.replaceChildren(...sessions.map((session) => patientDashboardSessionCard(session)));
+  }
+}
+
+function patientDashboardSessionCard(session) {
+  const latestNote = session.latest_note || {};
+  const item = recordItem({
+    title: session.title || "Documentation session",
+    status: latestNote.status || "no_draft",
+    body: session.transcript_snippet || "No transcript stored.",
+    meta: [
+      formatDate(session.session_date || session.created_at),
+      session.generated_note_summary ? "summary available" : null,
+      latestNote.reviewed_at ? `reviewed ${formatDate(latestNote.reviewed_at)}` : null,
+    ],
+  });
+  item.classList.add("clickable");
+  item.tabIndex = 0;
+  item.addEventListener("click", () => openDocumentationSessionFromDashboard(session));
+  item.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") openDocumentationSessionFromDashboard(session);
+  });
+  const actions = document.createElement("div");
+  actions.className = "actions tight";
+  actions.appendChild(
+    actionButton("Open Documentation", (event) => {
+      event.stopPropagation();
+      openDocumentationSessionFromDashboard(session);
+    }),
+  );
+  item.appendChild(actions);
+  return item;
+}
+
+function renderPatientOverview(patient, sessions) {
+  if (!patientSessionDetail) return;
+  const firstSession = sessions[0] || null;
+  const lastSession = sessions[sessions.length - 1] || null;
+  const item = recordItem({
+    title: patient.patient_label || patient.display_name || "Patient overview",
+    status: patient.status || "active",
+    body: patient.contact_email || patient.email || "No contact email recorded.",
+    meta: [
+      patient.patient_id || patient.id || patient.patient_key,
+      patient.language,
+      firstSession ? `first ${formatDate(firstSession.session_date || firstSession.created_at)}` : null,
+      lastSession ? `last ${formatDate(lastSession.session_date || lastSession.created_at)}` : null,
+    ],
+  });
+  const details = document.createElement("div");
+  details.className = "dashboard-note-grid";
+  details.append(
+    noteListBlock("Sessions recorded", [String(sessions.length)]),
+    noteListBlock("Patient key", [patient.patient_key || patient.patient_label || patient.id || "Not available"]),
+    noteListBlock("Latest session", [lastSession?.title || "No sessions recorded."]),
+  );
+  item.appendChild(details);
+  patientSessionDetail.replaceChildren(item);
+}
+
+function renderProgressOverview(overview) {
+  if (!patientDashboardProgress) return;
+  const progress = overview || {};
+  const sessions = latestPatientDashboard?.sessions || [];
+  const patient = latestPatientDashboard?.patient || {};
+  const sessionDates = sessions
+    .map((session) => session.session_date || session.created_at)
+    .filter(Boolean)
+    .sort();
+  const holistic = buildHolisticProgressFields(progress, sessions);
+  const item = recordItem({
+    title: "Progress overview",
+    status: progress.generated_at ? "AI-generated" : "review required",
+    body: progress.summary || "Generate a progress overview after transcripts and notes are ready.",
+    meta: [
+      "review required",
+      patient.patient_label || patient.display_name,
+      sessionDates[0] ? `first ${formatDate(sessionDates[0])}` : null,
+      sessionDates[sessionDates.length - 1] ? `last ${formatDate(sessionDates[sessionDates.length - 1])}` : null,
+      progress.source_session_count ? `${progress.source_session_count} source sessions` : null,
+      progress.reviewed_note_count ? `${progress.reviewed_note_count} reviewed notes` : null,
+      progress.generated_at ? formatDate(progress.generated_at) : null,
+    ],
+  });
+  const lists = document.createElement("div");
+  lists.className = "dashboard-note-grid";
+  holistic.forEach(({ label, values }) => lists.appendChild(noteListBlock(label, values)));
+  const actions = document.createElement("div");
+  actions.className = "actions tight";
+  actions.appendChild(actionButton("Refresh Progress Overview", () => generatePatientProgressOverview()));
+  item.append(lists, actions);
+  patientDashboardProgress.replaceChildren(item);
+}
+
+function buildHolisticProgressFields(progress, sessions) {
+  const subjective = collectSessionNoteItems(sessions, "subjective");
+  const patientResponse = collectSessionNoteItems(sessions, "patient_response");
+  const summaries = collectSessionSummaries(sessions);
+  const presentingTopics = collectSessionNoteItems(sessions, "presenting_topics");
+  const keyPoints = collectSessionNoteItems(sessions, "key_points_discussed");
+  const observations = collectSessionNoteItems(sessions, "objective_observations");
+  const followUps = collectSessionNoteItems(sessions, "follow_up_items");
+  const interventions = collectSessionNoteItems(sessions, "interventions");
+  const plan = collectSessionNoteItems(sessions, "plan");
+  const recommendations = collectSessionNoteItems(sessions, "recommendations");
+  const uncertainty = collectSessionNoteItems(sessions, "uncertainty_flags");
+  return [
+    {
+      label: "Overall Mood / Emotional Trends",
+      values: conciseUnique([...subjective, ...patientResponse, ...summaries], 4),
+    },
+    {
+      label: "Key Challenges / Stressors",
+      values: conciseUnique([...presentingTopics, ...keyPoints, ...observations, ...followUps, ...(progress.persistent_issues || [])], 5),
+    },
+    {
+      label: "Coping Skills & Interventions Practiced",
+      values: conciseUnique([...interventions, ...patientResponse, ...plan], 5),
+    },
+    {
+      label: "Progress Milestones / Achievements",
+      values: conciseUnique([...(progress.progress_milestones || []), ...(progress.improvements_or_trends || []), ...observations, ...patientResponse], 5),
+    },
+    {
+      label: "Follow-up / Actionable Items",
+      values: conciseUnique([...followUps, ...plan, ...recommendations, ...(progress.follow_up_items || [])], 5),
+    },
+    {
+      label: "Risk or Safety Flags",
+      values: conciseUnique(collectRiskSafetyItems(sessions), 5),
+    },
+    {
+      label: "Uncertainty / Ambiguity Flags",
+      values: conciseUnique([...uncertainty, ...plan, ...summaries], 5),
+    },
+    {
+      label: "Recommendations Trends",
+      values: conciseUnique([
+        ...recommendations,
+        ...(progress.recommendations || []),
+        ...(progress.recommendations_for_therapist || []),
+        ...(progress.recommendations_for_patient || []),
+        ...patientResponse,
+        ...followUps,
+      ], 5),
+    },
+  ];
+}
+
+function collectSessionNoteItems(sessions, key) {
+  const values = [];
+  sessions.forEach((session) => {
+    const note = latestSessionNoteJson(session);
+    const items = note[key];
+    if (Array.isArray(items)) values.push(...items);
+  });
+  return [...new Set(values.filter(Boolean))];
+}
+
+function latestSessionNoteJson(session) {
+  return session.latest_note?.reviewed_json || session.latest_note?.note_json || {};
+}
+
+function collectSessionSummaries(sessions) {
+  return sessions
+    .map((session) => latestSessionNoteJson(session).summary || session.generated_note_summary)
+    .filter(Boolean);
+}
+
+function collectRiskSafetyItems(sessions) {
+  return sessions
+    .map((session) => {
+      const risk = latestSessionNoteJson(session).risk_or_safety || {};
+      const status = risk.status ? `Status: ${String(risk.status).replaceAll("_", " ")}` : "";
+      return [status, risk.details].filter(Boolean).join(" - ");
+    })
+    .filter(Boolean);
+}
+
+function conciseUnique(values, limit) {
+  return [...new Set((values || []).map((value) => String(value).trim()).filter(Boolean))].slice(0, limit);
+}
+
+function noteListBlock(label, values) {
+  const block = document.createElement("div");
+  block.className = "key-value";
+  const title = document.createElement("span");
+  title.textContent = label;
+  const body = document.createElement("strong");
+  body.textContent = Array.isArray(values) && values.length ? values.join("\n") : "None recorded.";
+  block.append(title, body);
+  return block;
+}
+
+async function generatePatientProgressOverview(options = {}) {
+  if (!selectedDashboardPatientKey) return;
+  setPatientDashboardMessage(options.auto ? "Updating progress overview..." : "Generating progress overview...");
+  if (options.auto && patientDashboardProgress) {
+    patientDashboardProgress.replaceChildren(emptyState("Updating AI progress overview..."));
+  }
+  try {
+    const response = await fetch(
+      `/api/documentation/patients/${encodeURIComponent(selectedDashboardPatientKey)}/progress-overview/generate`,
+      { method: "POST" },
+    );
+    const data = await readResponseBody(response);
+    if (!response.ok) throw new Error(data.detail || "Progress overview could not be generated.");
+    latestPatientDashboard.progress_overview = data.progress_overview;
+    setPatientDashboardMessage(options.auto ? "" : "Progress overview generated.");
+    renderPatientDashboard();
+  } catch (error) {
+    setPatientDashboardMessage(friendlyClientError(error), true);
+    renderPatientDashboard();
+  }
+}
+
+function setMyPatientsMessage(message, isError = false) {
+  if (!myPatientsMessage) return;
+  myPatientsMessage.textContent = message || "";
+  myPatientsMessage.dataset.status = isError ? "failed" : "idle";
+}
+
+function setPatientDashboardMessage(message, isError = false) {
+  if (!patientDashboardMessage) return;
+  patientDashboardMessage.textContent = message || "";
+  patientDashboardMessage.dataset.status = isError ? "failed" : "idle";
 }
 
 async function loadWorkflows() {
@@ -4378,8 +5041,13 @@ async function readResponseBody(response) {
   }
 }
 
-applyRoute(window.location.pathname);
-loadSecurityContext();
-loadExamples();
-loadModelHealth();
-refreshProductWorkspace();
+async function initializeApp() {
+  await loadSecurityContext();
+  if (isAdminUser()) {
+    loadExamples();
+    loadModelHealth();
+  }
+  await refreshWorkspaceForCurrentRole();
+}
+
+initializeApp();

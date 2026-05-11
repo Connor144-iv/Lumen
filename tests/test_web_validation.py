@@ -43,6 +43,18 @@ def test_examples_endpoint_returns_samples() -> None:
     assert response.json()["examples"]
 
 
+def test_therapist_spa_routes_return_frontend_html() -> None:
+    for path in ("/documentation", "/my-patients", "/patients/{patient_key}/dashboard"):
+        route = next(item for item in app.routes if getattr(item, "path", None) == path)
+        if path == "/patients/{patient_key}/dashboard":
+            response = route.endpoint("demo-clean-patient-001")
+        else:
+            response = route.endpoint()
+
+        assert str(response.path).endswith("frontend/index.html")
+        assert response.media_type == "text/html"
+
+
 def test_integration_health_exposes_manual_google_calendar_placeholder() -> None:
     response = client.get("/api/integrations/health")
 

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Lumen Admin Workflow</title>
-    <link rel="stylesheet" href="static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
     <div class="app-shell">
@@ -18,12 +18,12 @@
         </a>
 
         <nav class="side-nav">
-          <a href="/" data-nav data-page-link="overview">Overview</a>
-          <a href="/workbench" data-nav data-page-link="workbench">Workbench</a>
-          <a href="/new-referral" data-nav data-page-link="new-referral">New referral</a>
-          <a href="/therapists" data-nav data-page-link="therapists">Therapists</a>
-          <a href="/integrations" data-nav data-page-link="integrations">Integrations</a>
-          <a href="/system" data-nav data-page-link="system">System / Agents</a>
+          <a href="/" data-nav data-page-link="overview" data-admin-only hidden>Overview</a>
+          <a href="/workbench" data-nav data-page-link="workbench" data-admin-only hidden>Workbench</a>
+          <a href="/new-referral" data-nav data-page-link="new-referral" data-admin-only hidden>New referral</a>
+          <a href="/therapists" data-nav data-page-link="therapists" data-admin-only hidden>Therapists</a>
+          <a href="/integrations" data-nav data-page-link="integrations" data-admin-only hidden>Integrations</a>
+          <a href="/system" data-nav data-page-link="system" data-admin-only hidden>System / Agents</a>
           <a href="/documentation" data-nav data-page-link="documentation" data-therapist-only hidden>Documentation</a>
           <a href="/my-patients" data-nav data-page-link="my-patients" data-therapist-only hidden>My patients</a>
         </nav>
@@ -54,14 +54,14 @@
                 <option value="demo-clara-therapist-user">Clara therapist</option>
               </select>
             </label>
-            <a class="button-link primary-action" href="/new-referral" data-nav>New referral</a>
-            <button id="demo-reset-button" type="button" class="secondary compact">Reset demo path</button>
+            <a class="button-link primary-action" href="/new-referral" data-nav data-admin-only hidden>New referral</a>
+            <button id="demo-reset-button" type="button" class="secondary compact" data-admin-only hidden>Reset demo path</button>
             <button id="refresh-product-button" type="button" class="secondary compact">Refresh data</button>
           </div>
         </header>
 
         <main class="content">
-          <section class="page is-active" data-page="overview" aria-labelledby="overview-title">
+          <section class="page" data-page="overview" aria-labelledby="overview-title">
             <h2 id="overview-title" class="sr-only">Referral Journey Dashboard</h2>
 
             <section class="metric-grid" aria-label="Operational metrics">
@@ -754,12 +754,12 @@
           </section>
 
           <section class="page" data-page="documentation" aria-labelledby="documentation-title" data-therapist-page>
-            <div class="workspace-grid">
-              <section class="panel" aria-labelledby="documentation-title">
+            <div class="workspace-grid documentation-focus-grid">
+              <section class="panel documentation-controls-panel" aria-labelledby="documentation-title">
                 <div class="panel-header">
                   <div>
                     <p class="eyebrow">Therapist workspace</p>
-                    <h2 id="documentation-title">Documentation</h2>
+                    <h2 id="documentation-title">Session controls</h2>
                   </div>
                   <span class="panel-stat" id="therapist-context-label">Therapist context</span>
                 </div>
@@ -779,13 +779,16 @@
                 <div id="documentation-session-list" class="record-list"></div>
               </section>
 
-              <section class="panel" aria-labelledby="documentation-detail-title">
+              <section class="panel documentation-editor-panel" aria-labelledby="documentation-detail-title">
                 <div class="panel-header">
                   <div>
-                    <p class="eyebrow">Selected session</p>
+                    <p class="eyebrow">Current session</p>
                     <h2 id="documentation-detail-title">Transcript and reviewed note</h2>
                   </div>
-                  <span class="panel-stat" id="documentation-session-status">No session selected</span>
+                  <div class="panel-actions">
+                    <button id="documentation-back-dashboard" class="secondary compact" type="button" hidden>Back to Dashboard</button>
+                    <span class="panel-stat" id="documentation-session-status">No session selected</span>
+                  </div>
                 </div>
                 <div id="documentation-detail" class="record-list"></div>
               </section>
@@ -793,8 +796,8 @@
           </section>
 
           <section class="page" data-page="my-patients" aria-labelledby="my-patients-title" data-therapist-page>
-            <div class="workspace-grid">
-              <section class="panel" aria-labelledby="my-patients-title">
+            <div class="workspace-grid therapist-patients-grid">
+              <section class="panel therapist-patient-list-panel" aria-labelledby="my-patients-title">
                 <div class="panel-header">
                   <div>
                     <p class="eyebrow">Therapist workspace</p>
@@ -802,7 +805,32 @@
                   </div>
                   <span class="panel-stat" id="my-patients-count">-</span>
                 </div>
+                <form class="filter-form" role="search">
+                  <label>
+                    Search patients
+                    <input id="my-patients-search" type="search" placeholder="Patient name" />
+                  </label>
+                </form>
+                <p id="my-patients-message" class="empty-state"></p>
                 <div id="my-patients-list" class="record-list"></div>
+              </section>
+
+              <section class="panel therapist-patient-dashboard-panel" aria-labelledby="patient-dashboard-title">
+                <div class="panel-header">
+                  <div>
+                    <p class="eyebrow">Patient dashboard</p>
+                    <h2 id="patient-dashboard-title">Patient dashboard</h2>
+                  </div>
+                  <span class="panel-stat" id="patient-dashboard-count">-</span>
+                </div>
+                <p id="patient-dashboard-message" class="empty-state"></p>
+                <div id="patient-session-detail" class="record-list"></div>
+                <div id="patient-dashboard-progress" class="record-list"></div>
+                <div class="subsection-header">
+                  <h3 id="patient-session-detail-title">Past sessions</h3>
+                  <span class="panel-stat" id="patient-session-status">Open a session</span>
+                </div>
+                <div id="patient-dashboard-sessions" class="record-list"></div>
               </section>
             </div>
           </section>
@@ -810,6 +838,6 @@
       </div>
     </div>
 
-    <script src="static/app.js"></script>
+    <script src="/static/app.js"></script>
   </body>
 </html>

@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -21,10 +21,16 @@ from backend.lumen_web import google_workspace
 from backend.lumen_web.documentation import (
     add_documentation_session_text_for_therapist,
     create_documentation_session_for_therapist,
+    documentation_patient_dashboard_for_therapist,
+    documentation_patients_overview_for_therapist,
     documentation_session_detail_for_therapist,
+    generate_progress_overview_for_therapist,
+    generate_documentation_note_for_therapist,
     list_documentation_patients_for_therapist,
     list_documentation_sessions_for_therapist,
     save_reviewed_documentation_note_for_therapist,
+    save_reviewed_documentation_note_update_for_therapist,
+    transcribe_documentation_session_audio_for_therapist,
     update_documentation_session_text_for_therapist,
 )
 from backend.lumen_web.model_health import check_configured_models
@@ -85,6 +91,7 @@ from backend.lumen_web.repositories import (
     record_simulated_patient_reply,
     reset_clean_demo_referral,
     review_task_to_dict,
+    seed_clara_demo_documentation_transcripts,
     mark_inbound_gmail_referral_workflow_started,
     request_consent_exception,
     request_intake_item_exception,
@@ -126,6 +133,13 @@ app = FastAPI(title="Lumen Workflow API", version="0.1.0")
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 
 jobs = WorkflowJobManager()
+
+
+async def require_admin(request: Request) -> None:
+    with session_scope() as session:
+        user = session.get(User, current_user_id(request, fallback=DEMO_USER_ID))
+        if user is None or not user.active or user.role != "admin":
+            raise HTTPException(status_code=403, detail="Current user is not an admin.")
 
 
 class ReviewActionRequest(BaseModel):
@@ -310,6 +324,14 @@ class DocumentationReviewedNoteRequest(BaseModel):
     source_text_id: str | None = None
 
 
+class DocumentationGenerateNoteRequest(BaseModel):
+    source_text_id: str | None = None
+
+
+class DocumentationReviewedNoteUpdateRequest(BaseModel):
+    reviewed_json: dict[str, Any]
+
+
 @app.get("/", include_in_schema=False)
 def index() -> FileResponse:
     return FileResponse(FRONTEND_DIR / "index.html")
@@ -326,9 +348,10 @@ def index() -> FileResponse:
 @app.get("/clinical", include_in_schema=False)
 @app.get("/documentation", include_in_schema=False)
 @app.get("/my-patients", include_in_schema=False)
+@app.get("/patients/{patient_key}/dashboard", include_in_schema=False)
 @app.get("/integrations", include_in_schema=False)
 @app.get("/system", include_in_schema=False)
-def app_page() -> FileResponse:
+def app_page(patient_key: str | None = None) -> FileResponse:
     return FileResponse(FRONTEND_DIR / "index.html")
 
 
@@ -337,12 +360,12 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/api/health/models")
+@app.get("/api/health/models", dependencies=[Depends(require_admin)])
 def model_health() -> dict[str, object]:
     return check_configured_models()
 
 
-@app.get("/api/examples")
+@app.get("/api/examples", dependencies=[Depends(require_admin)])
 def examples() -> dict[str, Any]:
     items = []
     if SAMPLES_DIR.exists():
@@ -355,7 +378,7 @@ def examples() -> dict[str, Any]:
     return {"examples": items}
 
 
-@app.post("/api/run-workflow", status_code=202)
+@app.post("/api/run-workflow", status_code=202, dependencies=[Depends(require_admin)])
 async def run_workflow(request: Request) -> JSONResponse:
     try:
         workflow_request = await parse_workflow_request(request)
@@ -374,7 +397,7 @@ async def run_workflow(request: Request) -> JSONResponse:
     )
 
 
-@app.get("/api/status/{job_id}")
+@app.get("/api/status/{job_id}", dependencies=[Depends(require_admin)])
 def workflow_status(job_id: str) -> dict[str, Any]:
     try:
         return jobs.snapshot(job_id)
@@ -382,25 +405,25 @@ def workflow_status(job_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@app.get("/api/workflows")
+@app.get("/api/workflows", dependencies=[Depends(require_admin)])
 def workflows(tenant_id: str | None = None, limit: int = 50) -> dict[str, Any]:
     with session_scope() as session:
         return {"workflows": list_workflow_runs(session, tenant_id=tenant_id, limit=limit)}
 
 
-@app.get("/api/referrals")
+@app.get("/api/referrals", dependencies=[Depends(require_admin)])
 def referrals(tenant_id: str | None = None, status: str | None = None) -> dict[str, Any]:
     with session_scope() as session:
         return {"referrals": list_referrals(session, tenant_id=tenant_id, status=status)}
 
 
-@app.get("/api/referral-journey")
+@app.get("/api/referral-journey", dependencies=[Depends(require_admin)])
 def referral_journey(tenant_id: str | None = None) -> dict[str, Any]:
     with session_scope() as session:
         return referral_journey_dashboard(session, tenant_id=tenant_id)
 
 
-@app.get("/api/referrals/{referral_id}")
+@app.get("/api/referrals/{referral_id}", dependencies=[Depends(require_admin)])
 def referral(referral_id: str) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -409,7 +432,7 @@ def referral(referral_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@app.get("/api/referrals/{referral_id}/workbench")
+@app.get("/api/referrals/{referral_id}/workbench", dependencies=[Depends(require_admin)])
 def referral_workbench(referral_id: str) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -418,7 +441,7 @@ def referral_workbench(referral_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@app.post("/api/referrals/{referral_id}/retry-extraction", status_code=202)
+@app.post("/api/referrals/{referral_id}/retry-extraction", status_code=202, dependencies=[Depends(require_admin)])
 def referral_retry_extraction(referral_id: str) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -446,7 +469,7 @@ def referral_retry_extraction(referral_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/referrals/{referral_id}/continue-email-workflow")
+@app.post("/api/referrals/{referral_id}/continue-email-workflow", dependencies=[Depends(require_admin)])
 def referral_continue_email_workflow(referral_id: str) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -459,7 +482,7 @@ def referral_continue_email_workflow(referral_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/referrals/{referral_id}/match")
+@app.post("/api/referrals/{referral_id}/match", dependencies=[Depends(require_admin)])
 def referral_match(referral_id: str) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -468,7 +491,7 @@ def referral_match(referral_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/referrals/{referral_id}/appointment-proposals")
+@app.post("/api/referrals/{referral_id}/appointment-proposals", dependencies=[Depends(require_admin)])
 def appointment_proposals(referral_id: str, body: AppointmentProposalRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -484,7 +507,7 @@ def appointment_proposals(referral_id: str, body: AppointmentProposalRequest) ->
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/referrals/{referral_id}/missing-info-draft", status_code=201)
+@app.post("/api/referrals/{referral_id}/missing-info-draft", status_code=201, dependencies=[Depends(require_admin)])
 def referral_missing_info_draft(referral_id: str, body: MissingInfoDraftRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -493,7 +516,7 @@ def referral_missing_info_draft(referral_id: str, body: MissingInfoDraftRequest)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/referrals/{referral_id}/missing-info-replies", status_code=201)
+@app.post("/api/referrals/{referral_id}/missing-info-replies", status_code=201, dependencies=[Depends(require_admin)])
 def referral_missing_info_reply(referral_id: str, body: MissingInfoReplyRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -508,7 +531,7 @@ def referral_missing_info_reply(referral_id: str, body: MissingInfoReplyRequest)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/referrals/{referral_id}/clinical-review", status_code=201)
+@app.post("/api/referrals/{referral_id}/clinical-review", status_code=201, dependencies=[Depends(require_admin)])
 def referral_clinical_review(referral_id: str, body: ClinicalReviewRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -518,7 +541,7 @@ def referral_clinical_review(referral_id: str, body: ClinicalReviewRequest) -> d
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/referrals/{referral_id}/duplicate-review", status_code=201)
+@app.post("/api/referrals/{referral_id}/duplicate-review", status_code=201, dependencies=[Depends(require_admin)])
 def referral_duplicate_review(referral_id: str, body: ReviewCreateRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -533,7 +556,7 @@ def referral_duplicate_review(referral_id: str, body: ReviewCreateRequest) -> di
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/referrals/{referral_id}/suitability-review", status_code=201)
+@app.post("/api/referrals/{referral_id}/suitability-review", status_code=201, dependencies=[Depends(require_admin)])
 def referral_suitability_review(referral_id: str, body: ReviewCreateRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -547,7 +570,7 @@ def referral_suitability_review(referral_id: str, body: ReviewCreateRequest) -> 
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/referrals/{referral_id}/contact-draft", status_code=201)
+@app.post("/api/referrals/{referral_id}/contact-draft", status_code=201, dependencies=[Depends(require_admin)])
 def referral_contact_draft(referral_id: str, body: DraftMessageRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -556,7 +579,7 @@ def referral_contact_draft(referral_id: str, body: DraftMessageRequest) -> dict[
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/referrals/{referral_id}/patient-replies", status_code=201)
+@app.post("/api/referrals/{referral_id}/patient-replies", status_code=201, dependencies=[Depends(require_admin)])
 def referral_patient_reply(referral_id: str, body: PatientReplyRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -571,7 +594,7 @@ def referral_patient_reply(referral_id: str, body: PatientReplyRequest) -> dict[
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/appointments")
+@app.get("/api/appointments", dependencies=[Depends(require_admin)])
 def appointments(
     tenant_id: str | None = None,
     referral_id: str | None = None,
@@ -588,7 +611,7 @@ def appointments(
         }
 
 
-@app.post("/api/appointments/{appointment_id}/confirm")
+@app.post("/api/appointments/{appointment_id}/confirm", dependencies=[Depends(require_admin)])
 def appointment_confirm(appointment_id: str) -> dict[str, Any]:
     raise HTTPException(
         status_code=400,
@@ -596,7 +619,7 @@ def appointment_confirm(appointment_id: str) -> dict[str, Any]:
     )
 
 
-@app.post("/api/appointments/proposals", status_code=201)
+@app.post("/api/appointments/proposals", status_code=201, dependencies=[Depends(require_admin)])
 def appointment_manual_proposal(body: ManualAppointmentProposalRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -611,7 +634,7 @@ def appointment_manual_proposal(body: ManualAppointmentProposalRequest) -> dict[
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/appointments/{appointment_id}/reschedule-request", status_code=201)
+@app.post("/api/appointments/{appointment_id}/reschedule-request", status_code=201, dependencies=[Depends(require_admin)])
 def appointment_reschedule_request(appointment_id: str, body: AppointmentRescheduleRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -627,25 +650,31 @@ def appointment_reschedule_request(appointment_id: str, body: AppointmentResched
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/review-tasks")
+@app.get("/api/review-tasks", dependencies=[Depends(require_admin)])
 def review_tasks(tenant_id: str | None = None, status: str | None = "open") -> dict[str, Any]:
     with session_scope() as session:
         return {"tasks": list_review_tasks(session, tenant_id=tenant_id, status=status)}
 
 
-@app.get("/api/escalations")
+@app.get("/api/escalations", dependencies=[Depends(require_admin)])
 def escalations(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
     with session_scope() as session:
         return {"items": list_escalation_queue(session, tenant_id=tenant_id)}
 
 
-@app.post("/api/demo/clean-referral/reset", status_code=201)
+@app.post("/api/demo/clean-referral/reset", status_code=201, dependencies=[Depends(require_admin)])
 def demo_clean_referral_reset(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
     with session_scope() as session:
         return reset_clean_demo_referral(session, tenant_id or DEMO_TENANT_ID)
 
 
-@app.post("/api/review-tasks/{task_id}/actions")
+@app.post("/api/demo/clara-documentation-transcripts/seed", status_code=201, dependencies=[Depends(require_admin)])
+def demo_clara_documentation_transcripts_seed(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
+    with session_scope() as session:
+        return seed_clara_demo_documentation_transcripts(session, tenant_id or DEMO_TENANT_ID)
+
+
+@app.post("/api/review-tasks/{task_id}/actions", dependencies=[Depends(require_admin)])
 def review_task_action(task_id: str, body: ReviewActionRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -713,7 +742,7 @@ def _review_action_message(action: str, task: dict[str, Any], referral: dict[str
     return f"{task_type.title()} {action_labels.get(action, 'updated')}."
 
 
-@app.get("/api/therapists")
+@app.get("/api/therapists", dependencies=[Depends(require_admin)])
 def therapists(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
     with session_scope() as session:
         return {"therapists": list_therapists(session, tenant_id=tenant_id)}
@@ -744,14 +773,39 @@ def my_therapist_patients(request: Request) -> dict[str, Any]:
 
 
 @app.get("/api/documentation/patients")
-def documentation_patients(request: Request) -> dict[str, Any]:
+async def documentation_patients(request: Request) -> dict[str, Any]:
     with session_scope() as session:
         therapist = _current_active_therapist(session, request)
         return {"patients": list_documentation_patients_for_therapist(session, therapist["id"])}
 
 
+@app.get("/api/documentation/therapists/all/patients/overview")
+async def documentation_therapist_patients_overview(request: Request) -> dict[str, Any]:
+    with session_scope() as session:
+        therapist = _current_active_therapist(session, request)
+        return documentation_patients_overview_for_therapist(session, therapist["id"])
+
+
+@app.get("/api/documentation/patients/{patient_key}/dashboard")
+async def documentation_patient_dashboard(patient_key: str, request: Request) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            therapist = _current_active_therapist(session, request)
+            return documentation_patient_dashboard_for_therapist(
+                session,
+                therapist_id=therapist["id"],
+                patient_key=patient_key,
+            )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/documentation/sessions")
-def documentation_sessions(request: Request, patient_id: str | None = None) -> dict[str, Any]:
+async def documentation_sessions(request: Request, patient_id: str | None = None) -> dict[str, Any]:
     try:
         with session_scope() as session:
             therapist = _current_active_therapist(session, request)
@@ -769,7 +823,7 @@ def documentation_sessions(request: Request, patient_id: str | None = None) -> d
 
 
 @app.post("/api/documentation/sessions", status_code=201)
-def documentation_session_create(body: DocumentationSessionCreateRequest, request: Request) -> dict[str, Any]:
+async def documentation_session_create(body: DocumentationSessionCreateRequest, request: Request) -> dict[str, Any]:
     try:
         with session_scope() as session:
             therapist = _current_active_therapist(session, request)
@@ -790,7 +844,7 @@ def documentation_session_create(body: DocumentationSessionCreateRequest, reques
 
 
 @app.get("/api/documentation/sessions/{session_id}")
-def documentation_session_get(session_id: str, request: Request) -> dict[str, Any]:
+async def documentation_session_get(session_id: str, request: Request) -> dict[str, Any]:
     try:
         with session_scope() as session:
             therapist = _current_active_therapist(session, request)
@@ -806,7 +860,7 @@ def documentation_session_get(session_id: str, request: Request) -> dict[str, An
 
 
 @app.post("/api/documentation/sessions/{session_id}/texts", status_code=201)
-def documentation_session_text_create(
+async def documentation_session_text_create(
     session_id: str,
     body: DocumentationTextRequest,
     request: Request,
@@ -830,8 +884,34 @@ def documentation_session_text_create(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/documentation/sessions/{session_id}/audio/transcribe", status_code=201)
+async def documentation_session_audio_transcribe(session_id: str, request: Request) -> dict[str, Any]:
+    try:
+        form = await request.form()
+        audio = form.get("audio")
+        if audio is None or not hasattr(audio, "read"):
+            raise ValueError("Audio file is required.")
+        audio_bytes = await audio.read()
+        filename = getattr(audio, "filename", None) or "session-audio"
+        with session_scope() as session:
+            therapist = _current_active_therapist(session, request)
+            return {
+                "text": transcribe_documentation_session_audio_for_therapist(
+                    session,
+                    therapist_id=therapist["id"],
+                    documentation_session_id=session_id,
+                    audio_bytes=audio_bytes,
+                    filename=filename,
+                )
+            }
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.put("/api/documentation/sessions/{session_id}/texts/{text_id}")
-def documentation_session_text_update(
+async def documentation_session_text_update(
     session_id: str,
     text_id: str,
     body: DocumentationTextRequest,
@@ -860,7 +940,7 @@ def documentation_session_text_update(
 
 
 @app.post("/api/documentation/sessions/{session_id}/notes/reviewed", status_code=201)
-def documentation_session_reviewed_note_create(
+async def documentation_session_reviewed_note_create(
     session_id: str,
     body: DocumentationReviewedNoteRequest,
     request: Request,
@@ -884,13 +964,82 @@ def documentation_session_reviewed_note_create(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/therapists/calendar-capacity")
+@app.post("/api/documentation/sessions/{session_id}/notes/generate", status_code=201)
+async def documentation_session_note_generate(
+    session_id: str,
+    body: DocumentationGenerateNoteRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            therapist = _current_active_therapist(session, request)
+            return {
+                "note": generate_documentation_note_for_therapist(
+                    session,
+                    therapist_id=therapist["id"],
+                    documentation_session_id=session_id,
+                    source_text_id=body.source_text_id,
+                )
+            }
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.put("/api/documentation/notes/{note_id}/reviewed")
+async def documentation_note_reviewed_update(
+    note_id: str,
+    body: DocumentationReviewedNoteUpdateRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            therapist = _current_active_therapist(session, request)
+            return {
+                "note": save_reviewed_documentation_note_update_for_therapist(
+                    session,
+                    therapist_id=therapist["id"],
+                    note_id=note_id,
+                    reviewed_json=body.reviewed_json,
+                    reviewer_id=current_user_id(request, fallback=DEMO_THERAPIST_USER_ID),
+                )
+            }
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/documentation/patients/{patient_key}/progress-overview/generate")
+async def documentation_patient_progress_overview_generate(patient_key: str, request: Request) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            therapist = _current_active_therapist(session, request)
+            return generate_progress_overview_for_therapist(
+                session,
+                therapist_id=therapist["id"],
+                patient_key=patient_key,
+            )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/therapists/calendar-capacity", dependencies=[Depends(require_admin)])
 def therapists_calendar_capacity(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
     with session_scope() as session:
         return therapist_calendar_capacity(session, tenant_id=tenant_id)
 
 
-@app.post("/api/therapists", status_code=201)
+@app.post("/api/therapists", status_code=201, dependencies=[Depends(require_admin)])
 def therapist_create(body: TherapistPayload, tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -899,7 +1048,7 @@ def therapist_create(body: TherapistPayload, tenant_id: str | None = DEMO_TENANT
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/therapists/{therapist_id}")
+@app.get("/api/therapists/{therapist_id}", dependencies=[Depends(require_admin)])
 def therapist_get(therapist_id: str) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -908,7 +1057,7 @@ def therapist_get(therapist_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@app.put("/api/therapists/{therapist_id}")
+@app.put("/api/therapists/{therapist_id}", dependencies=[Depends(require_admin)])
 def therapist_update(therapist_id: str, body: TherapistPayload) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -917,13 +1066,13 @@ def therapist_update(therapist_id: str, body: TherapistPayload) -> dict[str, Any
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/intake/templates")
+@app.get("/api/intake/templates", dependencies=[Depends(require_admin)])
 def intake_templates(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
     with session_scope() as session:
         return {"templates": list_intake_templates(session, tenant_id=tenant_id)}
 
 
-@app.post("/api/intake/templates/{template_id}/items/{item_key}/file", status_code=201)
+@app.post("/api/intake/templates/{template_id}/items/{item_key}/file", status_code=201, dependencies=[Depends(require_admin)])
 async def intake_template_file_upload(template_id: str, item_key: str, request: Request) -> dict[str, Any]:
     try:
         form = await request.form()
@@ -951,13 +1100,13 @@ async def intake_template_file_upload(template_id: str, item_key: str, request: 
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/intake/tracker")
+@app.get("/api/intake/tracker", dependencies=[Depends(require_admin)])
 def intake_tracker(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
     with session_scope() as session:
         return {"items": list_intake_tracker(session, tenant_id=tenant_id)}
 
 
-@app.get("/api/referrals/{referral_id}/intake")
+@app.get("/api/referrals/{referral_id}/intake", dependencies=[Depends(require_admin)])
 def referral_intake(referral_id: str) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -966,7 +1115,7 @@ def referral_intake(referral_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@app.post("/api/referrals/{referral_id}/intake")
+@app.post("/api/referrals/{referral_id}/intake", dependencies=[Depends(require_admin)])
 def referral_intake_start(referral_id: str, body: StartIntakeRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -975,7 +1124,7 @@ def referral_intake_start(referral_id: str, body: StartIntakeRequest) -> dict[st
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/referrals/{referral_id}/intake-packet-draft", status_code=201)
+@app.post("/api/referrals/{referral_id}/intake-packet-draft", status_code=201, dependencies=[Depends(require_admin)])
 def referral_intake_packet_draft(referral_id: str, body: DraftMessageRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -991,7 +1140,7 @@ def referral_intake_packet_draft(referral_id: str, body: DraftMessageRequest) ->
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/referrals/{referral_id}/intake-reminder", status_code=201)
+@app.post("/api/referrals/{referral_id}/intake-reminder", status_code=201, dependencies=[Depends(require_admin)])
 def referral_intake_reminder(referral_id: str) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -1000,7 +1149,7 @@ def referral_intake_reminder(referral_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/referrals/{referral_id}/documents", status_code=201)
+@app.post("/api/referrals/{referral_id}/documents", status_code=201, dependencies=[Depends(require_admin)])
 async def referral_document_upload(referral_id: str, request: Request) -> dict[str, Any]:
     try:
         form = await request.form()
@@ -1028,7 +1177,7 @@ async def referral_document_upload(referral_id: str, request: Request) -> dict[s
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/documents/{document_id}/download")
+@app.get("/api/documents/{document_id}/download", dependencies=[Depends(require_admin)])
 def document_download(document_id: str) -> FileResponse:
     try:
         with session_scope() as session:
@@ -1046,7 +1195,7 @@ def document_download(document_id: str) -> FileResponse:
     )
 
 
-@app.post("/api/intake/items/{item_id}/complete")
+@app.post("/api/intake/items/{item_id}/complete", dependencies=[Depends(require_admin)])
 def intake_item_complete(item_id: str, body: CompleteIntakeItemRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -1055,7 +1204,7 @@ def intake_item_complete(item_id: str, body: CompleteIntakeItemRequest) -> dict[
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@app.post("/api/intake/items/{item_id}/exception-request", status_code=201)
+@app.post("/api/intake/items/{item_id}/exception-request", status_code=201, dependencies=[Depends(require_admin)])
 def intake_item_exception_request(item_id: str, body: IntakeExceptionRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -1065,7 +1214,7 @@ def intake_item_exception_request(item_id: str, body: IntakeExceptionRequest) ->
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/consent-records/{consent_id}/complete")
+@app.post("/api/consent-records/{consent_id}/complete", dependencies=[Depends(require_admin)])
 def consent_complete(consent_id: str, body: CompleteConsentRequest) -> dict[str, Any]:
     try:
         expires_at = None
@@ -1077,7 +1226,7 @@ def consent_complete(consent_id: str, body: CompleteConsentRequest) -> dict[str,
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/consent-records/{consent_id}/exception-request", status_code=201)
+@app.post("/api/consent-records/{consent_id}/exception-request", status_code=201, dependencies=[Depends(require_admin)])
 def consent_exception_request(consent_id: str, body: IntakeExceptionRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -1087,7 +1236,7 @@ def consent_exception_request(consent_id: str, body: IntakeExceptionRequest) -> 
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/referrals/{referral_id}/questionnaires")
+@app.post("/api/referrals/{referral_id}/questionnaires", dependencies=[Depends(require_admin)])
 def questionnaire_save(referral_id: str, body: QuestionnaireRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -1103,7 +1252,7 @@ def questionnaire_save(referral_id: str, body: QuestionnaireRequest) -> dict[str
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/referrals/{referral_id}/prep-brief")
+@app.post("/api/referrals/{referral_id}/prep-brief", dependencies=[Depends(require_admin)])
 def prep_brief_generate(referral_id: str, body: PrepBriefRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -1112,7 +1261,7 @@ def prep_brief_generate(referral_id: str, body: PrepBriefRequest) -> dict[str, A
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/patients/{patient_id}/workspace")
+@app.get("/api/patients/{patient_id}/workspace", dependencies=[Depends(require_admin)])
 def patient_workspace_get(patient_id: str) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -1121,7 +1270,7 @@ def patient_workspace_get(patient_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@app.post("/api/referrals/{referral_id}/session-notes", status_code=201)
+@app.post("/api/referrals/{referral_id}/session-notes", status_code=201, dependencies=[Depends(require_admin)])
 def session_note_create(referral_id: str, body: SessionNoteRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -1140,7 +1289,7 @@ def session_note_create(referral_id: str, body: SessionNoteRequest) -> dict[str,
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/session-notes/{note_id}/approve")
+@app.post("/api/session-notes/{note_id}/approve", dependencies=[Depends(require_admin)])
 def session_note_approve(note_id: str) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -1149,7 +1298,7 @@ def session_note_approve(note_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@app.get("/api/clinical-library")
+@app.get("/api/clinical-library", dependencies=[Depends(require_admin)])
 def clinical_library(tenant_id: str | None = DEMO_TENANT_ID, record_type: str | None = None) -> dict[str, Any]:
     with session_scope() as session:
         return {
@@ -1161,7 +1310,7 @@ def clinical_library(tenant_id: str | None = DEMO_TENANT_ID, record_type: str | 
         }
 
 
-@app.post("/api/clinical-library", status_code=201)
+@app.post("/api/clinical-library", status_code=201, dependencies=[Depends(require_admin)])
 def clinical_library_create(body: ClinicalLibraryRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -1180,7 +1329,7 @@ def clinical_library_create(body: ClinicalLibraryRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/retrieval/search")
+@app.get("/api/retrieval/search", dependencies=[Depends(require_admin)])
 def retrieval_search(
     query: str,
     tenant_id: str | None = DEMO_TENANT_ID,
@@ -1201,7 +1350,7 @@ def retrieval_search(
         }
 
 
-@app.post("/api/referrals/{referral_id}/reports/draft", status_code=201)
+@app.post("/api/referrals/{referral_id}/reports/draft", status_code=201, dependencies=[Depends(require_admin)])
 def report_draft_create(referral_id: str, body: ReportDraftRequest) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -1219,7 +1368,7 @@ def report_draft_create(referral_id: str, body: ReportDraftRequest) -> dict[str,
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.put("/api/report-drafts/{report_id}")
+@app.put("/api/report-drafts/{report_id}", dependencies=[Depends(require_admin)])
 def report_draft_update(report_id: str, body: ReportDraftUpdateRequest, request: Request) -> dict[str, Any]:
     try:
         reviewer_id = body.reviewer_id or current_user_id(request, fallback=DEMO_THERAPIST_USER_ID)
@@ -1239,7 +1388,7 @@ def report_draft_update(report_id: str, body: ReportDraftUpdateRequest, request:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/report-drafts/{report_id}/sign-off")
+@app.post("/api/report-drafts/{report_id}/sign-off", dependencies=[Depends(require_admin)])
 def report_draft_sign_off(report_id: str, request: Request) -> dict[str, Any]:
     try:
         reviewer_id = current_user_id(request, fallback=DEMO_THERAPIST_USER_ID)
@@ -1249,7 +1398,7 @@ def report_draft_sign_off(report_id: str, request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/report-drafts/{report_id}/export")
+@app.get("/api/report-drafts/{report_id}/export", dependencies=[Depends(require_admin)])
 def report_draft_export(report_id: str, format: str = "markdown") -> Response:
     try:
         with session_scope() as session:
@@ -1263,7 +1412,7 @@ def report_draft_export(report_id: str, format: str = "markdown") -> Response:
     )
 
 
-@app.post("/api/report-drafts/{report_id}/feedback", status_code=201)
+@app.post("/api/report-drafts/{report_id}/feedback", status_code=201, dependencies=[Depends(require_admin)])
 def report_draft_feedback(report_id: str, body: DraftFeedbackRequest, request: Request) -> dict[str, Any]:
     try:
         reviewer_id = body.reviewer_id or current_user_id(request, fallback=DEMO_THERAPIST_USER_ID)
@@ -1282,24 +1431,24 @@ def report_draft_feedback(report_id: str, body: DraftFeedbackRequest, request: R
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/feedback/metrics")
+@app.get("/api/feedback/metrics", dependencies=[Depends(require_admin)])
 def feedback_metrics(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
     with session_scope() as session:
         return draft_feedback_metrics(session, tenant_id=tenant_id)
 
 
-@app.get("/api/integrations/health")
+@app.get("/api/integrations/health", dependencies=[Depends(require_admin)])
 def integrations_health(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
     with session_scope() as session:
         return integration_health(session, tenant_id=tenant_id)
 
 
-@app.get("/api/integrations/google/status")
+@app.get("/api/integrations/google/status", dependencies=[Depends(require_admin)])
 def google_integration_status() -> dict[str, Any]:
     return google_workspace.google_workspace_status(refresh=True)
 
 
-@app.post("/api/integrations/google/test-calendar-read")
+@app.post("/api/integrations/google/test-calendar-read", dependencies=[Depends(require_admin)])
 def google_test_calendar_read() -> dict[str, Any]:
     try:
         return google_workspace.test_calendar_read()
@@ -1307,13 +1456,13 @@ def google_test_calendar_read() -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=google_workspace.provider_error_message(exc)) from exc
 
 
-@app.get("/api/integrations/referral-batches")
+@app.get("/api/integrations/referral-batches", dependencies=[Depends(require_admin)])
 def referral_import_batches(tenant_id: str | None = DEMO_TENANT_ID, limit: int = 20) -> dict[str, Any]:
     with session_scope() as session:
         return {"batches": list_referral_import_batches(session, tenant_id=tenant_id, limit=limit)}
 
 
-@app.get("/api/integrations/import-errors")
+@app.get("/api/integrations/import-errors", dependencies=[Depends(require_admin)])
 def referral_import_errors(
     tenant_id: str | None = DEMO_TENANT_ID,
     batch_id: str | None = None,
@@ -1323,7 +1472,7 @@ def referral_import_errors(
         return {"errors": list_referral_import_errors(session, tenant_id=tenant_id, batch_id=batch_id, limit=limit)}
 
 
-@app.post("/api/integrations/referral-batches", status_code=201)
+@app.post("/api/integrations/referral-batches", status_code=201, dependencies=[Depends(require_admin)])
 async def referral_import_batch_create(request: Request) -> dict[str, Any]:
     try:
         form = await request.form()
@@ -1351,7 +1500,7 @@ async def referral_import_batch_create(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/integrations/email-referrals", status_code=201)
+@app.post("/api/integrations/email-referrals", status_code=201, dependencies=[Depends(require_admin)])
 def email_referral_create(body: EmailReferralRequest, request: Request) -> dict[str, Any]:
     try:
         raw_input = email_referral_raw_input(sender=body.sender, subject=body.subject, body=body.body)
@@ -1374,7 +1523,7 @@ def email_referral_create(body: EmailReferralRequest, request: Request) -> dict[
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/integrations/gmail-sync")
+@app.post("/api/integrations/gmail-sync", dependencies=[Depends(require_admin)])
 def gmail_sync(body: GmailSyncRequest) -> dict[str, Any]:
     if not google_workspace.is_enabled():
         raise HTTPException(status_code=400, detail="Google Workspace integration is not enabled.")
@@ -1510,13 +1659,13 @@ def _download_gmail_attachments_for_intake(message: dict[str, Any]) -> list[dict
     return stored
 
 
-@app.get("/api/integrations/gmail-inbox")
+@app.get("/api/integrations/gmail-inbox", dependencies=[Depends(require_admin)])
 def gmail_inbox(tenant_id: str | None = DEMO_TENANT_ID, limit: int = 50) -> dict[str, Any]:
     with session_scope() as session:
         return {"messages": list_inbound_gmail_messages(session, tenant_id=tenant_id, limit=limit)}
 
 
-@app.post("/api/integrations/gmail-inbox/convert", status_code=201)
+@app.post("/api/integrations/gmail-inbox/convert", status_code=201, dependencies=[Depends(require_admin)])
 def gmail_inbox_convert(body: GmailInboxConvertRequest, request: Request) -> dict[str, Any]:
     try:
         with session_scope() as session:
@@ -1571,13 +1720,13 @@ def security_context_get(request: Request) -> dict[str, Any]:
         return security_context(session, current_user_id(request, fallback=DEMO_USER_ID))
 
 
-@app.get("/api/security/posture")
+@app.get("/api/security/posture", dependencies=[Depends(require_admin)])
 def security_posture(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
     with session_scope() as session:
         return governance_posture(session, tenant_id=tenant_id)
 
 
-@app.get("/api/events/{job_id}")
+@app.get("/api/events/{job_id}", dependencies=[Depends(require_admin)])
 async def workflow_events(job_id: str, request: Request, cursor: int = 0) -> StreamingResponse:
     try:
         jobs.snapshot(job_id)
