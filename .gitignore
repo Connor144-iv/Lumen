@@ -2,3 +2,13 @@
 *.log
 **/secret/
 /.venv/Scripts/run_lumen_local.ps1
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Local virtual environments
+.venv/
+venv/
+
+# Local dev database
+lumen_dev.db
