@@ -20,13 +20,15 @@ from backend.lumen_web.models import (
     User,
 )
 from backend.lumen_web.repositories import (
-    DEMO_CLARA_PATIENT_APPOINTMENT_ID,
-    DEMO_CLEAN_PATIENT_ID,
     DEMO_CLEAN_THERAPIST_ID,
+    DEMO_OUTBOUND_PATIENT_EMAIL,
     reset_clean_demo_referral,
     seed_clara_demo_documentation_transcripts,
 )
 from backend.lumen_web.seed import DEMO_CLARA_THERAPIST_USER_ID, DEMO_TENANT_ID, DEMO_USER_ID
+
+DOC_PATIENT_ID = "documentation-http-patient-001"
+DOC_APPOINTMENT_ID = "documentation-http-appointment-001"
 
 
 def _prepare_documentation_demo() -> None:
@@ -37,12 +39,22 @@ def _prepare_documentation_demo() -> None:
         session.execute(delete(DocumentationSessionText))
         session.execute(delete(DocumentationSession))
         reset_clean_demo_referral(session)
-        session.execute(
-            delete(Appointment).where(
-                Appointment.therapist_id == DEMO_CLEAN_THERAPIST_ID,
-                Appointment.id != DEMO_CLARA_PATIENT_APPOINTMENT_ID,
-            )
-        )
+        patient = session.get(Patient, DOC_PATIENT_ID)
+        if patient is None:
+            patient = Patient(id=DOC_PATIENT_ID, tenant_id=DEMO_TENANT_ID)
+            session.add(patient)
+        patient.display_name = "Documentation HTTP Patient"
+        patient.contact_email = DEMO_OUTBOUND_PATIENT_EMAIL
+        session.flush()
+        appointment = session.get(Appointment, DOC_APPOINTMENT_ID)
+        if appointment is None:
+            appointment = Appointment(id=DOC_APPOINTMENT_ID, tenant_id=DEMO_TENANT_ID)
+            session.add(appointment)
+        appointment.patient_id = patient.id
+        appointment.therapist_id = DEMO_CLEAN_THERAPIST_ID
+        appointment.starts_at = patient.created_at
+        appointment.ends_at = patient.created_at
+        appointment.status = "confirmed"
         session.commit()
     finally:
         session.close()
@@ -117,22 +129,22 @@ def test_clara_can_use_documentation_api_over_http() -> None:
 
     status, _, body = _http_request("GET", "/api/documentation/patients", user_id=DEMO_CLARA_THERAPIST_USER_ID)
     assert status == 200
-    assert [patient["id"] for patient in body["patients"]] == [DEMO_CLEAN_PATIENT_ID]
+    assert [patient["id"] for patient in body["patients"]] == [DOC_PATIENT_ID]
 
     status, _, body = _http_request(
         "POST",
         "/api/documentation/sessions",
         user_id=DEMO_CLARA_THERAPIST_USER_ID,
-        json_body={"patient_id": DEMO_CLEAN_PATIENT_ID, "title": "HTTP documentation session"},
+        json_body={"patient_id": DOC_PATIENT_ID, "title": "HTTP documentation session"},
     )
     assert status == 201
     doc_session = body["session"]
     assert doc_session["therapist_id"] == DEMO_CLEAN_THERAPIST_ID
-    assert doc_session["patient_id"] == DEMO_CLEAN_PATIENT_ID
+    assert doc_session["patient_id"] == DOC_PATIENT_ID
 
     status, _, body = _http_request(
         "GET",
-        f"/api/documentation/sessions?patient_id={DEMO_CLEAN_PATIENT_ID}",
+        f"/api/documentation/sessions?patient_id={DOC_PATIENT_ID}",
         user_id=DEMO_CLARA_THERAPIST_USER_ID,
     )
     assert status == 200
@@ -208,14 +220,14 @@ def test_admin_can_seed_clara_transcript_only_documentation_sessions() -> None:
         session.commit()
     finally:
         session.close()
-    assert seeded["patient_id"] == DEMO_CLEAN_PATIENT_ID
+    assert seeded["patient_id"] == DOC_PATIENT_ID
     assert seeded["therapist_id"] == DEMO_CLEAN_THERAPIST_ID
     assert seeded["session_count"] == 12
     assert seeded["text_count"] == 12
 
     status, _, body = _http_request(
         "GET",
-        f"/api/documentation/sessions?patient_id={DEMO_CLEAN_PATIENT_ID}",
+        f"/api/documentation/sessions?patient_id={DOC_PATIENT_ID}",
         user_id=DEMO_CLARA_THERAPIST_USER_ID,
     )
     assert status == 200
@@ -239,23 +251,23 @@ def test_admin_can_seed_clara_transcript_only_documentation_sessions() -> None:
         user_id=DEMO_CLARA_THERAPIST_USER_ID,
     )
     assert status == 200
-    assert overview["patients"][0]["patient_key"] == DEMO_CLEAN_PATIENT_ID
+    assert overview["patients"][0]["patient_key"] == DOC_PATIENT_ID
     assert overview["patients"][0]["session_count"] == 12
 
     status, _, dashboard = _http_request(
         "GET",
-        f"/api/documentation/patients/{DEMO_CLEAN_PATIENT_ID}/dashboard",
+        f"/api/documentation/patients/{DOC_PATIENT_ID}/dashboard",
         user_id=DEMO_CLARA_THERAPIST_USER_ID,
     )
     assert status == 200
-    assert dashboard["patient"]["patient_key"] == DEMO_CLEAN_PATIENT_ID
+    assert dashboard["patient"]["patient_key"] == DOC_PATIENT_ID
     assert len(dashboard["sessions"]) == 12
     assert dashboard["sessions"][0]["transcript_text"]
     assert dashboard["sessions"][0]["latest_note"] is None
 
     status, _, progress = _http_request(
         "POST",
-        f"/api/documentation/patients/{DEMO_CLEAN_PATIENT_ID}/progress-overview/generate",
+        f"/api/documentation/patients/{DOC_PATIENT_ID}/progress-overview/generate",
         user_id=DEMO_CLARA_THERAPIST_USER_ID,
     )
     assert status == 200
@@ -268,7 +280,7 @@ def test_admin_is_denied_documentation_api_over_http() -> None:
         "POST",
         "/api/documentation/sessions",
         user_id=DEMO_CLARA_THERAPIST_USER_ID,
-        json_body={"patient_id": DEMO_CLEAN_PATIENT_ID},
+        json_body={"patient_id": DOC_PATIENT_ID},
     )
     assert status == 201
     doc_session_id = body["session"]["id"]
@@ -276,7 +288,7 @@ def test_admin_is_denied_documentation_api_over_http() -> None:
     admin_requests = [
         ("GET", "/api/documentation/patients", None),
         ("GET", "/api/documentation/sessions", None),
-        ("POST", "/api/documentation/sessions", {"patient_id": DEMO_CLEAN_PATIENT_ID}),
+        ("POST", "/api/documentation/sessions", {"patient_id": DOC_PATIENT_ID}),
         ("GET", f"/api/documentation/sessions/{doc_session_id}", None),
         ("POST", f"/api/documentation/sessions/{doc_session_id}/texts", {"text": "Blocked."}),
         ("POST", f"/api/documentation/sessions/{doc_session_id}/notes/generate", {}),
@@ -440,7 +452,7 @@ def test_wrong_owner_documentation_session_is_rejected_over_http() -> None:
 def test_therapist_spa_entry_routes_are_registered_for_index_html() -> None:
     for path in ("/documentation", "/my-patients", "/patients/{patient_key}/dashboard"):
         route = next(item for item in app.routes if getattr(item, "path", None) == path)
-        response = route.endpoint(patient_key=DEMO_CLEAN_PATIENT_ID) if "{patient_key}" in path else route.endpoint()
+        response = route.endpoint(patient_key=DOC_PATIENT_ID) if "{patient_key}" in path else route.endpoint()
 
         assert Path(response.path).as_posix().endswith("frontend/index.html")
         assert response.media_type == "text/html"

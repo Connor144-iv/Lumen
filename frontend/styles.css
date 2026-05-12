@@ -114,6 +114,18 @@ button.secondary:hover,
   box-shadow: 0 10px 24px rgba(22, 31, 45, 0.09);
 }
 
+button.success,
+.button-link.success {
+  background: linear-gradient(180deg, #0f9f73 0%, var(--success) 100%);
+  box-shadow: 0 10px 22px rgba(8, 127, 91, 0.22);
+}
+
+button.success:hover,
+.button-link.success:hover {
+  background: linear-gradient(180deg, #0b8d65 0%, #066a4b 100%);
+  box-shadow: 0 12px 28px rgba(8, 127, 91, 0.28);
+}
+
 button.compact,
 .button-link.compact {
   min-height: 32px;
@@ -377,12 +389,8 @@ h3 {
 
 .overview-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.25fr) minmax(320px, 0.9fr);
+  grid-template-columns: 1fr;
   gap: 18px;
-}
-
-.overview-grid .panel:first-child {
-  grid-row: span 2;
 }
 
 .journey-panel {
@@ -551,6 +559,10 @@ h3 {
 
 .advanced-trace .monitor-stack {
   padding: 16px;
+}
+
+.page[data-page="workbench"] .advanced-trace {
+  grid-column: auto;
 }
 
 .monitor-stack {
@@ -1196,6 +1208,37 @@ textarea:focus {
   box-shadow: 0 14px 34px rgba(54, 91, 214, 0.14);
 }
 
+.agent-registry-card {
+  display: block;
+}
+
+.agent-registry-card summary {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  cursor: pointer;
+  list-style-position: outside;
+}
+
+.agent-registry-summary {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+
+.agent-registry-summary h4,
+.agent-registry-summary p,
+.agent-registry-purpose {
+  margin: 0;
+}
+
+.agent-registry-purpose {
+  margin-top: 12px;
+  color: var(--text-soft);
+  line-height: 1.45;
+}
+
 .documentation-controls-panel .record-item.is-selected {
   padding: 15px;
 }
@@ -1828,10 +1871,6 @@ pre {
 
   .journey-lane-header p {
     display: none;
-  }
-
-  .overview-grid .panel:first-child {
-    grid-row: auto;
   }
 
   .timeline,

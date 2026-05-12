@@ -55,7 +55,7 @@
               </select>
             </label>
             <a class="button-link primary-action" href="/new-referral" data-nav data-admin-only hidden>New referral</a>
-            <button id="demo-reset-button" type="button" class="secondary compact" data-admin-only hidden>Reset demo path</button>
+            <button id="demo-reset-button" type="button" class="secondary compact" data-admin-only hidden>Reset Gmail demo</button>
             <button id="refresh-product-button" type="button" class="secondary compact">Refresh data</button>
           </div>
         </header>
@@ -109,17 +109,6 @@
             </section>
 
             <div class="overview-grid">
-              <section class="panel" aria-labelledby="action-queue-title">
-                <div class="panel-header">
-                  <div>
-                    <p class="eyebrow">Operations</p>
-                    <h3 id="action-queue-title">Needs attention</h3>
-                  </div>
-                  <span class="panel-stat" id="metric-action-queue">-</span>
-                </div>
-                <div id="overview-action-list" class="record-list"></div>
-              </section>
-
               <section class="panel" aria-labelledby="overview-referrals-title">
                 <div class="panel-header">
                   <div>
@@ -129,17 +118,6 @@
                   <a class="text-link" href="/workbench" data-nav>Open workbench</a>
                 </div>
                 <div id="overview-referral-list" class="record-list"></div>
-              </section>
-
-              <section class="panel" aria-labelledby="overview-health-title">
-                <div class="panel-header">
-                  <div>
-                    <p class="eyebrow">Health</p>
-                    <h3 id="overview-health-title">System health</h3>
-                  </div>
-                  <span class="panel-stat" id="metric-last-sync">-</span>
-                </div>
-                <div id="overview-health-strip" class="health-strip-grid"></div>
               </section>
             </div>
           </section>
@@ -257,36 +235,6 @@
                 </div>
               </section>
 
-              <details class="advanced-trace">
-                <summary>Advanced trace</summary>
-                <div class="monitor-stack">
-                <section class="panel timeline-panel" aria-labelledby="timeline-title">
-                  <div class="panel-header">
-                    <div>
-                      <p class="eyebrow">Trace</p>
-                      <h3 id="timeline-title">Workflow visualization</h3>
-                    </div>
-                    <span id="job-id-label">No job</span>
-                  </div>
-                  <ol id="timeline" class="timeline"></ol>
-                </section>
-
-                <section class="panel detail-panel" aria-labelledby="detail-title">
-                  <div class="panel-header">
-                    <div>
-                      <p class="eyebrow">Payloads</p>
-                      <h3 id="detail-title">Data handoffs</h3>
-                    </div>
-                    <button id="export-button" type="button" class="secondary compact" disabled>Export JSON</button>
-                  </div>
-                  <div id="handoffs" class="handoffs"></div>
-                  <div id="final-output" class="final-output" hidden>
-                    <h3>Initial result</h3>
-                    <pre id="result-json"></pre>
-                  </div>
-                </section>
-                </div>
-              </details>
             </div>
           </section>
 
@@ -681,13 +629,13 @@
                     <p class="eyebrow">Developer demo</p>
                     <h2 id="workflow-trace-link-title">Workflow trace</h2>
                   </div>
-                  <a class="text-link" href="/new-referral" data-nav>Open new referral trace</a>
+                  <a class="text-link" href="/workbench" data-nav>Open Workbench</a>
                 </div>
                 <div class="record-list">
                   <article class="record-item" data-status="configured">
-                    <h4>Agent workflow console</h4>
+                    <h4>Workbench advanced trace</h4>
                     <span class="pill">demo-only</span>
-                    <p>Run referral payloads and inspect agent handoffs without making trace output the clinic admin journey.</p>
+                    <p>Select a referral in Workbench to inspect persisted agent activity, workflow events, outputs, and review gates.</p>
                   </article>
                 </div>
               </section>

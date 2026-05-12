@@ -101,7 +101,7 @@ NEXT_ACTION_LABELS = {
     "start_intake": "Start intake",
     "complete_intake": "Complete intake",
     "generate_prep_brief": "Generate prep brief",
-    "ready": "Ready for first session",
+    "ready": "Referral complete",
     "closed": "Closed",
     "retry_extraction": "Retry extraction",
     "wait_extraction": "Agent extraction running",
@@ -166,6 +166,8 @@ def next_action_for_referral(referral: Any) -> str:
     flags = secondary_flags_for_referral(referral)
     if status in {"closed_declined", "closed_no_response", "closed_not_suitable"}:
         return "closed"
+    if status == "first_session_ready":
+        return "ready"
     if status in {"new_referral", "normalising"}:
         return "review_referral"
     if (
@@ -195,8 +197,6 @@ def next_action_for_referral(referral: Any) -> str:
     if status == "intake_complete":
         return "generate_prep_brief"
     if status == "prep_brief_ready":
-        return "ready"
-    if status == "first_session_ready":
         return "ready"
     return "review_referral"
 

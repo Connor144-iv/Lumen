@@ -22,6 +22,7 @@ from backend.lumen_web.models import (
     HumanReviewTask,
     IntakeChecklistItem,
     IntakeTemplate,
+    Patient,
     QuestionnaireResponse,
     Referral,
     ScoreRecord,
@@ -33,6 +34,7 @@ from backend.lumen_web.models import (
 )
 from backend.lumen_web.repositories import (
     apply_review_action,
+    appointment_options_for_workflow,
     continue_email_referral_workflow,
     create_intake_template_file,
     create_referral_for_request,
@@ -44,6 +46,7 @@ from backend.lumen_web.repositories import (
     generate_missing_intake_reminder,
     generate_prep_brief,
     ingest_gmail_message,
+    intake_workspace,
     list_intake_templates,
     prepare_email_referral_followup,
     propose_appointment_slots,
@@ -225,7 +228,7 @@ def test_new_gmail_from_existing_patient_email_stays_unmatched_without_reply_con
             source_channel="webform",
             raw_text="Legacy demo referral.",
             status="needs_admin_review",
-            patient_name="Clean Demo Patient",
+            patient_name="Legacy Demo Patient",
             contact_email="lumenpatientdemo@gmail.com",
             insurer="Multicare",
             language_preference="Portuguese",
@@ -255,7 +258,7 @@ def test_new_gmail_from_existing_patient_email_stays_unmatched_without_reply_con
         assert result["action"] == "unmatched"
         assert result["match_reason"] == "unmatched"
         session.refresh(referral)
-        assert referral.patient_name == "Clean Demo Patient"
+        assert referral.patient_name == "Legacy Demo Patient"
         assert referral.insurer == "Multicare"
         assert referral.language_preference == "Portuguese"
         assert session.scalar(
@@ -425,7 +428,7 @@ def test_email_referral_placeholder_does_not_create_premature_missing_info_task(
         session.close()
 
 
-def test_gmail_patient_demo_reset_removes_email_referral_and_repairs_inbound_doc() -> None:
+def test_gmail_patient_demo_reset_removes_email_referral_and_clears_inbound_doc() -> None:
     Base.metadata.create_all(bind=engine)
     session = SessionLocal()
     try:
@@ -506,11 +509,283 @@ def test_gmail_patient_demo_reset_removes_email_referral_and_repairs_inbound_doc
         assert session.get(CommunicationDraft, draft.id) is None
         assert session.get(WorkflowEvent, event.id) is None
         assert session.get(WorkflowRun, workflow.id) is None
-        session.refresh(document)
-        assert "referral_id" not in document.metadata_json
-        assert "workflow_job_id" not in document.metadata_json
-        assert "converted_to_referral" not in document.metadata_json
-        assert result["repaired_inbound_documents"] == 1
+        assert session.get(Document, document.id) is None
+        assert result["deleted_gmail_inbox_documents"] == 1
+        assert result["deleted_gmail_demo_referrals"] == 1
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_gmail_demo_reset_seeds_stable_non_gmail_stage_referrals(monkeypatch) -> None:
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "false")
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Demo Stage Reset", slug=_id("demo-stage-reset"))
+        session.add(tenant)
+        session.flush()
+
+        result = reset_gmail_patient_demo(session, tenant_id=tenant.id)
+
+        stage_referrals = list(
+            session.scalars(
+                select(Referral).where(
+                    Referral.tenant_id == tenant.id,
+                    Referral.source_channel == repository_module.DEMO_STAGE_SOURCE,
+                )
+            )
+        )
+        statuses = {}
+        for referral in stage_referrals:
+            statuses[referral.status] = statuses.get(referral.status, 0) + 1
+
+        assert result["seeded_stage_referrals"] == 8
+        assert len(stage_referrals) == 8
+        assert statuses == {
+            "needs_admin_review": 1,
+            "ready_for_matching": 1,
+            "match_recommended": 1,
+            "awaiting_patient_contact": 1,
+            "awaiting_patient_reply": 1,
+            "intake_incomplete": 1,
+            "first_session_ready": 2,
+        }
+        assert not session.scalar(
+            select(Referral).where(
+                Referral.tenant_id == tenant.id,
+                Referral.source_channel == "email",
+                Referral.contact_email == "lumenpatientdemo@gmail.com",
+            )
+        )
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_gmail_demo_reset_ready_stage_referrals_are_complete(monkeypatch) -> None:
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "true")
+    monkeypatch.setattr(google_workspace, "query_calendar_busy", lambda **kwargs: [])
+    monkeypatch.setattr(google_workspace, "list_lumen_appointment_events", lambda **kwargs: [])
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Demo Ready Stage", slug=_id("demo-ready-stage"))
+        session.add(tenant)
+        session.flush()
+
+        reset_gmail_patient_demo(session, tenant_id=tenant.id)
+        ready_referrals = list(
+            session.scalars(
+                select(Referral).where(
+                    Referral.tenant_id == tenant.id,
+                    Referral.source_channel == repository_module.DEMO_STAGE_SOURCE,
+                    Referral.status == "first_session_ready",
+                )
+            )
+        )
+
+        assert len(ready_referrals) == 2
+        for referral in ready_referrals:
+            assert referral.patient_name
+            assert referral.date_of_birth
+            assert referral.contact_email and referral.contact_email != "lumenpatientdemo@gmail.com"
+            assert referral.contact_phone
+            assert referral.insurer
+            assert referral.match_summary["ranked_matches"][0]["name"] in {"Dr. Sofia Almeida", "Miguel Costa"}
+
+            workspace = intake_workspace(session, referral.id)
+            appointments = list(session.scalars(select(Appointment).where(Appointment.referral_id == referral.id)))
+
+            assert workspace["status"] == "complete"
+            assert all(item["status"] == "completed" and item["source_document_id"] for item in workspace["items"])
+            assert all(consent["status"] == "completed" and consent["source_document_id"] for consent in workspace["consents"])
+            assert workspace["questionnaires"]
+            assert workspace["prep_briefs"]
+            assert len(workspace["patient_files"]) == 4
+            assert all(file["document_type"] != "intake_template_file" for file in workspace["patient_files"])
+            assert all(file["download_url"].startswith("/api/documents/") for file in workspace["patient_files"])
+            assert any(appointment.status == "confirmed" and appointment.therapist_id for appointment in appointments)
+        capacity = therapist_calendar_capacity(session, tenant_id=tenant.id)
+        seeded_summaries = [
+            item
+            for item in capacity["therapists"]
+            if item["therapist_id"] in {"demo-therapist-001", "demo-therapist-002"}
+        ]
+        assert seeded_summaries
+        assert not any(
+            error["code"] == "calendar_event_not_seen"
+            for summary in seeded_summaries
+            for error in summary["sync_errors"]
+        )
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_gmail_demo_reset_recreates_stage_rows_idempotently(monkeypatch) -> None:
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "false")
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Demo Stage Idempotent", slug=_id("demo-stage-idempotent"))
+        session.add(tenant)
+        session.flush()
+
+        first = reset_gmail_patient_demo(session, tenant_id=tenant.id)
+        changed = session.get(Referral, first["seeded_stage_referral_ids"][0])
+        changed.patient_name = "Changed Stage Patient"
+        extra_patient = Patient(
+            id="demo-stage-patient-extra",
+            tenant_id=tenant.id,
+            display_name="Extra Stage Patient",
+        )
+        extra_referral = Referral(
+            id="demo-stage-extra",
+            tenant_id=tenant.id,
+            patient_id=extra_patient.id,
+            source_channel=repository_module.DEMO_STAGE_SOURCE,
+            raw_text="Extra stale stage row.",
+            status="needs_admin_review",
+            patient_name="Extra Stage Patient",
+        )
+        session.add_all([extra_patient, extra_referral])
+        session.flush()
+
+        second = reset_gmail_patient_demo(session, tenant_id=tenant.id)
+        stage_referrals = list(
+            session.scalars(
+                select(Referral).where(
+                    Referral.tenant_id == tenant.id,
+                    Referral.source_channel == repository_module.DEMO_STAGE_SOURCE,
+                )
+            )
+        )
+
+        assert second["deleted_stage_referrals"] == 9
+        assert len(stage_referrals) == 8
+        assert session.get(Referral, "demo-stage-extra") is None
+        assert session.get(Referral, first["seeded_stage_referral_ids"][0]).patient_name != "Changed Stage Patient"
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_gmail_demo_reset_does_not_create_placeholder_names_or_block_clara(monkeypatch) -> None:
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "false")
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Demo Clara Availability", slug=_id("demo-clara-availability"))
+        session.add(tenant)
+        session.flush()
+
+        reset_gmail_patient_demo(session, tenant_id=tenant.id)
+        clara = session.scalar(
+            select(Therapist).where(
+                Therapist.tenant_id == tenant.id,
+                Therapist.email == "clara.demo1234@gmail.com",
+            )
+        )
+        capacity = therapist_calendar_capacity(session, tenant_id=tenant.id)
+        clara_summary = next(item for item in capacity["therapists"] if item["therapist_id"] == clara.id)
+
+        assert session.scalar(select(Therapist).where(Therapist.tenant_id == tenant.id, Therapist.name == "Other Therapist")) is None
+        assert session.scalar(select(Patient).where(Patient.tenant_id == tenant.id, Patient.display_name == "No Resume Patient")) is None
+        assert clara_summary["active_appointments"] == []
+        assert clara_summary["available_slots"]
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_intake_workspace_patient_files_only_completed_returned_files() -> None:
+    Base.metadata.create_all(bind=engine)
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Patient Files", slug=_id("patient-files"))
+        patient = Patient(tenant_id=tenant.id, display_name="Patient Files Person")
+        referral = Referral(
+            tenant_id=tenant.id,
+            patient_id=None,
+            source_channel="webform",
+            raw_text="Referral with returned intake file.",
+            status="intake_incomplete",
+            patient_name="Patient Files Person",
+        )
+        session.add(tenant)
+        session.flush()
+        session.add_all([patient, referral])
+        session.flush()
+        referral.patient_id = patient.id
+
+        returned_meta = _template_file_meta("returned-intake.txt", b"Returned intake")
+        returned_doc = Document(
+            tenant_id=tenant.id,
+            patient_id=patient.id,
+            document_type="intake_submission",
+            title="returned-intake.txt",
+            storage_uri=str(returned_meta["storage_uri"]),
+            metadata_json={**returned_meta, "referral_id": referral.id},
+        )
+        template_meta = _template_file_meta("blank-template.txt", b"Blank template")
+        template_doc = Document(
+            tenant_id=tenant.id,
+            patient_id=patient.id,
+            document_type="intake_template_file",
+            title="blank-template.txt",
+            storage_uri=str(template_meta["storage_uri"]),
+            metadata_json={**template_meta, "referral_id": referral.id},
+        )
+        session.add_all([returned_doc, template_doc])
+        session.flush()
+        item = IntakeChecklistItem(
+            tenant_id=tenant.id,
+            patient_id=patient.id,
+            referral_id=referral.id,
+            item_key="intake_form",
+            label="Clinical intake form",
+            item_type="form",
+            status="completed",
+            source_document_id=returned_doc.id,
+        )
+        template_item = IntakeChecklistItem(
+            tenant_id=tenant.id,
+            patient_id=patient.id,
+            referral_id=referral.id,
+            item_key="template_copy",
+            label="Template copy",
+            item_type="form",
+            status="completed",
+            source_document_id=template_doc.id,
+        )
+        missing_item = IntakeChecklistItem(
+            tenant_id=tenant.id,
+            patient_id=patient.id,
+            referral_id=referral.id,
+            item_key="missing_file",
+            label="Missing file",
+            item_type="form",
+            status="missing",
+            source_document_id=returned_doc.id,
+        )
+        consent = ConsentRecord(
+            tenant_id=tenant.id,
+            patient_id=patient.id,
+            scope="privacy_notice",
+            status="completed",
+            source_document_id=returned_doc.id,
+        )
+        session.add_all([item, template_item, missing_item, consent])
+        session.flush()
+
+        workspace = intake_workspace(session, referral.id)
+
+        assert [file["document_id"] for file in workspace["patient_files"]] == [returned_doc.id]
+        assert workspace["patient_files"][0]["display_name"] == "returned-intake.txt"
+        assert workspace["patient_files"][0]["intake_item_labels"] == ["Clinical intake form"]
+        assert workspace["patient_files"][0]["consent_labels"] == ["privacy notice"]
+        assert workspace["patient_files"][0]["size_bytes"] == len(b"Returned intake")
     finally:
         session.rollback()
         session.close()
@@ -1232,6 +1507,75 @@ def test_email_slot_offer_body_is_normalized_to_one_slot_per_option(monkeypatch)
         session.close()
 
 
+def test_email_appointment_options_use_configured_availability_only(monkeypatch) -> None:
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "false")
+
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Configured Availability Test", slug=_id("configured-availability"))
+        clara = Therapist(
+            tenant_id=tenant.id,
+            name="Dr. Clara Demo",
+            email="clara.demo1234@gmail.com",
+            availability_blocks=[{"weekday": "Thursday", "start": "09:00", "end": "13:00", "modality": "online"}],
+        )
+        unconfigured = Therapist(
+            tenant_id=tenant.id,
+            name="Nigel Farage",
+            email="nigel@example.com",
+            availability_blocks=[],
+        )
+        session.add_all([tenant, clara, unconfigured])
+        session.flush()
+
+        options = appointment_options_for_workflow(
+            session,
+            tenant.id,
+            {"raw_text": "Patient is available all day Thursday for an online appointment."},
+            limit=6,
+        )
+
+        assert options
+        assert {option["therapist_id"] for option in options} == {clara.id}
+        assert all(option["therapist_name"] == "Dr. Clara Demo" for option in options)
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_all_day_weekday_availability_is_not_constrained_by_other_day_morning(monkeypatch) -> None:
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "false")
+
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="All Day Availability Test", slug=_id("all-day-availability"))
+        clara = Therapist(
+            tenant_id=tenant.id,
+            name="Dr. Clara Demo",
+            email="clara.demo1234@gmail.com",
+            availability_blocks=[{"weekday": "Thursday", "start": "11:20", "end": "13:00", "modality": "online"}],
+        )
+        session.add_all([tenant, clara])
+        session.flush()
+
+        options = appointment_options_for_workflow(
+            session,
+            tenant.id,
+            {"raw_text": "I am available Monday morning, and all day Thursday, Friday and Saturday."},
+            limit=3,
+        )
+
+        assert options
+        assert options[0]["therapist_id"] == clara.id
+        assert options[0]["weekday"] == "Thursday"
+        assert "T11:20:00" in options[0]["starts_at"]
+    finally:
+        session.rollback()
+        session.close()
+
+
 def test_email_referrals_reject_parallel_deterministic_actions(monkeypatch) -> None:
     Base.metadata.create_all(bind=engine)
     monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "false")
@@ -1625,11 +1969,55 @@ def test_gmail_failure_leaves_review_gate_open(monkeypatch) -> None:
         session.close()
 
 
+def test_intake_reminder_requires_sent_intake_packet() -> None:
+    Base.metadata.create_all(bind=engine)
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Reminder Guard", slug=_id("reminder-guard"))
+        referral = Referral(
+            tenant_id=tenant.id,
+            source_channel="webform",
+            raw_text="Referral with intake outstanding before packet send.",
+            status="intake_incomplete",
+            patient_name="Reminder Guard Patient",
+        )
+        template = IntakeTemplate(
+            tenant_id=tenant.id,
+            name="Reminder guard template",
+            required_items=[{"key": "intake_form", "label": "Intake form", "type": "form"}],
+        )
+        session.add(tenant)
+        session.flush()
+        session.add_all([referral, template])
+        session.flush()
+        start_intake_for_referral(session, referral.id, template.id)
+
+        with pytest.raises(ValueError, match="Send the intake packet before drafting an intake reminder"):
+            generate_missing_intake_reminder(session, referral.id)
+
+        reminder_tasks = list(
+            session.scalars(
+                select(HumanReviewTask).where(
+                    HumanReviewTask.referral_id == referral.id,
+                    HumanReviewTask.task_type == "intake_reminder_approval",
+                )
+            )
+        )
+        assert reminder_tasks == []
+    finally:
+        session.rollback()
+        session.close()
+
+
 def test_intake_reminder_gmail_failure_keeps_gate_open_and_draft_unsent(monkeypatch) -> None:
     Base.metadata.create_all(bind=engine)
     monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "true")
+    send_calls = []
 
     def fake_send(**kwargs):
+        send_calls.append(kwargs)
+        if kwargs.get("subject") == "Intake packet for your first session":
+            return {"message_id": "packet-message-before-reminder", "thread_id": "packet-thread-before-reminder"}
         raise google_workspace.GoogleWorkspaceError("simulated reminder Gmail outage")
 
     monkeypatch.setattr(google_workspace, "send_approved_draft", fake_send)
@@ -1653,7 +2041,26 @@ def test_intake_reminder_gmail_failure_keeps_gate_open_and_draft_unsent(monkeypa
         )
         session.add_all([referral, template])
         session.flush()
-        start_intake_for_referral(session, referral.id)
+        file_meta = _template_file_meta("intake-form.txt")
+        create_intake_template_file(
+            session,
+            template_id=template.id,
+            item_key="intake_form",
+            title=str(file_meta["file_name"]),
+            storage_uri=str(file_meta["storage_uri"]),
+            metadata=file_meta,
+        )
+        start_intake_for_referral(session, referral.id, template.id)
+        packet_draft = draft_intake_packet(session, referral.id)
+        packet_task = session.scalar(
+            select(HumanReviewTask).where(
+                HumanReviewTask.referral_id == referral.id,
+                HumanReviewTask.task_type == "send_approval",
+            )
+        )
+        apply_review_action(session, task_id=packet_task.id, action="approve")
+        assert session.get(CommunicationDraft, packet_draft["id"]).status == "sent"
+
         draft = generate_missing_intake_reminder(session, referral.id)
         task = session.scalar(
             select(HumanReviewTask).where(
@@ -1671,6 +2078,10 @@ def test_intake_reminder_gmail_failure_keeps_gate_open_and_draft_unsent(monkeypa
         assert draft_row.sent_at is None
         assert "simulated reminder Gmail outage" in (draft_row.last_provider_error or "")
         assert "simulated reminder Gmail outage" in task.source_payload["provider_error"]
+        assert [call["subject"] for call in send_calls] == [
+            "Intake packet for your first session",
+            "Reminder: intake items before your first session",
+        ]
     finally:
         session.rollback()
         session.close()
@@ -1877,9 +2288,26 @@ def test_demo_clara_confirmation_invites_clara_and_stays_visible_locally(monkeyp
     session = SessionLocal()
     try:
         payload = reset_clean_demo_referral(session)
-        referral = session.get(Referral, payload["referral"]["id"])
         therapist = session.scalar(select(Therapist).where(Therapist.name == "Dr. Clara Demo"))
         assert therapist.email == "clara.demo1234@gmail.com"
+        patient = Patient(
+            tenant_id=payload["therapist"]["tenant_id"],
+            display_name="Gmail Demo Patient",
+            contact_email="lumenpatientdemo@gmail.com",
+        )
+        session.add(patient)
+        session.flush()
+        referral = Referral(
+            tenant_id=payload["therapist"]["tenant_id"],
+            patient_id=patient.id,
+            source_channel="email",
+            raw_text="Gmail demo referral.",
+            status="awaiting_patient_reply",
+            patient_name=patient.display_name,
+            contact_email=patient.contact_email,
+        )
+        session.add(referral)
+        session.flush()
 
         referral.status = "awaiting_patient_reply"
         starts_at = datetime.now(timezone.utc) + timedelta(days=5)
@@ -2578,6 +3006,10 @@ def test_gmail_demo_intake_reply_auto_maps_completed_forms_and_marks_ready(monke
         }
         assert all(task.status == "completed" for task in review_tasks if task.task_type == "intake_submission_review")
         assert session.scalar(select(TherapistPrepBrief).where(TherapistPrepBrief.referral_id == referral.id)) is not None
+        assert referral.status == "first_session_ready"
+
+        start_intake_for_referral(session, referral.id)
+        session.refresh(referral)
         assert referral.status == "first_session_ready"
     finally:
         session.rollback()

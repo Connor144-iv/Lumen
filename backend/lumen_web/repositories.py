@@ -12,7 +12,7 @@ from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session, selectinload
 
 from .models import (
@@ -189,6 +189,7 @@ ACTION_OWNER_LABELS = {
     "wait_patient_reply": "Patient",
     "confirm_appointment": "Admin",
     "start_intake": "Admin",
+    "draft_intake_packet": "Agent",
     "complete_intake": "Patient / admin",
     "generate_prep_brief": "Agent",
     "ready": "Complete",
@@ -217,6 +218,7 @@ NEXT_ACTION_ALLOWED_ACTIONS = {
     "wait_patient_reply": ("record_patient_reply",),
     "confirm_appointment": ("review_gate",),
     "start_intake": ("start_intake", "draft_intake_packet"),
+    "draft_intake_packet": ("draft_intake_packet",),
     "complete_intake": ("draft_intake_reminder", "generate_prep_brief"),
     "generate_prep_brief": ("generate_prep_brief",),
     "ready": (),
@@ -268,9 +270,11 @@ DEMO_CLEAN_REFERRAL_ID = "demo-clean-referral-001"
 DEMO_CLEAN_PATIENT_ID = "demo-clean-patient-001"
 DEMO_CLEAN_THERAPIST_ID = "demo-clean-therapist-001"
 DEMO_CLEAN_INTAKE_TEMPLATE_ID = "demo-clean-intake-template"
-DEMO_CLARA_PATIENT_APPOINTMENT_ID = "demo-clara-patient-appt-001"
 DEMO_CLARA_DOCUMENTATION_SESSION_PREFIX = "demo-clara-doc-session"
 DEMO_CLARA_DOCUMENTATION_TEXT_PREFIX = "demo-clara-doc-text"
+DEMO_STAGE_PREFIX = "demo-stage-"
+DEMO_STAGE_SOURCE = "demo_stage"
+DEMO_STAGE_SEED_SOURCE = "demo_seed"
 DEMO_GMAIL_INTAKE_TEMPLATE_NAME = "Standard first-session intake"
 DEMO_GMAIL_INTAKE_PACKET_ASSET_DIR = REPO_ROOT / "backend" / "lumen_web" / "demo_assets" / "intake_packet"
 DEMO_GMAIL_INTAKE_REQUIRED_ITEMS = [
@@ -1064,6 +1068,15 @@ def _referral_workbench_state(
     summary = referral_summary(referral)
     status = summary["status"]
     stage = _journey_stage(status)
+    packet_state = _intake_packet_state(session, referral, tasks=tasks, drafts=drafts)
+    if _supersede_premature_intake_reminder_tasks(
+        session,
+        referral,
+        packet_state=packet_state,
+        tasks=tasks,
+        drafts=drafts,
+    ):
+        packet_state = _intake_packet_state(session, referral, tasks=tasks, drafts=drafts)
     open_tasks = [task for task in tasks if task.status == "open"]
     change_tasks = [task for task in tasks if task.status == "changes_requested"]
     email_workflow = _email_workflow_packet(session, referral, tasks=tasks, drafts=drafts, workflows=workflows)
@@ -1105,6 +1118,9 @@ def _referral_workbench_state(
         for blocker in email_workflow.get("blockers") or []:
             _append_blocker(blockers, blocker["code"], blocker["label"], blocker.get("severity", "warning"))
 
+    if packet_state.get("state") != "sent":
+        allowed_actions = [action for action in allowed_actions if action != "draft_intake_reminder"]
+
     primary_blocker = _primary_blocker(blockers)
     if changed_gate is not None:
         primary_blocker = {
@@ -1136,7 +1152,14 @@ def _referral_workbench_state(
         "progress": _workbench_progress_facts(session, referral, tasks=tasks, drafts=drafts),
         "agent_outputs": _agent_outputs_for_referral(session, referral, tasks=tasks, drafts=drafts),
         "activity": _referral_activity(session, referral, tasks=tasks, drafts=drafts, workflows=workflows),
+        "advanced_trace": _advanced_trace_for_referral(workflows),
         "email_workflow": email_workflow,
+    }
+
+
+def _advanced_trace_for_referral(workflows: list[WorkflowRun]) -> dict[str, Any]:
+    return {
+        "workflow_runs": [workflow_run_to_dict(run, include_events=True) for run in workflows],
     }
 
 
@@ -1154,11 +1177,17 @@ def _email_workflow_packet(
     latest_workflow = next((run for run in workflows if run.workflow_type == "new_referral"), None)
     proposed_appointment = _latest_appointment_for_referral(session, referral, statuses=("proposed",))
     confirmed_appointment = _latest_appointment_for_referral(session, referral, statuses=("confirmed",))
-    slot_draft = next((draft for draft in drafts if draft.proposed_slots), None)
-    latest_sent_draft = next((draft for draft in drafts if draft.status == "sent"), None)
-    latest_draft = slot_draft or (drafts[0] if drafts else None)
+    actionable_drafts = [draft for draft in drafts if draft.status != "superseded"]
+    slot_draft = next((draft for draft in actionable_drafts if draft.proposed_slots), None)
+    latest_sent_draft = next((draft for draft in actionable_drafts if draft.status == "sent"), None)
+    latest_draft = slot_draft or (actionable_drafts[0] if actionable_drafts else None)
+    packet_state = _intake_packet_state(session, referral, tasks=tasks, drafts=drafts)
     open_tasks = [task for task in tasks if task.status == "open"]
     open_task_types = {task.task_type for task in open_tasks}
+    has_non_intake_send_approval = any(
+        task.task_type == "send_approval" and not _is_intake_packet_send_task(task)
+        for task in open_tasks
+    )
     relevant_task_types = {
         "admin_missing_info_review",
         "match_approval",
@@ -1166,6 +1195,7 @@ def _email_workflow_packet(
         "send_approval",
         "appointment_confirmation_approval",
         "inbound_reply_review",
+        "intake_reminder_approval",
         "intake_submission_review",
     }
     packet_tasks = [review_task_to_dict(task) for task in open_tasks if task.task_type in relevant_task_types]
@@ -1180,7 +1210,10 @@ def _email_workflow_packet(
         or confirmed_appointment
         or (open_task_types & relevant_task_types)
     )
-    if latest_workflow and latest_workflow.status == "failed" and not has_response_artifacts:
+    if canonical_referral_status(referral.status) == "first_session_ready":
+        next_action = "ready"
+        next_label = next_action_label("ready")
+    elif latest_workflow and latest_workflow.status == "failed" and not has_response_artifacts:
         next_action = "retry_extraction"
         next_label = "Retry extraction"
     elif latest_workflow and latest_workflow.status in {"queued", "running"} and not has_response_artifacts:
@@ -1195,10 +1228,29 @@ def _email_workflow_packet(
     elif "intake_submission_review" in open_task_types:
         next_action = "complete_intake"
         next_label = "Review intake submission"
-    elif "send_approval" in open_task_types and _review_prereqs_approved(tasks, require_slot_offer=False):
+    elif packet_state["state"] == "draft_pending_review":
+        next_action = "review_prepared_email"
+        next_label = "Review intake packet"
+    elif confirmed_appointment and packet_state["state"] == "not_drafted" and canonical_referral_status(referral.status) in {
+        "intake_incomplete",
+        "intake_packet_sent",
+        "intake_complete",
+        "prep_brief_ready",
+        "first_session_ready",
+    }:
+        next_action = "draft_intake_packet"
+        next_label = "Draft intake packet"
+    elif "intake_reminder_approval" in open_task_types and packet_state["state"] == "sent":
+        next_action = "review_prepared_email"
+        next_label = "Approve intake reminder"
+    elif has_non_intake_send_approval and _review_prereqs_approved(tasks, require_slot_offer=False):
         next_action = "send_email"
         next_label = "Send email to patient"
-    elif open_task_types & {"match_approval", "slot_offer_approval", "send_approval"} or (latest_draft and latest_draft.status == "draft_pending_review"):
+    elif (
+        open_task_types & {"match_approval", "slot_offer_approval"}
+        or has_non_intake_send_approval
+        or (latest_draft and latest_draft.status == "draft_pending_review")
+    ):
         next_action = "review_prepared_email"
         next_label = "Review prepared email"
     elif referral.duplicate_candidates:
@@ -1256,6 +1308,7 @@ def _email_workflow_packet(
             "sent_at": iso_or_none(latest_draft.sent_at) if latest_draft else None,
         },
         "review_tasks": packet_tasks,
+        "intake_packet_state": packet_state,
         "blockers": blockers,
         "progress": _email_workflow_progress(latest_workflow, referral, latest_draft, proposed_appointment, confirmed_appointment),
     }
@@ -2110,135 +2163,942 @@ def list_escalation_queue(session: Session, tenant_id: str | None = None) -> lis
 
 
 def reset_clean_demo_referral(session: Session, tenant_id: str = DEMO_TENANT_ID) -> dict[str, Any]:
-    seed_demo_data(session)
-    therapist = session.get(Therapist, DEMO_CLEAN_THERAPIST_ID)
-    if therapist is None:
-        therapist = Therapist(
-            id=DEMO_CLEAN_THERAPIST_ID,
-            tenant_id=tenant_id,
-            name="Dr. Clara Demo",
-            email=DEMO_CLARA_EMAIL,
-            specialties=["anxiety", "work stress", "adjustment"],
-            age_groups=["adult"],
-            languages=["Portuguese", "English"],
-            modalities=["online"],
-            insurers=["Multicare", "self-pay"],
-            capacity_per_week=6,
-            availability_blocks=[
-                {"weekday": "Tuesday", "start": "10:00", "end": "16:00", "modality": "online"},
-                {"weekday": "Thursday", "start": "09:00", "end": "13:00", "modality": "online"},
-            ],
-        )
-        session.add(therapist)
-    else:
-        therapist.tenant_id = tenant_id
-        therapist.active = True
-        therapist.email = DEMO_CLARA_EMAIL
-        therapist.specialties = ["anxiety", "work stress", "adjustment"]
-        therapist.age_groups = ["adult"]
-        therapist.languages = ["Portuguese", "English"]
-        therapist.modalities = ["online"]
-        therapist.insurers = ["Multicare", "self-pay"]
-        therapist.capacity_per_week = 6
-        therapist.availability_blocks = [
-            {"weekday": "Tuesday", "start": "10:00", "end": "16:00", "modality": "online"},
-            {"weekday": "Thursday", "start": "09:00", "end": "13:00", "modality": "online"},
-        ]
-
-    template = session.get(IntakeTemplate, DEMO_CLEAN_INTAKE_TEMPLATE_ID)
-    required_items = [
-        {"key": "privacy_notice", "label": "Privacy notice acknowledged", "type": "consent", "consent_scope": "privacy_notice"},
-        {"key": "intake_form", "label": "Clinical intake form", "type": "form"},
-    ]
-    if template is None:
-        session.add(
-            IntakeTemplate(
-                id=DEMO_CLEAN_INTAKE_TEMPLATE_ID,
-                tenant_id=tenant_id,
-                name="Clean referral demo intake",
-                patient_type="standard",
-                insurer="Multicare",
-                modality="online",
-                required_items=required_items,
-                questionnaire_schema={"name": "clean_demo_screening", "questions": []},
-                active=True,
-            )
-        )
-    else:
-        template.active = True
-        template.required_items = required_items
-        template.insurer = "Multicare"
-        template.modality = "online"
-
-    _delete_clean_demo_referral_rows(session)
-
-    patient = session.get(Patient, DEMO_CLEAN_PATIENT_ID)
-    if patient is None:
-        patient = Patient(id=DEMO_CLEAN_PATIENT_ID, tenant_id=tenant_id)
-        session.add(patient)
-    patient.display_name = "Clean Demo Patient"
-    patient.contact_email = DEMO_CLEAN_PATIENT_EMAIL
-    patient.language = "Portuguese"
-    session.flush()
-    _ensure_clara_demo_patient_appointment(session, tenant_id=tenant_id)
-
-    referral = Referral(
-        id=DEMO_CLEAN_REFERRAL_ID,
-        tenant_id=tenant_id,
-        patient_id=patient.id,
-        source_channel="webform",
-        raw_text=(
-            "Adult referral for anxiety and work stress. Portuguese online therapy requested. "
-            "Insurance: Multicare. Patient can attend Tuesday or Thursday mornings. Date of birth is missing."
-        ),
-        status="needs_admin_review",
-        patient_name=patient.display_name,
-        contact_email=DEMO_CLEAN_PATIENT_EMAIL,
-        insurer="Multicare",
-        language_preference="Portuguese",
-        modality_preference="online",
-        missing_fields=["date_of_birth"],
-        risk_category="standard",
-        urgency="routine",
-        risk_present=False,
-    )
-    session.add(referral)
-    session.flush()
-    source_document = Document(
-        tenant_id=tenant_id,
-        patient_id=patient.id,
-        document_type="source_referral",
-        title="Clean referral demo source",
-        storage_uri=None,
-        metadata_json={"referral_id": referral.id, "scope": "clean_demo", "source": "demo_reset"},
-    )
-    session.add(source_document)
-    session.flush()
-    _ensure_admin_missing_info_task(session, referral)
-    write_audit(
-        session,
-        tenant_id=tenant_id,
-        action="demo_reset",
-        entity_type="referral",
-        entity_id=referral.id,
-        after=referral_summary(referral),
-    )
-    return {
-        "referral": referral_detail(session, referral.id),
-        "therapist": therapist_to_dict(therapist),
-        "intake_template": intake_template_to_dict(session.get(IntakeTemplate, DEMO_CLEAN_INTAKE_TEMPLATE_ID)),
-    }
+    return reset_gmail_first_demo_state(session, tenant_id=tenant_id)
 
 
 def reset_gmail_patient_demo(session: Session, tenant_id: str = DEMO_TENANT_ID) -> dict[str, Any]:
+    return reset_gmail_first_demo_state(session, tenant_id=tenant_id)
+
+
+def reset_gmail_first_demo_state(session: Session, tenant_id: str = DEMO_TENANT_ID) -> dict[str, Any]:
     seed_demo_data(session)
+    therapist = _ensure_clara_demo_therapist(session, tenant_id)
     intake_assets = _ensure_gmail_demo_intake_packet_assets(session, tenant_id)
-    _delete_clean_demo_referral_rows(session)
+    inbox_document_ids = _gmail_inbox_document_ids(session, tenant_id)
+    deleted_gmail_inbox_documents = _delete_document_rows(session, inbox_document_ids)
+    clara_cleanup = _clear_clara_demo_local_calendar(session, therapist)
+    cleanup = _delete_demo_patient_and_referral_state(session, tenant_id=tenant_id)
+    stage_seed = _reset_demo_stage_referrals(session, tenant_id=tenant_id, template_id=intake_assets["intake_template"]["id"])
+    session.flush()
+    write_audit(
+        session,
+        tenant_id=tenant_id,
+        action="demo_gmail_first_reset",
+        entity_type="tenant",
+        entity_id=tenant_id,
+        after={
+            "patient_email": DEMO_OUTBOUND_PATIENT_EMAIL,
+            "deleted_gmail_inbox_documents": deleted_gmail_inbox_documents,
+            **cleanup,
+            **clara_cleanup,
+            **stage_seed,
+        },
+    )
+    return {
+        "patient_email": DEMO_OUTBOUND_PATIENT_EMAIL,
+        "deleted_clean_demo_patient": cleanup["deleted_clean_demo_patient"],
+        "deleted_gmail_inbox_documents": deleted_gmail_inbox_documents,
+        "deleted_gmail_demo_referrals": cleanup["deleted_gmail_demo_referrals"],
+        "deleted_clara_appointments": clara_cleanup["deleted_clara_appointments"],
+        "superseded_appointment_tasks": clara_cleanup["superseded_appointment_tasks"],
+        "removed_referral_ids": cleanup["removed_referral_ids"],
+        "removed_patient_ids": cleanup["removed_patient_ids"],
+        "removed_document_ids": [*inbox_document_ids, *cleanup["removed_document_ids"]],
+        "google_workspace_enabled": google_workspace.is_enabled(),
+        "therapist": therapist_to_dict(therapist),
+        "intake_template": intake_assets["intake_template"],
+        "intake_template_files": intake_assets["intake_template_files"],
+        "missing_intake_template_files": intake_assets["missing_intake_template_files"],
+        "seeded_stage_referrals": stage_seed["seeded_stage_referrals"],
+        "seeded_stage_referral_ids": stage_seed["seeded_stage_referral_ids"],
+        "deleted_stage_referrals": stage_seed["deleted_stage_referrals"],
+    }
+
+
+def _ensure_clara_demo_therapist(session: Session, tenant_id: str) -> Therapist:
+    therapist = session.get(Therapist, DEMO_CLEAN_THERAPIST_ID)
+    if therapist is None:
+        therapist = Therapist(id=DEMO_CLEAN_THERAPIST_ID, tenant_id=tenant_id)
+        session.add(therapist)
+    therapist.tenant_id = tenant_id
+    therapist.active = True
+    therapist.name = "Dr. Clara Demo"
+    therapist.email = DEMO_CLARA_EMAIL
+    therapist.specialties = ["anxiety", "work stress", "adjustment"]
+    therapist.age_groups = ["adult"]
+    therapist.languages = ["Portuguese", "English"]
+    therapist.modalities = ["online"]
+    therapist.insurers = ["Multicare", "self-pay"]
+    therapist.capacity_per_week = 6
+    therapist.availability_blocks = [
+        {"weekday": "Tuesday", "start": "10:00", "end": "16:00", "modality": "online"},
+        {"weekday": "Thursday", "start": "09:00", "end": "13:00", "modality": "online"},
+    ]
+    session.flush()
+    return therapist
+
+
+def _reset_demo_stage_referrals(session: Session, *, tenant_id: str, template_id: str) -> dict[str, Any]:
+    cleanup = _delete_demo_stage_referral_state(session, tenant_id=tenant_id)
+    therapists = _ensure_demo_stage_therapists(session, tenant_id)
+    template = session.get(IntakeTemplate, template_id)
+    if template is None:
+        template = _ensure_gmail_demo_intake_template(session, tenant_id)
+
+    tenant_token = _demo_stage_tenant_token(tenant_id)
+    specs = _demo_stage_referral_specs(therapists, tenant_token=tenant_token)
+    created_ids: list[str] = []
+    for index, spec in enumerate(specs, start=1):
+        patient = Patient(
+            id=spec["patient_id"],
+            tenant_id=tenant_id,
+            display_name=spec["patient_name"],
+            date_of_birth=spec["date_of_birth"],
+            contact_email=spec["contact_email"],
+            contact_phone=spec["contact_phone"],
+            language=spec["language_preference"],
+        )
+        referral = Referral(
+            id=spec["referral_id"],
+            tenant_id=tenant_id,
+            patient_id=patient.id,
+            source_channel=DEMO_STAGE_SOURCE,
+            raw_text=spec["raw_text"],
+            status=spec["status"],
+            patient_name=spec["patient_name"],
+            date_of_birth=spec["date_of_birth"],
+            contact_email=spec["contact_email"],
+            contact_phone=spec["contact_phone"],
+            insurer=spec["insurer"],
+            referring_entity=spec["referring_entity"],
+            language_preference=spec["language_preference"],
+            modality_preference=spec["modality_preference"],
+            missing_fields=spec.get("missing_fields", []),
+            risk_category=spec["risk_category"],
+            urgency=spec["urgency"],
+            risk_present=spec["risk_present"],
+            match_summary=json_safe(spec.get("match_summary") or {}),
+        )
+        session.add_all([patient, referral])
+        session.flush()
+        created_ids.append(referral.id)
+
+        if spec["status"] == "needs_admin_review":
+            _seed_demo_stage_review_task(session, referral, tenant_token)
+        if spec["status"] == "match_recommended":
+            _seed_demo_stage_match_task(session, referral, tenant_token)
+        if spec["status"] == "awaiting_patient_contact":
+            _seed_demo_stage_contact_draft(session, referral, patient, tenant_token)
+        if spec["status"] == "awaiting_patient_reply":
+            _seed_demo_stage_sent_contact(session, referral, patient, spec["therapist_id"], index, tenant_token)
+        if spec["status"] == "intake_incomplete":
+            _seed_demo_stage_incomplete_intake(session, referral, patient, template, index, tenant_token)
+        if spec["status"] == "first_session_ready":
+            _seed_demo_stage_ready_referral(session, referral, patient, template, spec["therapist_id"], index, tenant_token)
+
+    session.flush()
+    return {
+        **cleanup,
+        "seeded_stage_referrals": len(created_ids),
+        "seeded_stage_referral_ids": created_ids,
+    }
+
+
+def _delete_demo_stage_referral_state(session: Session, *, tenant_id: str) -> dict[str, Any]:
+    referral_ids = list(
+        session.scalars(
+            select(Referral.id).where(
+                Referral.tenant_id == tenant_id,
+                Referral.id.like(f"{DEMO_STAGE_PREFIX}%"),
+            )
+        )
+    )
+    patient_ids = set(
+        session.scalars(
+            select(Patient.id).where(
+                Patient.tenant_id == tenant_id,
+                Patient.id.like(f"{DEMO_STAGE_PREFIX}%"),
+            )
+        )
+    )
+    if referral_ids:
+        patient_ids.update(
+            referral.patient_id
+            for referral in session.scalars(select(Referral).where(Referral.id.in_(referral_ids)))
+            if referral.patient_id
+        )
+    workflow_ids = list(
+        session.scalars(
+            select(WorkflowRun.id).where(
+                WorkflowRun.tenant_id == tenant_id,
+                WorkflowRun.id.like(f"{DEMO_STAGE_PREFIX}%"),
+            )
+        )
+    )
+    document_ids = []
+    for document in session.scalars(select(Document).where(Document.tenant_id == tenant_id)):
+        metadata = document.metadata_json or {}
+        if (
+            str(document.id or "").startswith(DEMO_STAGE_PREFIX)
+            or document.patient_id in patient_ids
+            or str(metadata.get("source") or "") == DEMO_STAGE_SEED_SOURCE
+            or str(metadata.get("referral_id") or "") in referral_ids
+        ):
+            document_ids.append(document.id)
+
+    if workflow_ids:
+        session.execute(delete(WorkflowEvent).where(WorkflowEvent.workflow_run_id.in_(workflow_ids)))
+    if referral_ids:
+        session.execute(delete(DraftFeedback).where(DraftFeedback.referral_id.in_(referral_ids)))
+        session.execute(delete(HumanReviewTask).where(HumanReviewTask.referral_id.in_(referral_ids)))
+        session.execute(delete(CommunicationDraft).where(CommunicationDraft.referral_id.in_(referral_ids)))
+        session.execute(delete(Appointment).where(Appointment.referral_id.in_(referral_ids)))
+        session.execute(delete(IntakeChecklistItem).where(IntakeChecklistItem.referral_id.in_(referral_ids)))
+        session.execute(delete(ScoreRecord).where(ScoreRecord.referral_id.in_(referral_ids)))
+        session.execute(delete(QuestionnaireResponse).where(QuestionnaireResponse.referral_id.in_(referral_ids)))
+        session.execute(delete(TherapistPrepBrief).where(TherapistPrepBrief.referral_id.in_(referral_ids)))
+        session.execute(delete(SessionNote).where(SessionNote.referral_id.in_(referral_ids)))
+        session.execute(delete(ReportDraft).where(ReportDraft.referral_id.in_(referral_ids)))
+    if patient_ids:
+        ids = list(patient_ids)
+        session.execute(delete(DocumentChunk).where(DocumentChunk.patient_id.in_(ids)))
+        session.execute(delete(DraftFeedback).where(DraftFeedback.patient_id.in_(ids)))
+        session.execute(delete(HumanReviewTask).where(HumanReviewTask.patient_id.in_(ids)))
+        session.execute(delete(CommunicationDraft).where(CommunicationDraft.patient_id.in_(ids)))
+        session.execute(delete(Appointment).where(Appointment.patient_id.in_(ids)))
+        session.execute(delete(IntakeChecklistItem).where(IntakeChecklistItem.patient_id.in_(ids)))
+        session.execute(delete(ScoreRecord).where(ScoreRecord.patient_id.in_(ids)))
+        session.execute(delete(QuestionnaireResponse).where(QuestionnaireResponse.patient_id.in_(ids)))
+        session.execute(delete(TherapistPrepBrief).where(TherapistPrepBrief.patient_id.in_(ids)))
+        session.execute(delete(SessionNote).where(SessionNote.patient_id.in_(ids)))
+        session.execute(delete(ReportDraft).where(ReportDraft.patient_id.in_(ids)))
+        session.execute(delete(ConsentRecord).where(ConsentRecord.patient_id.in_(ids)))
+    session.execute(
+        delete(HumanReviewTask).where(
+            HumanReviewTask.tenant_id == tenant_id,
+            HumanReviewTask.id.like(f"{DEMO_STAGE_PREFIX}%"),
+        )
+    )
+    removed_documents = _delete_document_rows(session, document_ids)
+    if workflow_ids:
+        session.execute(delete(WorkflowRun).where(WorkflowRun.id.in_(workflow_ids)))
+    if referral_ids:
+        session.execute(delete(Referral).where(Referral.id.in_(referral_ids)))
+    if patient_ids:
+        session.execute(delete(Patient).where(Patient.id.in_(list(patient_ids))))
+    session.flush()
+    return {
+        "deleted_stage_referrals": len(referral_ids),
+        "deleted_stage_patients": len(patient_ids),
+        "deleted_stage_documents": removed_documents,
+    }
+
+
+def _ensure_demo_stage_therapists(session: Session, tenant_id: str) -> dict[str, Therapist]:
+    specs = [
+        {
+            "id": "demo-therapist-001",
+            "name": "Dr. Sofia Almeida",
+            "email": "sofia.almeida@demo-clinic.local",
+            "specialties": ["anxiety", "adjustment", "work stress"],
+            "age_groups": ["adult", "older_adult"],
+            "languages": ["Portuguese", "English"],
+            "modalities": ["online", "hybrid"],
+            "insurers": ["Multicare", "AdvanceCare", "self-pay"],
+            "capacity_per_week": 6,
+            "availability_blocks": [
+                {"weekday": "Tuesday", "start": "10:00", "end": "13:00", "modality": "online"},
+                {"weekday": "Thursday", "start": "14:00", "end": "18:00", "modality": "hybrid"},
+            ],
+        },
+        {
+            "id": "demo-therapist-002",
+            "name": "Miguel Costa",
+            "email": "miguel.costa@demo-clinic.local",
+            "specialties": ["adolescent mental health", "family transitions", "school stress"],
+            "age_groups": ["adolescent", "adult"],
+            "languages": ["Portuguese", "Spanish"],
+            "modalities": ["in_person", "hybrid"],
+            "insurers": ["Medis", "self-pay"],
+            "capacity_per_week": 4,
+            "availability_blocks": [
+                {"weekday": "Monday", "start": "15:00", "end": "19:00", "modality": "in_person"},
+                {"weekday": "Wednesday", "start": "09:00", "end": "12:00", "modality": "hybrid"},
+            ],
+        },
+    ]
+    therapists: dict[str, Therapist] = {}
+    for spec in specs:
+        therapist = session.get(Therapist, spec["id"])
+        if therapist is None:
+            therapist = Therapist(id=spec["id"], tenant_id=tenant_id)
+            session.add(therapist)
+        therapist.tenant_id = tenant_id
+        therapist.active = True
+        therapist.name = spec["name"]
+        therapist.email = spec["email"]
+        therapist.specialties = spec["specialties"]
+        therapist.age_groups = spec["age_groups"]
+        therapist.languages = spec["languages"]
+        therapist.modalities = spec["modalities"]
+        therapist.insurers = spec["insurers"]
+        therapist.capacity_per_week = spec["capacity_per_week"]
+        therapist.availability_blocks = spec["availability_blocks"]
+        therapists[spec["id"]] = therapist
+    session.flush()
+    return therapists
+
+
+def _demo_stage_tenant_token(tenant_id: str) -> str:
+    if tenant_id == DEMO_TENANT_ID:
+        return "demo"
+    return hashlib.sha1(str(tenant_id).encode("utf-8")).hexdigest()[:6]
+
+
+def _demo_stage_referral_specs(therapists: dict[str, Therapist], *, tenant_token: str) -> list[dict[str, Any]]:
+    sofia = therapists["demo-therapist-001"]
+    miguel = therapists["demo-therapist-002"]
+    return [
+        _demo_stage_referral_spec(
+            "needs-review",
+            "Marta Silva",
+            "needs_admin_review",
+            "Referrer sent a partial workplace anxiety referral missing insurer confirmation.",
+            tenant_token=tenant_token,
+            missing_fields=["insurer"],
+            therapist=sofia,
+            insurer=None,
+        ),
+        _demo_stage_referral_spec(
+            "ready-match",
+            "Rui Pereira",
+            "ready_for_matching",
+            "Adult referral with complete details ready for deterministic matching.",
+            tenant_token=tenant_token,
+            therapist=sofia,
+        ),
+        _demo_stage_referral_spec(
+            "match-rec",
+            "Helena Duarte",
+            "match_recommended",
+            "Referral has a recommended therapist and awaits admin match approval.",
+            tenant_token=tenant_token,
+            therapist=sofia,
+            match=True,
+        ),
+        _demo_stage_referral_spec(
+            "await-contact",
+            "Tiago Rocha",
+            "awaiting_patient_contact",
+            "Match approved and first-contact email is drafted for admin approval.",
+            tenant_token=tenant_token,
+            therapist=miguel,
+            match=True,
+        ),
+        _demo_stage_referral_spec(
+            "await-reply",
+            "Ana Ferreira",
+            "awaiting_patient_reply",
+            "Patient has been sent appointment options and the clinic is waiting for a reply.",
+            tenant_token=tenant_token,
+            therapist=miguel,
+            match=True,
+        ),
+        _demo_stage_referral_spec(
+            "intake-open",
+            "Bruno Nunes",
+            "intake_incomplete",
+            "Appointment is confirmed, but intake paperwork is still incomplete.",
+            tenant_token=tenant_token,
+            therapist=sofia,
+            match=True,
+        ),
+        _demo_stage_referral_spec(
+            "ready-one",
+            "Carla Mendes",
+            "first_session_ready",
+            "Appointment, intake, questionnaires, and prep brief are complete.",
+            tenant_token=tenant_token,
+            therapist=sofia,
+            match=True,
+        ),
+        _demo_stage_referral_spec(
+            "ready-two",
+            "Joao Ribeiro",
+            "first_session_ready",
+            "Second ready referral with completed patient files and confirmed appointment.",
+            tenant_token=tenant_token,
+            therapist=miguel,
+            match=True,
+            insurer="self-pay",
+            modality="hybrid",
+        ),
+    ]
+
+
+def _demo_stage_referral_spec(
+    key: str,
+    patient_name: str,
+    status: str,
+    raw_text: str,
+    *,
+    tenant_token: str,
+    therapist: Therapist,
+    missing_fields: list[str] | None = None,
+    insurer: str | None = "Multicare",
+    modality: str = "online",
+    match: bool = False,
+) -> dict[str, Any]:
+    slug = key.replace("_", "-")
+    first_name = patient_name.split()[0].lower()
+    match_summary = {}
+    if match:
+        match_summary = {
+            "ranked_matches": [
+                {
+                    "therapist_id": therapist.id,
+                    "name": therapist.name,
+                    "score": 91,
+                    "rationale": "Matches language, modality, insurer, and presenting concern.",
+                }
+            ],
+            "excluded_therapists": [],
+        }
+    return {
+        "referral_id": f"{DEMO_STAGE_PREFIX}{tenant_token}-{slug}",
+        "patient_id": f"{DEMO_STAGE_PREFIX}{tenant_token}-p-{slug[:10]}",
+        "patient_name": patient_name,
+        "date_of_birth": "1990-04-12",
+        "contact_email": f"{first_name}.{tenant_token}.{slug}@demo-stage.local",
+        "contact_phone": "+351 910 000 100",
+        "insurer": insurer,
+        "referring_entity": "Demo staging referrer",
+        "language_preference": "Portuguese",
+        "modality_preference": modality,
+        "missing_fields": missing_fields or [],
+        "risk_category": "low",
+        "urgency": "routine",
+        "risk_present": False,
+        "raw_text": raw_text,
+        "status": status,
+        "therapist_id": therapist.id,
+        "match_summary": match_summary,
+    }
+
+
+def _seed_demo_stage_review_task(session: Session, referral: Referral, tenant_token: str) -> None:
+    session.add(
+        HumanReviewTask(
+            id=f"{DEMO_STAGE_PREFIX}{tenant_token}-task-review",
+            tenant_id=referral.tenant_id,
+            referral_id=referral.id,
+            patient_id=referral.patient_id,
+            task_type="admin_missing_info_review",
+            status="open",
+            reason="Demo staging referral is missing insurer details.",
+            payload_key="demo_stage_missing_info",
+            source_payload={"source": DEMO_STAGE_SEED_SOURCE, "referral_id": referral.id},
+        )
+    )
+
+
+def _seed_demo_stage_match_task(session: Session, referral: Referral, tenant_token: str) -> None:
+    session.add(
+        HumanReviewTask(
+            id=f"{DEMO_STAGE_PREFIX}{tenant_token}-task-match",
+            tenant_id=referral.tenant_id,
+            referral_id=referral.id,
+            patient_id=referral.patient_id,
+            task_type="match_approval",
+            status="open",
+            reason="Demo staging match recommendation is ready for admin approval.",
+            payload_key="demo_stage_match",
+            source_payload={"source": DEMO_STAGE_SEED_SOURCE, "referral_id": referral.id},
+        )
+    )
+
+
+def _seed_demo_stage_contact_draft(
+    session: Session,
+    referral: Referral,
+    patient: Patient,
+    tenant_token: str,
+) -> None:
+    draft = CommunicationDraft(
+        id=f"{DEMO_STAGE_PREFIX}{tenant_token}-draft-contact",
+        tenant_id=referral.tenant_id,
+        referral_id=referral.id,
+        patient_id=patient.id,
+        channel="email",
+        subject="Appointment options for your referral",
+        body="Hello, we have a therapist match and can offer appointment options once this message is approved.",
+        status="draft_pending_review",
+        proposed_slots=[],
+        requires_human_send=True,
+        recipient_email=patient.contact_email,
+    )
+    session.add(draft)
+    referral.communication_draft_id = draft.id
+    session.add(
+        HumanReviewTask(
+            id=f"{DEMO_STAGE_PREFIX}{tenant_token}-task-contact",
+            tenant_id=referral.tenant_id,
+            referral_id=referral.id,
+            patient_id=patient.id,
+            task_type="send_approval",
+            status="open",
+            reason="Demo staging patient-contact draft requires approval.",
+            payload_key=f"first_contact_draft:{draft.id[:8]}",
+            source_payload=communication_draft_to_dict(draft),
+            draft_text=draft.body,
+        )
+    )
+
+
+def _seed_demo_stage_sent_contact(
+    session: Session,
+    referral: Referral,
+    patient: Patient,
+    therapist_id: str,
+    index: int,
+    tenant_token: str,
+) -> None:
+    starts_at = _demo_stage_future_time(index + 14, 15)
+    appointment = Appointment(
+        id=f"{DEMO_STAGE_PREFIX}{tenant_token}-appt-prop",
+        tenant_id=referral.tenant_id,
+        patient_id=patient.id,
+        therapist_id=therapist_id,
+        referral_id=referral.id,
+        starts_at=starts_at,
+        ends_at=starts_at + timedelta(minutes=SESSION_LENGTH_MINUTES),
+        status="proposed",
+        source=DEMO_STAGE_SEED_SOURCE,
+    )
+    draft = CommunicationDraft(
+        id=f"{DEMO_STAGE_PREFIX}{tenant_token}-draft-sent",
+        tenant_id=referral.tenant_id,
+        referral_id=referral.id,
+        patient_id=patient.id,
+        channel="email",
+        subject="Please confirm one appointment option",
+        body="Hello, please reply with the appointment option that works best for you.",
+        status="sent",
+        proposed_slots=[appointment.id],
+        requires_human_send=True,
+        recipient_email=patient.contact_email,
+        sent_at=utc_now() - timedelta(days=1),
+    )
+    session.add_all([appointment, draft])
+    referral.communication_draft_id = draft.id
+
+
+def _seed_demo_stage_incomplete_intake(
+    session: Session,
+    referral: Referral,
+    patient: Patient,
+    template: IntakeTemplate,
+    index: int,
+    tenant_token: str,
+) -> None:
+    starts_at = _demo_stage_future_time(index + 20, 10)
+    session.add(
+        Appointment(
+            id=f"{DEMO_STAGE_PREFIX}{tenant_token}-appt-intake",
+            tenant_id=referral.tenant_id,
+            patient_id=patient.id,
+            therapist_id=_top_match_therapist_id(referral),
+            referral_id=referral.id,
+            starts_at=starts_at,
+            ends_at=starts_at + timedelta(minutes=SESSION_LENGTH_MINUTES),
+            status="confirmed",
+            source=DEMO_STAGE_SEED_SOURCE,
+            google_calendar_id="demo_seed_local",
+            google_calendar_event_id=f"{DEMO_STAGE_PREFIX}{tenant_token}-event-intake",
+            google_calendar_synced_at=utc_now(),
+        )
+    )
+    for spec in _intake_template_required_item_specs(template):
+        key = _intake_template_item_key(spec)
+        if not key:
+            continue
+        session.add(
+            IntakeChecklistItem(
+                id=f"{DEMO_STAGE_PREFIX}{tenant_token}-item-6-{_demo_stage_item_alias(key)}",
+                tenant_id=referral.tenant_id,
+                patient_id=patient.id,
+                referral_id=referral.id,
+                template_id=template.id,
+                item_key=key,
+                label=str(spec.get("label") or key.replace("_", " ").title()),
+                item_type=str(spec.get("type") or "form"),
+                status="missing",
+                due_at=utc_now() + timedelta(days=int(spec.get("due_days") or 5)),
+            )
+        )
+        if str(spec.get("type") or "form") == "consent":
+            session.add(
+                ConsentRecord(
+                    id=f"{DEMO_STAGE_PREFIX}{tenant_token}-cons-6-{_demo_stage_item_alias(key)}",
+                    tenant_id=referral.tenant_id,
+                    patient_id=patient.id,
+                    scope=str(spec.get("consent_scope") or key),
+                    status="missing",
+                )
+            )
+
+
+def _seed_demo_stage_ready_referral(
+    session: Session,
+    referral: Referral,
+    patient: Patient,
+    template: IntakeTemplate,
+    therapist_id: str,
+    index: int,
+    tenant_token: str,
+) -> None:
+    document_by_key: dict[str, Document] = {}
+    for spec in _intake_template_required_item_specs(template):
+        key = _intake_template_item_key(spec)
+        if not key:
+            continue
+        alias = _demo_stage_item_alias(key)
+        document = _create_demo_stage_patient_document(session, referral, patient, spec, index, alias, tenant_token)
+        document_by_key[key] = document
+        session.add(
+            IntakeChecklistItem(
+                id=f"{DEMO_STAGE_PREFIX}{tenant_token}-item-{index}-{alias}",
+                tenant_id=referral.tenant_id,
+                patient_id=patient.id,
+                referral_id=referral.id,
+                template_id=template.id,
+                item_key=key,
+                label=str(spec.get("label") or key.replace("_", " ").title()),
+                item_type=str(spec.get("type") or "form"),
+                status="completed",
+                due_at=utc_now() - timedelta(days=2),
+                completed_at=utc_now() - timedelta(days=1),
+                source_document_id=document.id,
+                notes="Returned by seeded demo patient.",
+            )
+        )
+        if str(spec.get("type") or "form") == "consent":
+            session.add(
+                ConsentRecord(
+                    id=f"{DEMO_STAGE_PREFIX}{tenant_token}-cons-{index}-{alias}",
+                    tenant_id=referral.tenant_id,
+                    patient_id=patient.id,
+                    scope=str(spec.get("consent_scope") or key),
+                    status="completed",
+                    source_document_id=document.id,
+                )
+            )
+    questionnaire_document = document_by_key.get("screening_questionnaire")
+    response = QuestionnaireResponse(
+        id=f"{DEMO_STAGE_PREFIX}{tenant_token}-q-{index}",
+        tenant_id=referral.tenant_id,
+        patient_id=patient.id,
+        referral_id=referral.id,
+        template_id=template.id,
+        questionnaire_name="generic_screening",
+        answers={"mood": 1, "anxiety": 2, "sleep": 1},
+        score_summary={"total_score": 4, "answered_items": 3, "numeric_items": 3},
+        status="completed",
+    )
+    session.add(response)
+    session.flush()
+    if questionnaire_document is not None:
+        questionnaire_document.metadata_json = json_safe(
+            {
+                **(questionnaire_document.metadata_json or {}),
+                "questionnaire_response_id": response.id,
+            }
+        )
+    session.add(
+        ScoreRecord(
+            id=f"{DEMO_STAGE_PREFIX}{tenant_token}-score-{index}",
+            tenant_id=referral.tenant_id,
+            patient_id=patient.id,
+            referral_id=referral.id,
+            source_response_id=response.id,
+            instrument_name=response.questionnaire_name,
+            score_summary=response.score_summary,
+            status="recorded",
+        )
+    )
+    starts_at = _demo_stage_future_time(index + 24, 11)
+    appointment = Appointment(
+        id=f"{DEMO_STAGE_PREFIX}{tenant_token}-appt-{index}",
+        tenant_id=referral.tenant_id,
+        patient_id=patient.id,
+        therapist_id=therapist_id,
+        referral_id=referral.id,
+        starts_at=starts_at,
+        ends_at=starts_at + timedelta(minutes=SESSION_LENGTH_MINUTES),
+        status="confirmed",
+        source=DEMO_STAGE_SEED_SOURCE,
+        google_calendar_id="demo_seed_local",
+        google_calendar_event_id=f"{DEMO_STAGE_PREFIX}{tenant_token}-event-{index}",
+        google_calendar_synced_at=utc_now(),
+    )
+    brief = TherapistPrepBrief(
+        id=f"{DEMO_STAGE_PREFIX}{tenant_token}-brief-{index}",
+        tenant_id=referral.tenant_id,
+        patient_id=patient.id,
+        referral_id=referral.id,
+        therapist_id=therapist_id,
+        title=f"Prep brief for {patient.display_name}",
+        body=(
+            f"{patient.display_name} is ready for a first session. Intake files, consent records, "
+            "screening scores, and appointment confirmation are complete."
+        ),
+        source_summary={
+            "source": DEMO_STAGE_SEED_SOURCE,
+            "completed_intake_count": len(document_by_key),
+            "questionnaire_count": 1,
+            "appointment_count": 1,
+        },
+        status="ready",
+    )
+    session.add_all([appointment, brief])
+
+
+def _create_demo_stage_patient_document(
+    session: Session,
+    referral: Referral,
+    patient: Patient,
+    spec: dict[str, Any],
+    index: int,
+    alias: str,
+    tenant_token: str,
+) -> Document:
+    label = str(spec.get("label") or alias.replace("_", " ").title())
+    file_name = f"{tenant_token}_{patient.display_name.replace(' ', '_')}_{alias}.txt"
+    storage_uri, size_bytes, checksum = _write_demo_stage_patient_file(file_name, patient.display_name or "Patient", label)
+    document = Document(
+        id=f"{DEMO_STAGE_PREFIX}{tenant_token}-doc-{index}-{alias}",
+        tenant_id=referral.tenant_id,
+        patient_id=patient.id,
+        document_type="intake_submission",
+        title=file_name,
+        storage_uri=storage_uri,
+        metadata_json={
+            "source": DEMO_STAGE_SEED_SOURCE,
+            "referral_id": referral.id,
+            "patient_id": patient.id,
+            "file_name": file_name,
+            "content_type": "text/plain",
+            "mime_type": "text/plain",
+            "size_bytes": size_bytes,
+            "sha256": checksum,
+            "item_key": _intake_template_item_key(spec),
+            "item_label": label,
+            "item_type": str(spec.get("type") or "form"),
+        },
+    )
+    session.add(document)
+    session.flush()
+    return document
+
+
+def _write_demo_stage_patient_file(file_name: str, patient_name: str, label: str) -> tuple[str, int, str]:
+    storage_dir = REPO_ROOT / "storage" / "uploads" / "intake" / "demo-stage"
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", file_name).strip("-") or "patient-file.txt"
+    path = storage_dir / safe_name
+    content = (
+        f"Demo returned patient file\n"
+        f"Patient: {patient_name}\n"
+        f"File: {label}\n"
+        f"Source: {DEMO_STAGE_SEED_SOURCE}\n"
+    ).encode("utf-8")
+    path.write_bytes(content)
+    return (
+        str(path.resolve().relative_to(REPO_ROOT.resolve())),
+        len(content),
+        hashlib.sha256(content).hexdigest(),
+    )
+
+
+def _demo_stage_item_alias(key: str) -> str:
+    aliases = {
+        "privacy_notice": "privacy",
+        "telehealth_consent": "telehealth",
+        "intake_form": "form",
+        "screening_questionnaire": "screen",
+    }
+    return aliases.get(key, re.sub(r"[^a-z0-9]+", "-", key.lower()).strip("-")[:12] or "file")
+
+
+def _demo_stage_future_time(days_from_now: int, hour: int) -> datetime:
+    base = utc_now() + timedelta(days=days_from_now)
+    return base.replace(hour=hour, minute=0, second=0, microsecond=0)
+
+
+def _gmail_inbox_document_ids(session: Session, tenant_id: str) -> list[str]:
+    return list(
+        session.scalars(
+            select(Document.id).where(
+                Document.tenant_id == tenant_id,
+                Document.storage_uri.like(f"{INBOUND_GMAIL_STORAGE_PREFIX}%"),
+            )
+        )
+    )
+
+
+def _delete_document_rows(session: Session, document_ids: list[str]) -> int:
+    ids = list(dict.fromkeys(document_ids))
+    if not ids:
+        return 0
+    session.execute(
+        update(ConsentRecord)
+        .where(ConsentRecord.source_document_id.in_(ids))
+        .values(source_document_id=None)
+    )
+    session.execute(
+        update(IntakeChecklistItem)
+        .where(IntakeChecklistItem.source_document_id.in_(ids))
+        .values(source_document_id=None)
+    )
+    session.execute(
+        update(SessionNote)
+        .where(SessionNote.source_document_id.in_(ids))
+        .values(source_document_id=None)
+    )
+    session.execute(
+        update(ClinicalLibraryRecord)
+        .where(ClinicalLibraryRecord.source_document_id.in_(ids))
+        .values(source_document_id=None)
+    )
+    session.execute(
+        update(ReferralImportBatch)
+        .where(ReferralImportBatch.source_document_id.in_(ids))
+        .values(source_document_id=None)
+    )
+    session.execute(delete(DocumentChunk).where(DocumentChunk.document_id.in_(ids)))
+    session.execute(delete(DocumentChunk).where(DocumentChunk.source_id.in_(ids)))
+    session.execute(delete(Document).where(Document.id.in_(ids)))
+    return len(ids)
+
+
+def _delete_documentation_session_rows(session: Session, session_ids: list[str]) -> int:
+    ids = list(dict.fromkeys(session_ids))
+    if not ids:
+        return 0
+    text_ids = list(
+        session.scalars(
+            select(DocumentationSessionText.id).where(DocumentationSessionText.documentation_session_id.in_(ids))
+        )
+    )
+    session.execute(delete(DocumentationSessionNote).where(DocumentationSessionNote.documentation_session_id.in_(ids)))
+    if text_ids:
+        session.execute(delete(DocumentationSessionNote).where(DocumentationSessionNote.source_text_id.in_(text_ids)))
+    session.execute(delete(DocumentationSessionText).where(DocumentationSessionText.documentation_session_id.in_(ids)))
+    session.execute(delete(DocumentationSession).where(DocumentationSession.id.in_(ids)))
+    return len(ids)
+
+
+def _task_references_appointment(task: HumanReviewTask, appointment_ids: set[str]) -> bool:
+    payload = task.source_payload if isinstance(task.source_payload, dict) else {}
+    candidates = {str(payload.get("appointment_id") or "").strip()}
+    candidates.update(_candidate_appointment_ids_for_task(task))
+    return bool(appointment_ids & {candidate for candidate in candidates if candidate})
+
+
+def _clear_clara_demo_local_calendar(session: Session, therapist: Therapist) -> dict[str, int]:
+    appointments = list(
+        session.scalars(
+            select(Appointment).where(
+                Appointment.therapist_id == therapist.id,
+            )
+        )
+    )
+    appointment_ids = {appointment.id for appointment in appointments}
+    if not appointment_ids:
+        return {"deleted_clara_appointments": 0, "superseded_appointment_tasks": 0}
+
+    superseded_tasks = 0
+    for task in session.scalars(
+        select(HumanReviewTask).where(
+            HumanReviewTask.tenant_id == therapist.tenant_id,
+            HumanReviewTask.status == "open",
+            HumanReviewTask.task_type.in_(["appointment_confirmation_approval", "appointment_reschedule_approval"]),
+        )
+    ):
+        if not _task_references_appointment(task, appointment_ids):
+            continue
+        before = review_task_to_dict(task)
+        task.status = "superseded"
+        task.rejection_reason = "Dr. Clara Demo's local calendar was reset for Gmail-route testing."
+        task.reviewed_at = utc_now()
+        task.updated_at = utc_now()
+        superseded_tasks += 1
+        write_audit(
+            session,
+            tenant_id=task.tenant_id,
+            actor_user_id=task.reviewer_id,
+            action="review_superseded",
+            entity_type="human_review_task",
+            entity_id=task.id,
+            before=before,
+            after=review_task_to_dict(task),
+        )
+
+    for draft in session.scalars(
+        select(CommunicationDraft).where(
+            CommunicationDraft.tenant_id == therapist.tenant_id,
+            CommunicationDraft.proposed_slots.is_not(None),
+        )
+    ):
+        proposed_slots = [slot for slot in draft.proposed_slots or [] if slot not in appointment_ids]
+        if proposed_slots != list(draft.proposed_slots or []):
+            draft.proposed_slots = proposed_slots
+            draft.updated_at = utc_now()
+
+    session.execute(
+        update(DocumentationSession)
+        .where(DocumentationSession.appointment_id.in_(list(appointment_ids)))
+        .values(appointment_id=None)
+    )
+    session.execute(
+        update(SessionNote)
+        .where(SessionNote.appointment_id.in_(list(appointment_ids)))
+        .values(appointment_id=None)
+    )
+    session.execute(delete(Appointment).where(Appointment.id.in_(list(appointment_ids))))
+    return {
+        "deleted_clara_appointments": len(appointment_ids),
+        "superseded_appointment_tasks": superseded_tasks,
+    }
+
+
+def _delete_demo_patient_and_referral_state(session: Session, *, tenant_id: str) -> dict[str, Any]:
     clean_patient = session.get(Patient, DEMO_CLEAN_PATIENT_ID)
-    if clean_patient is not None and _extract_email_address(clean_patient.contact_email or "") == DEMO_OUTBOUND_PATIENT_EMAIL:
-        clean_patient.contact_email = DEMO_CLEAN_PATIENT_EMAIL
-        clean_patient.updated_at = utc_now()
-    referrals = list(
+    if clean_patient is not None and clean_patient.tenant_id != tenant_id:
+        clean_patient = None
+    gmail_patients = list(
+        session.scalars(
+            select(Patient).where(
+                Patient.tenant_id == tenant_id,
+                func.lower(Patient.contact_email) == DEMO_OUTBOUND_PATIENT_EMAIL,
+            )
+        )
+    )
+    patient_ids = {
+        *(patient.id for patient in gmail_patients),
+        *([DEMO_CLEAN_PATIENT_ID] if clean_patient is not None else []),
+    }
+    clean_referrals = list(
+        session.scalars(
+            select(Referral).where(
+                Referral.tenant_id == tenant_id,
+                (Referral.id == DEMO_CLEAN_REFERRAL_ID)
+                | (Referral.patient_id == DEMO_CLEAN_PATIENT_ID)
+                | (func.lower(Referral.contact_email) == DEMO_CLEAN_PATIENT_EMAIL),
+            )
+        )
+    )
+    gmail_referrals = list(
         session.scalars(
             select(Referral).where(
                 Referral.tenant_id == tenant_id,
@@ -2247,77 +3107,105 @@ def reset_gmail_patient_demo(session: Session, tenant_id: str = DEMO_TENANT_ID) 
             )
         )
     )
-    referral_ids = [referral.id for referral in referrals]
-    workflow_ids = [
-        item
-        for item in session.scalars(select(WorkflowRun.id).where(WorkflowRun.referral_id.in_(referral_ids)))
-    ] if referral_ids else []
-    if referral_ids:
-        session.execute(delete(HumanReviewTask).where(HumanReviewTask.referral_id.in_(referral_ids)))
-        session.execute(delete(CommunicationDraft).where(CommunicationDraft.referral_id.in_(referral_ids)))
-        session.execute(delete(Appointment).where(Appointment.referral_id.in_(referral_ids)))
-        session.execute(delete(IntakeChecklistItem).where(IntakeChecklistItem.referral_id.in_(referral_ids)))
-        session.execute(delete(QuestionnaireResponse).where(QuestionnaireResponse.referral_id.in_(referral_ids)))
-        session.execute(delete(TherapistPrepBrief).where(TherapistPrepBrief.referral_id.in_(referral_ids)))
-        session.execute(delete(SessionNote).where(SessionNote.referral_id.in_(referral_ids)))
-        session.execute(delete(ReportDraft).where(ReportDraft.referral_id.in_(referral_ids)))
-        session.execute(delete(ScoreRecord).where(ScoreRecord.referral_id.in_(referral_ids)))
-        session.execute(delete(DraftFeedback).where(DraftFeedback.referral_id.in_(referral_ids)))
+    referral_ids = {
+        *(referral.id for referral in clean_referrals),
+        *(referral.id for referral in gmail_referrals),
+    }
+    patient_ids.update(referral.patient_id for referral in [*clean_referrals, *gmail_referrals] if referral.patient_id)
+
+    workflow_ids: list[str] = []
+    if referral_ids or patient_ids:
+        workflow_query = select(WorkflowRun.id)
+        filters = []
+        if referral_ids:
+            filters.append(WorkflowRun.referral_id.in_(list(referral_ids)))
+        if patient_ids:
+            filters.append(WorkflowRun.patient_id.in_(list(patient_ids)))
+        workflow_ids = [
+            item
+            for item in session.scalars(workflow_query.where(filters[0] if len(filters) == 1 else filters[0] | filters[1]))
+        ] if filters else []
+
+    document_ids = [
+        document.id
+        for document in session.scalars(select(Document).where(Document.tenant_id == tenant_id))
+        if (
+            document.patient_id in patient_ids
+            or str((document.metadata_json or {}).get("referral_id") or "") in referral_ids
+        )
+    ]
+    documentation_session_ids: list[str] = []
+    if referral_ids or patient_ids:
+        docs_query = select(DocumentationSession.id).where(DocumentationSession.tenant_id == tenant_id)
+        filters = []
+        if referral_ids:
+            filters.append(DocumentationSession.referral_id.in_(list(referral_ids)))
+        if patient_ids:
+            filters.append(DocumentationSession.patient_id.in_(list(patient_ids)))
+        documentation_session_ids = [
+            item
+            for item in session.scalars(docs_query.where(filters[0] if len(filters) == 1 else filters[0] | filters[1]))
+        ] if filters else []
+    report_draft_ids: list[str] = []
+    if referral_ids or patient_ids:
+        report_query = select(ReportDraft.id).where(ReportDraft.tenant_id == tenant_id)
+        filters = []
+        if referral_ids:
+            filters.append(ReportDraft.referral_id.in_(list(referral_ids)))
+        if patient_ids:
+            filters.append(ReportDraft.patient_id.in_(list(patient_ids)))
+        report_draft_ids = [
+            item
+            for item in session.scalars(report_query.where(filters[0] if len(filters) == 1 else filters[0] | filters[1]))
+        ] if filters else []
+
+    _delete_documentation_session_rows(session, documentation_session_ids)
     if workflow_ids:
         session.execute(delete(WorkflowEvent).where(WorkflowEvent.workflow_run_id.in_(workflow_ids)))
-        session.execute(delete(WorkflowRun).where(WorkflowRun.id.in_(workflow_ids)))
-
-    repaired_documents = 0
-    deleted_documents: list[str] = []
-    for document in list(session.scalars(select(Document).where(Document.tenant_id == tenant_id))):
-        metadata = dict(document.metadata_json or {})
-        document_referral_id = str(metadata.get("referral_id") or "")
-        sender_email = _extract_email_address(str(metadata.get("sender_email") or metadata.get("from") or ""))
-        is_demo_inbound = sender_email == DEMO_OUTBOUND_PATIENT_EMAIL and str(document.storage_uri or "").startswith(INBOUND_GMAIL_STORAGE_PREFIX)
-        if document_referral_id in referral_ids and document.document_type == "inbound_email_unmatched" and is_demo_inbound:
-            for key in ("referral_id", "workflow_job_id", "converted_to_referral", "converted_at"):
-                metadata.pop(key, None)
-            document.metadata_json = json_safe(metadata)
-            document.updated_at = utc_now()
-            repaired_documents += 1
-            continue
-        if document_referral_id in referral_ids:
-            deleted_documents.append(document.id)
-            session.execute(delete(DocumentChunk).where(DocumentChunk.document_id == document.id))
-            session.delete(document)
-            continue
-        if document.document_type == "inbound_email_unmatched" and is_demo_inbound and metadata.get("converted_to_referral"):
-            for key in ("referral_id", "workflow_job_id", "converted_to_referral", "converted_at"):
-                metadata.pop(key, None)
-            document.metadata_json = json_safe(metadata)
-            document.updated_at = utc_now()
-            repaired_documents += 1
+    if report_draft_ids:
+        session.execute(delete(DraftFeedback).where(DraftFeedback.report_draft_id.in_(report_draft_ids)))
 
     if referral_ids:
-        session.execute(delete(Referral).where(Referral.id.in_(referral_ids)))
-    session.flush()
-    write_audit(
-        session,
-        tenant_id=tenant_id,
-        action="demo_gmail_patient_reset",
-        entity_type="tenant",
-        entity_id=tenant_id,
-        after={
-            "patient_email": DEMO_OUTBOUND_PATIENT_EMAIL,
-            "removed_referral_ids": referral_ids,
-            "removed_document_ids": deleted_documents,
-            "repaired_inbound_documents": repaired_documents,
-        },
-    )
+        ids = list(referral_ids)
+        session.execute(delete(DraftFeedback).where(DraftFeedback.referral_id.in_(ids)))
+        session.execute(delete(HumanReviewTask).where(HumanReviewTask.referral_id.in_(ids)))
+        session.execute(delete(CommunicationDraft).where(CommunicationDraft.referral_id.in_(ids)))
+        session.execute(delete(Appointment).where(Appointment.referral_id.in_(ids)))
+        session.execute(delete(IntakeChecklistItem).where(IntakeChecklistItem.referral_id.in_(ids)))
+        session.execute(delete(ScoreRecord).where(ScoreRecord.referral_id.in_(ids)))
+        session.execute(delete(QuestionnaireResponse).where(QuestionnaireResponse.referral_id.in_(ids)))
+        session.execute(delete(TherapistPrepBrief).where(TherapistPrepBrief.referral_id.in_(ids)))
+        session.execute(delete(SessionNote).where(SessionNote.referral_id.in_(ids)))
+        session.execute(delete(ReportDraft).where(ReportDraft.referral_id.in_(ids)))
+    if patient_ids:
+        ids = list(patient_ids)
+        session.execute(delete(DocumentChunk).where(DocumentChunk.patient_id.in_(ids)))
+        session.execute(delete(DraftFeedback).where(DraftFeedback.patient_id.in_(ids)))
+        session.execute(delete(HumanReviewTask).where(HumanReviewTask.patient_id.in_(ids)))
+        session.execute(delete(CommunicationDraft).where(CommunicationDraft.patient_id.in_(ids)))
+        session.execute(delete(Appointment).where(Appointment.patient_id.in_(ids)))
+        session.execute(delete(IntakeChecklistItem).where(IntakeChecklistItem.patient_id.in_(ids)))
+        session.execute(delete(ScoreRecord).where(ScoreRecord.patient_id.in_(ids)))
+        session.execute(delete(QuestionnaireResponse).where(QuestionnaireResponse.patient_id.in_(ids)))
+        session.execute(delete(TherapistPrepBrief).where(TherapistPrepBrief.patient_id.in_(ids)))
+        session.execute(delete(SessionNote).where(SessionNote.patient_id.in_(ids)))
+        session.execute(delete(ReportDraft).where(ReportDraft.patient_id.in_(ids)))
+        session.execute(delete(ConsentRecord).where(ConsentRecord.patient_id.in_(ids)))
+    removed_documents = _delete_document_rows(session, document_ids)
+    if workflow_ids:
+        session.execute(delete(WorkflowRun).where(WorkflowRun.id.in_(workflow_ids)))
+    if referral_ids:
+        session.execute(delete(Referral).where(Referral.id.in_(list(referral_ids))))
+    if patient_ids:
+        session.execute(delete(Patient).where(Patient.id.in_(list(patient_ids))))
+
     return {
-        "patient_email": DEMO_OUTBOUND_PATIENT_EMAIL,
-        "removed_referral_ids": referral_ids,
-        "removed_document_ids": deleted_documents,
-        "repaired_inbound_documents": repaired_documents,
-        "google_workspace_enabled": google_workspace.is_enabled(),
-        "intake_template": intake_assets["intake_template"],
-        "intake_template_files": intake_assets["intake_template_files"],
-        "missing_intake_template_files": intake_assets["missing_intake_template_files"],
+        "deleted_clean_demo_patient": 1 if clean_patient is not None else 0,
+        "deleted_gmail_demo_referrals": len({referral.id for referral in gmail_referrals}),
+        "removed_referral_ids": list(referral_ids),
+        "removed_patient_ids": list(patient_ids),
+        "removed_document_ids": document_ids,
+        "deleted_demo_documents": removed_documents,
     }
 
 
@@ -2434,30 +3322,6 @@ def _missing_demo_intake_asset_entry(template: IntakeTemplate, spec: dict[str, A
         "required": True,
         "reason": f"Demo blank DOCX file is missing from {DEMO_GMAIL_INTAKE_PACKET_ASSET_DIR}.",
     }
-
-
-def _ensure_clara_demo_patient_appointment(session: Session, tenant_id: str) -> Appointment:
-    appointment = session.get(Appointment, DEMO_CLARA_PATIENT_APPOINTMENT_ID)
-    starts_at = utc_now() - timedelta(days=7)
-    ends_at = starts_at + timedelta(minutes=SESSION_LENGTH_MINUTES)
-    if appointment is None:
-        appointment = Appointment(id=DEMO_CLARA_PATIENT_APPOINTMENT_ID, tenant_id=tenant_id)
-        session.add(appointment)
-    appointment.tenant_id = tenant_id
-    appointment.patient_id = DEMO_CLEAN_PATIENT_ID
-    appointment.therapist_id = DEMO_CLEAN_THERAPIST_ID
-    appointment.referral_id = None
-    appointment.starts_at = starts_at
-    appointment.ends_at = ends_at
-    appointment.status = "confirmed"
-    appointment.source = "demo_clara_patient_assignment"
-    appointment.google_calendar_id = None
-    appointment.google_calendar_event_id = None
-    appointment.google_calendar_event_link = None
-    appointment.google_calendar_synced_at = None
-    appointment.last_provider_error = None
-    session.flush()
-    return appointment
 
 
 CLARA_DEMO_DOCUMENTATION_TRANSCRIPTS: tuple[tuple[str, str], ...] = (
@@ -2597,33 +3461,76 @@ CLARA_DEMO_DOCUMENTATION_TRANSCRIPTS: tuple[tuple[str, str], ...] = (
 
 
 def seed_clara_demo_documentation_transcripts(session: Session, tenant_id: str = DEMO_TENANT_ID) -> dict[str, Any]:
-    reset_clean_demo_referral(session, tenant_id=tenant_id)
+    seed_demo_data(session)
+    therapist = _ensure_clara_demo_therapist(session, tenant_id)
+    patient = session.scalar(
+        select(Patient)
+        .where(
+            Patient.tenant_id == tenant_id,
+            func.lower(Patient.contact_email) == DEMO_OUTBOUND_PATIENT_EMAIL,
+        )
+        .order_by(Patient.updated_at.desc())
+        .limit(1)
+    )
+    if patient is None:
+        raise ValueError("Create the Gmail demo patient before seeding Clara documentation transcripts.")
+    referral = session.scalar(
+        select(Referral)
+        .where(Referral.tenant_id == tenant_id, Referral.patient_id == patient.id)
+        .order_by(Referral.updated_at.desc())
+        .limit(1)
+    )
+    assignment = session.scalar(
+        select(Appointment)
+        .where(
+            Appointment.tenant_id == tenant_id,
+            Appointment.patient_id == patient.id,
+            Appointment.therapist_id == therapist.id,
+            Appointment.status != "cancelled",
+        )
+        .order_by(Appointment.starts_at.asc())
+        .limit(1)
+    )
+    if assignment is None:
+        assignment_start = utc_now() - timedelta(days=91)
+        assignment = Appointment(
+            id=f"demo-clara-gmail-doc-appt-{patient.id[:8]}",
+            tenant_id=tenant_id,
+            patient_id=patient.id,
+            therapist_id=therapist.id,
+            referral_id=referral.id if referral else None,
+            starts_at=assignment_start,
+            ends_at=assignment_start + timedelta(minutes=SESSION_LENGTH_MINUTES),
+            status="confirmed",
+            source="demo_clara_documentation_assignment",
+        )
+        session.add(assignment)
+        session.flush()
     session_ids = [
         item
         for item in session.scalars(
             select(DocumentationSession.id).where(
-                DocumentationSession.patient_id == DEMO_CLEAN_PATIENT_ID,
-                DocumentationSession.therapist_id == DEMO_CLEAN_THERAPIST_ID,
+                DocumentationSession.id.like(f"{DEMO_CLARA_DOCUMENTATION_SESSION_PREFIX}-%"),
+                DocumentationSession.therapist_id == therapist.id,
             )
         )
     ]
-    session.execute(delete(DocumentationSessionNote).where(DocumentationSessionNote.documentation_session_id.in_(session_ids)))
-    session.execute(delete(DocumentationSessionText).where(DocumentationSessionText.documentation_session_id.in_(session_ids)))
-    session.execute(delete(DocumentationSession).where(DocumentationSession.id.in_(session_ids)))
+    _delete_documentation_session_rows(session, session_ids)
     base_time = utc_now() - timedelta(days=84)
     created_sessions = []
+    patient_label = patient.display_name or patient.contact_email or patient.id
     for index, (title, transcript) in enumerate(CLARA_DEMO_DOCUMENTATION_TRANSCRIPTS, start=1):
         created_at = base_time + timedelta(days=(index - 1) * 7)
         doc_session = DocumentationSession(
             id=f"{DEMO_CLARA_DOCUMENTATION_SESSION_PREFIX}-{index:03d}",
             tenant_id=tenant_id,
-            patient_id=DEMO_CLEAN_PATIENT_ID,
-            therapist_id=DEMO_CLEAN_THERAPIST_ID,
-            referral_id=DEMO_CLEAN_REFERRAL_ID,
-            appointment_id=DEMO_CLARA_PATIENT_APPOINTMENT_ID,
+            patient_id=patient.id,
+            therapist_id=therapist.id,
+            referral_id=referral.id if referral else None,
+            appointment_id=assignment.id,
             title=title,
-            patient_label_snapshot="Clean Demo Patient",
-            therapist_label_snapshot="Dr. Clara Demo",
+            patient_label_snapshot=patient_label,
+            therapist_label_snapshot=therapist.name,
             status="active",
             created_at=created_at,
             updated_at=created_at,
@@ -2647,8 +3554,10 @@ def seed_clara_demo_documentation_transcripts(session: Session, tenant_id: str =
         created_sessions.append(doc_session)
     session.flush()
     return {
-        "patient_id": DEMO_CLEAN_PATIENT_ID,
-        "therapist_id": DEMO_CLEAN_THERAPIST_ID,
+        "patient_id": patient.id,
+        "therapist_id": therapist.id,
+        "appointment_id": assignment.id,
+        "referral_id": referral.id if referral else None,
         "session_count": len(created_sessions),
         "text_count": len(created_sessions),
         "sessions": [
@@ -2662,60 +3571,6 @@ def seed_clara_demo_documentation_transcripts(session: Session, tenant_id: str =
             for item in created_sessions
         ],
     }
-
-
-def _delete_clean_demo_referral_rows(session: Session) -> None:
-    workflow_ids = [
-        item
-        for item in session.scalars(select(WorkflowRun.id).where(WorkflowRun.referral_id == DEMO_CLEAN_REFERRAL_ID))
-    ]
-    document_ids = [
-        document.id
-        for document in session.scalars(
-            select(Document).where(
-                Document.patient_id == DEMO_CLEAN_PATIENT_ID,
-            )
-        )
-        if (document.metadata_json or {}).get("referral_id") == DEMO_CLEAN_REFERRAL_ID
-    ]
-    if workflow_ids:
-        session.execute(delete(WorkflowEvent).where(WorkflowEvent.workflow_run_id.in_(workflow_ids)))
-        session.execute(delete(WorkflowRun).where(WorkflowRun.id.in_(workflow_ids)))
-    if document_ids:
-        session.execute(delete(DocumentChunk).where(DocumentChunk.document_id.in_(document_ids)))
-    documentation_session_ids = [
-        item
-        for item in session.scalars(
-            select(DocumentationSession.id).where(DocumentationSession.referral_id == DEMO_CLEAN_REFERRAL_ID)
-        )
-    ]
-    if documentation_session_ids:
-        session.execute(
-            delete(DocumentationSessionNote).where(
-                DocumentationSessionNote.documentation_session_id.in_(documentation_session_ids)
-            )
-        )
-        session.execute(
-            delete(DocumentationSessionText).where(
-                DocumentationSessionText.documentation_session_id.in_(documentation_session_ids)
-            )
-        )
-        session.execute(delete(DocumentationSession).where(DocumentationSession.id.in_(documentation_session_ids)))
-    session.execute(delete(HumanReviewTask).where(HumanReviewTask.referral_id == DEMO_CLEAN_REFERRAL_ID))
-    session.execute(delete(CommunicationDraft).where(CommunicationDraft.referral_id == DEMO_CLEAN_REFERRAL_ID))
-    session.execute(delete(Appointment).where(Appointment.referral_id == DEMO_CLEAN_REFERRAL_ID))
-    session.execute(delete(IntakeChecklistItem).where(IntakeChecklistItem.referral_id == DEMO_CLEAN_REFERRAL_ID))
-    session.execute(delete(QuestionnaireResponse).where(QuestionnaireResponse.referral_id == DEMO_CLEAN_REFERRAL_ID))
-    session.execute(delete(TherapistPrepBrief).where(TherapistPrepBrief.referral_id == DEMO_CLEAN_REFERRAL_ID))
-    session.execute(delete(SessionNote).where(SessionNote.referral_id == DEMO_CLEAN_REFERRAL_ID))
-    session.execute(delete(ReportDraft).where(ReportDraft.referral_id == DEMO_CLEAN_REFERRAL_ID))
-    session.execute(delete(ScoreRecord).where(ScoreRecord.referral_id == DEMO_CLEAN_REFERRAL_ID))
-    session.execute(delete(DraftFeedback).where(DraftFeedback.referral_id == DEMO_CLEAN_REFERRAL_ID))
-    session.execute(delete(ConsentRecord).where(ConsentRecord.patient_id == DEMO_CLEAN_PATIENT_ID))
-    if document_ids:
-        session.execute(delete(Document).where(Document.id.in_(document_ids)))
-    session.execute(delete(Referral).where(Referral.id == DEMO_CLEAN_REFERRAL_ID))
-    session.flush()
 
 
 def create_review_task(
@@ -5755,6 +6610,233 @@ def _is_intake_packet_send_task(task: HumanReviewTask) -> bool:
     return task.task_type == "send_approval" and str(task.payload_key or "").startswith("intake_packet_draft")
 
 
+def _normalized_utc_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _intake_packet_draft_id_from_task(task: HumanReviewTask) -> str:
+    payload = task.source_payload if isinstance(task.source_payload, dict) else {}
+    return str(payload.get("id") or "").strip()
+
+
+def _is_intake_packet_draft(draft: CommunicationDraft, *, packet_task_draft_ids: set[str] | None = None) -> bool:
+    if packet_task_draft_ids and draft.id in packet_task_draft_ids:
+        return True
+    subject = str(draft.subject or "").strip().lower()
+    body = str(draft.body or "").strip().lower()
+    return (
+        "intake packet" in subject
+        or "attached blank files" in body
+        or "reply to this same email thread with the completed files attached" in body
+    )
+
+
+def _intake_packet_state(
+    session: Session,
+    referral: Referral,
+    *,
+    tasks: list[HumanReviewTask] | None = None,
+    drafts: list[CommunicationDraft] | None = None,
+) -> dict[str, Any]:
+    if tasks is None:
+        tasks = list(
+            session.scalars(
+                select(HumanReviewTask)
+                .where(HumanReviewTask.referral_id == referral.id)
+                .order_by(HumanReviewTask.created_at.desc())
+            )
+        )
+    if drafts is None:
+        drafts = list(
+            session.scalars(
+                select(CommunicationDraft)
+                .where(CommunicationDraft.referral_id == referral.id)
+                .order_by(CommunicationDraft.created_at.desc())
+            )
+        )
+
+    draft_by_id = {draft.id: draft for draft in drafts}
+    packet_tasks = [task for task in tasks if _is_intake_packet_send_task(task)]
+    packet_task_draft_ids = {
+        draft_id
+        for draft_id in (_intake_packet_draft_id_from_task(task) for task in packet_tasks)
+        if draft_id
+    }
+    packet_drafts = [
+        draft
+        for draft in drafts
+        if _is_intake_packet_draft(draft, packet_task_draft_ids=packet_task_draft_ids)
+    ]
+
+    def draft_for_task(task: HumanReviewTask) -> CommunicationDraft | None:
+        draft_id = _intake_packet_draft_id_from_task(task)
+        return draft_by_id.get(draft_id) if draft_id else None
+
+    latest_task = max(packet_tasks, key=lambda task: task.created_at, default=None)
+    latest_draft = max(packet_drafts, key=lambda draft: draft.created_at, default=None)
+    latest_draft_from_task = draft_for_task(latest_task) if latest_task else None
+
+    def task_has_sent_evidence(task: HumanReviewTask) -> bool:
+        payload = task.source_payload if isinstance(task.source_payload, dict) else {}
+        if task.status == "approved":
+            return True
+        return bool(payload.get("sent_attachment_records"))
+
+    def draft_has_sent_evidence(draft: CommunicationDraft) -> bool:
+        return bool(
+            draft.status in {"sent", "approved_pending_send"}
+            or draft.gmail_message_id
+            or draft.sent_at
+        )
+
+    sent_times = [
+        sent_at
+        for sent_at in (
+            *(
+                _normalized_utc_datetime(task.reviewed_at or task.updated_at or task.created_at)
+                for task in packet_tasks
+                if task_has_sent_evidence(task)
+            ),
+            *(
+                _normalized_utc_datetime(draft.sent_at or draft.updated_at or draft.created_at)
+                for draft in packet_drafts
+                if draft_has_sent_evidence(draft)
+            ),
+        )
+        if sent_at is not None
+    ]
+    packet_sent_at = max(sent_times, default=None)
+    latest_is_pending = bool(
+        (latest_task and latest_task.status in {"open", "changes_requested"})
+        or (latest_draft_from_task and latest_draft_from_task.status in {"draft_pending_review", "changes_requested"})
+        or (
+            latest_draft
+            and latest_draft.id not in packet_task_draft_ids
+            and latest_draft.status in {"draft_pending_review", "changes_requested"}
+        )
+    )
+    if latest_is_pending:
+        state = "draft_pending_review"
+    elif any(task_has_sent_evidence(task) for task in packet_tasks) or any(
+        draft_has_sent_evidence(draft) for draft in packet_drafts
+    ):
+        state = "sent"
+    else:
+        state = "not_drafted"
+
+    return {
+        "state": state,
+        "task_id": latest_task.id if latest_task else None,
+        "task_status": latest_task.status if latest_task else None,
+        "draft_id": (latest_draft_from_task or latest_draft).id if (latest_draft_from_task or latest_draft) else None,
+        "draft_status": (latest_draft_from_task or latest_draft).status if (latest_draft_from_task or latest_draft) else None,
+        "sent_at": iso_or_none(packet_sent_at),
+    }
+
+
+def _supersede_premature_intake_reminder_tasks(
+    session: Session,
+    referral: Referral,
+    *,
+    packet_state: dict[str, Any] | None = None,
+    tasks: list[HumanReviewTask] | None = None,
+    drafts: list[CommunicationDraft] | None = None,
+) -> int:
+    packet_state = packet_state or _intake_packet_state(session, referral, tasks=tasks, drafts=drafts)
+    if tasks is None:
+        tasks = list(
+            session.scalars(
+                select(HumanReviewTask)
+                .where(
+                    HumanReviewTask.referral_id == referral.id,
+                    HumanReviewTask.task_type == "intake_reminder_approval",
+                    HumanReviewTask.status == "open",
+                )
+                .order_by(HumanReviewTask.created_at.desc())
+            )
+        )
+    if drafts is None:
+        drafts = list(
+            session.scalars(
+                select(CommunicationDraft)
+                .where(CommunicationDraft.referral_id == referral.id)
+                .order_by(CommunicationDraft.created_at.desc())
+            )
+        )
+    draft_by_id = {draft.id: draft for draft in drafts}
+    open_reminder_tasks = [
+        task
+        for task in tasks
+        if task.task_type == "intake_reminder_approval" and task.status == "open"
+    ]
+    if packet_state.get("state") == "sent":
+        packet_sent_at = _normalized_utc_datetime(packet_state.get("sent_at"))
+        if packet_sent_at is None:
+            return 0
+        open_reminder_tasks = [
+            task
+            for task in open_reminder_tasks
+            if (
+                task_created_at := _normalized_utc_datetime(task.created_at)
+            ) is not None
+            and task_created_at < packet_sent_at
+        ]
+    if not open_reminder_tasks:
+        return 0
+
+    reason = "Intake reminders cannot be sent until the intake packet has been sent."
+    changed = 0
+    for task in open_reminder_tasks:
+        before = review_task_to_dict(task)
+        task.status = "superseded"
+        task.rejection_reason = reason
+        task.reviewed_at = utc_now()
+        task.updated_at = utc_now()
+        write_audit(
+            session,
+            tenant_id=task.tenant_id,
+            actor_user_id=task.reviewer_id,
+            action="review_superseded",
+            entity_type="human_review_task",
+            entity_id=task.id,
+            before=before,
+            after=review_task_to_dict(task),
+        )
+        changed += 1
+
+        payload = task.source_payload if isinstance(task.source_payload, dict) else {}
+        draft_id = str(payload.get("id") or "").strip()
+        draft = draft_by_id.get(draft_id) if draft_id else None
+        if draft and draft.status == "draft_pending_review":
+            draft_before = communication_draft_to_dict(draft)
+            draft.status = "superseded"
+            draft.last_provider_error = reason
+            draft.updated_at = utc_now()
+            write_audit(
+                session,
+                tenant_id=draft.tenant_id,
+                actor_user_id=task.reviewer_id,
+                action="draft_review_superseded",
+                entity_type="communication_draft",
+                entity_id=draft.id,
+                before=draft_before,
+                after=communication_draft_to_dict(draft),
+            )
+    session.flush()
+    return changed
+
+
 def _intake_packet_attachment_state_for_task(
     session: Session,
     task: HumanReviewTask,
@@ -7212,12 +8294,7 @@ def start_intake_for_referral(session: Session, referral_id: str, template_id: s
                     )
                 )
 
-    transition_referral_status(
-        session,
-        referral,
-        "intake_incomplete",
-        reason="Intake checklist started for first-session readiness.",
-    )
+    _refresh_referral_intake_status(session, referral.id)
     write_audit(
         session,
         tenant_id=referral.tenant_id,
@@ -7268,7 +8345,15 @@ def intake_workspace(session: Session, referral_id: str) -> dict[str, Any]:
             .order_by(CommunicationDraft.created_at.desc())
         )
     )
+    review_tasks = list(
+        session.scalars(
+            select(HumanReviewTask)
+            .where(HumanReviewTask.referral_id == referral.id)
+            .order_by(HumanReviewTask.created_at.desc())
+        )
+    )
     consents = []
+    patient_files: list[dict[str, Any]] = []
     if referral.patient_id:
         consents = list(
             session.scalars(
@@ -7277,39 +8362,111 @@ def intake_workspace(session: Session, referral_id: str) -> dict[str, Any]:
                 .order_by(ConsentRecord.scope)
             )
         )
-        documents = [
-            document
-            for document in session.scalars(
+        patient_documents = list(
+            session.scalars(
                 select(Document)
                 .where(Document.tenant_id == referral.tenant_id, Document.patient_id == referral.patient_id)
                 .order_by(Document.created_at.desc())
             )
-            if (document.metadata_json or {}).get("referral_id") == referral.id
-        ]
+        )
+        documents = [document for document in patient_documents if (document.metadata_json or {}).get("referral_id") == referral.id]
+        source_document_ids = {
+            source_id
+            for source_id in [
+                *(item.source_document_id for item in items if _intake_done(item.status)),
+                *(consent.source_document_id for consent in consents if _intake_done(consent.status)),
+            ]
+            if source_id
+        }
+        patient_files = _intake_patient_files(
+            [document for document in patient_documents if document.id in source_document_ids],
+            items,
+            consents,
+        )
+    packet_state = _intake_packet_state(session, referral, tasks=review_tasks, drafts=drafts)
+    if _supersede_premature_intake_reminder_tasks(
+        session,
+        referral,
+        packet_state=packet_state,
+        tasks=review_tasks,
+        drafts=drafts,
+    ):
+        packet_state = _intake_packet_state(session, referral, tasks=review_tasks, drafts=drafts)
+    status = _intake_status(items, consents)
     return {
         "referral": referral_summary(referral),
         "template": intake_template_to_dict(template, attachment_state=attachment_state) if template else None,
         "outbound_attachment_manifest": attachment_state["outbound_attachment_manifest"],
         "missing_template_files": attachment_state["missing_template_files"],
+        "intake_packet_state": packet_state["state"],
+        "intake_packet": packet_state,
+        "can_draft_intake_packet": packet_state["state"] == "not_drafted",
+        "can_draft_intake_reminder": packet_state["state"] == "sent" and status not in {"not_started", "complete"},
         "items": [intake_item_to_dict(item) for item in items],
         "consents": [consent_record_to_dict(consent) for consent in consents],
         "questionnaires": [questionnaire_response_to_dict(response) for response in responses],
         "documents": [document_to_dict(document) for document in documents],
+        "patient_files": patient_files,
         "communication_drafts": [_intake_communication_draft_to_dict(session, draft) for draft in drafts],
         "intake_submission_reviews": [
             review_task_to_dict(task)
-            for task in session.scalars(
-                select(HumanReviewTask)
-                .where(
-                    HumanReviewTask.referral_id == referral.id,
-                    HumanReviewTask.task_type == "intake_submission_review",
-                )
-                .order_by(HumanReviewTask.created_at.desc())
-            )
+            for task in review_tasks
+            if task.task_type == "intake_submission_review"
         ],
         "prep_briefs": [prep_brief_to_dict(brief) for brief in briefs],
-        "status": _intake_status(items, consents),
+        "status": status,
     }
+
+
+def _intake_patient_files(
+    documents: list[Document],
+    items: list[IntakeChecklistItem],
+    consents: list[ConsentRecord],
+) -> list[dict[str, Any]]:
+    item_labels_by_document: dict[str, list[str]] = {}
+    consent_labels_by_document: dict[str, list[str]] = {}
+    for item in items:
+        if not item.source_document_id or not _intake_done(item.status):
+            continue
+        item_labels_by_document.setdefault(item.source_document_id, []).append(item.label)
+    for consent in consents:
+        if not consent.source_document_id or not _intake_done(consent.status):
+            continue
+        consent_labels_by_document.setdefault(consent.source_document_id, []).append(consent.scope.replace("_", " "))
+
+    files: list[dict[str, Any]] = []
+    for document in documents:
+        if document.document_type == INTAKE_TEMPLATE_FILE_DOCUMENT_TYPE:
+            continue
+        if document.id not in item_labels_by_document and document.id not in consent_labels_by_document:
+            continue
+        path = _local_document_path(document.storage_uri)
+        if path is None or not path.exists() or not path.is_file():
+            continue
+        metadata = document.metadata_json or {}
+        file_name = str(metadata.get("file_name") or metadata.get("filename") or document.title)
+        item_labels = item_labels_by_document.get(document.id, [])
+        consent_labels = consent_labels_by_document.get(document.id, [])
+        files.append(
+            {
+                "id": document.id,
+                "document_id": document.id,
+                "download_id": document.id,
+                "download_url": f"/api/documents/{document.id}/download",
+                "title": document.title,
+                "display_name": file_name or document.title,
+                "file_name": file_name,
+                "document_type": document.document_type,
+                "intake_item_labels": item_labels,
+                "consent_labels": consent_labels,
+                "matched_labels": [*item_labels, *consent_labels],
+                "size_bytes": metadata.get("size_bytes"),
+                "mime_type": metadata.get("content_type") or metadata.get("mime_type") or "application/octet-stream",
+                "metadata": json_safe(metadata),
+                "uploaded_at": iso_or_none(document.created_at),
+            }
+        )
+    return files
 
 
 def generate_missing_intake_reminder(session: Session, referral_id: str) -> dict[str, Any]:
@@ -7318,6 +8475,8 @@ def generate_missing_intake_reminder(session: Session, referral_id: str) -> dict
         raise KeyError(f"Unknown referral: {referral_id}")
     patient = _ensure_patient_for_referral(session, referral)
     workspace = intake_workspace(session, referral_id)
+    if workspace.get("intake_packet_state") != "sent":
+        raise ValueError("Send the intake packet before drafting an intake reminder.")
     missing_items = [item for item in workspace["items"] if not _intake_done(item["status"])]
     missing_consents = [consent for consent in workspace["consents"] if not _intake_done(consent["status"])]
     if not missing_items and not missing_consents:
@@ -8633,6 +9792,7 @@ def _calendar_sync_issue_for_referral(session: Session, referral: Referral) -> b
             .where(
                 Appointment.referral_id == referral.id,
                 Appointment.status == "confirmed",
+                Appointment.source != DEMO_STAGE_SEED_SOURCE,
                 Appointment.google_calendar_event_id.is_(None),
             )
             .limit(1)
@@ -9054,6 +10214,7 @@ def appointment_to_dict(appointment: Appointment) -> dict[str, Any]:
     calendar_sync_issue = bool(
         google_workspace.is_enabled()
         and appointment.status == "confirmed"
+        and appointment.source != DEMO_STAGE_SEED_SOURCE
         and not appointment.google_calendar_event_id
     )
     return {
@@ -9468,10 +10629,11 @@ def _generate_slots(blocks: list[dict], max_candidates: int) -> list[tuple[datet
     }
     now = utc_now()
     slots = []
-    source_blocks = blocks or DEFAULT_AVAILABILITY_BLOCKS
+    if not blocks:
+        return slots
     for day_offset in range(1, 29):
         candidate_date = (now + timedelta(days=day_offset)).date()
-        for block in source_blocks:
+        for block in blocks:
             weekday = weekday_map.get(str(block.get("weekday") or "").strip().lower())
             if weekday is None or candidate_date.weekday() != weekday:
                 continue
@@ -9493,9 +10655,10 @@ def _patient_availability_constraints(raw_text: str) -> dict[str, Any] | None:
         return None
     weekdays = _extract_weekday_constraints(text)
     windows = _extract_time_windows(text)
-    if not weekdays and not windows:
+    all_day_weekdays = _extract_all_day_weekday_constraints(text)
+    if not weekdays and not windows and not all_day_weekdays:
         return None
-    return {"weekdays": sorted(weekdays), "windows": windows}
+    return {"weekdays": sorted(weekdays), "windows": windows, "all_day_weekdays": sorted(all_day_weekdays)}
 
 
 def _extract_weekday_constraints(text: str) -> set[int]:
@@ -9564,6 +10727,37 @@ def _extract_time_windows(text: str) -> list[tuple[int, int]]:
     return deduped
 
 
+def _extract_all_day_weekday_constraints(text: str) -> set[int]:
+    day_map = {
+        "monday": 0,
+        "mon": 0,
+        "tuesday": 1,
+        "tue": 1,
+        "wednesday": 2,
+        "wed": 2,
+        "thursday": 3,
+        "thu": 3,
+        "friday": 4,
+        "fri": 4,
+        "saturday": 5,
+        "sat": 5,
+        "sunday": 6,
+        "sun": 6,
+        "segunda": 0,
+        "terca": 1,
+        "quarta": 2,
+        "quinta": 3,
+        "sexta": 4,
+        "sabado": 5,
+        "domingo": 6,
+    }
+    days: set[int] = set()
+    for match in re.finditer(r"\ball\s+day\s+(?:on\s+)?([a-z,\s]+)", text):
+        segment = re.split(r"\b(?:for|from|at|before|after|appointment|session)\b", match.group(1), maxsplit=1)[0]
+        days.update(day_map[token] for token in re.findall(r"[a-z]+", segment) if token in day_map)
+    return days
+
+
 def _parse_clock_value(hour_text: str, minute_text: str | None, ampm: str | None) -> int | None:
     try:
         hour = int(hour_text)
@@ -9593,6 +10787,9 @@ def _slot_matches_patient_availability(
     weekdays = availability.get("weekdays") or []
     if weekdays and starts_at.weekday() not in weekdays:
         return False
+    all_day_weekdays = availability.get("all_day_weekdays") or []
+    if starts_at.weekday() in all_day_weekdays:
+        return True
     windows = availability.get("windows") or []
     if not windows:
         return True
@@ -9800,7 +10997,11 @@ def _therapist_calendar_capacity_summary(
     appointments = list(
         session.scalars(
             select(Appointment)
-            .where(Appointment.therapist_id == therapist.id, Appointment.status.in_(["proposed", "confirmed"]))
+            .where(
+                Appointment.tenant_id == therapist.tenant_id,
+                Appointment.therapist_id == therapist.id,
+                Appointment.status.in_(["proposed", "confirmed"]),
+            )
             .order_by(Appointment.starts_at.asc())
         )
     )
@@ -9822,7 +11023,12 @@ def _therapist_calendar_capacity_summary(
                     "message": appointment.last_provider_error,
                 }
             )
-        if appointment.google_calendar_event_id and appointment.id not in event_appointment_ids and google_enabled:
+        if (
+            appointment.google_calendar_event_id
+            and appointment.id not in event_appointment_ids
+            and google_enabled
+            and appointment.source != DEMO_STAGE_SEED_SOURCE
+        ):
             sync_issues.append(
                 {
                     "code": "calendar_event_not_seen",

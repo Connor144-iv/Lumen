@@ -129,21 +129,17 @@ const pageTitle = document.querySelector("#page-title");
 const sectionLabel = document.querySelector("#section-label");
 const recentWorkflowList = document.querySelector("#recent-workflow-list");
 const overviewReferralList = document.querySelector("#overview-referral-list");
-const overviewActionList = document.querySelector("#overview-action-list");
 const overviewReviewList = document.querySelector("#overview-review-list");
-const overviewHealthStrip = document.querySelector("#overview-health-strip");
 const referralJourneyBoard = document.querySelector("#referral-journey-board");
 const metricReferrals = document.querySelector("#metric-referrals");
 const metricReviews = document.querySelector("#metric-reviews");
 const metricTherapists = document.querySelector("#metric-therapists");
 const metricModels = document.querySelector("#metric-models");
 const metricWorkflows = document.querySelector("#metric-workflows");
-const metricActionQueue = document.querySelector("#metric-action-queue");
 const metricBlocked = document.querySelector("#metric-blocked");
 const metricReady = document.querySelector("#metric-ready");
 const metricReadyCount = document.querySelector("#metric-ready-count");
 const metricNewReferrals = document.querySelector("#metric-new-referrals");
-const metricLastSync = document.querySelector("#metric-last-sync");
 const metricTherapistActive = document.querySelector("#metric-therapist-active");
 const metricTherapistCapacity = document.querySelector("#metric-therapist-capacity");
 const metricTherapistFull = document.querySelector("#metric-therapist-full");
@@ -244,7 +240,7 @@ form.addEventListener("submit", async (event) => {
     if (!response.ok) {
       throw new Error(body.detail || "Unable to start workflow.");
     }
-    jobIdLabel.textContent = body.job_id;
+    if (jobIdLabel) jobIdLabel.textContent = body.job_id;
     setActiveJob(body.job_id);
     openEventStream(body.job_id, body.events_url);
     startPolling(body.status_url);
@@ -271,7 +267,7 @@ resetButton.addEventListener("click", () => {
 
 demoResetButton?.addEventListener("click", resetCleanDemoPath);
 
-exportButton.addEventListener("click", () => {
+exportButton?.addEventListener("click", () => {
   if (!currentResult) return;
   const blob = new Blob([JSON.stringify(currentResult, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
@@ -608,6 +604,7 @@ async function fetchStatus(statusUrl) {
 }
 
 function appendTimelineEvent(event) {
+  if (!timeline) return;
   if (event.type === "heartbeat") return;
   const item = document.createElement("li");
   item.className = "event";
@@ -638,6 +635,7 @@ function appendTimelineEvent(event) {
 }
 
 function appendHandoff(event) {
+  if (!handoffs) return;
   const detail = document.createElement("details");
   detail.className = "handoff";
   if (event.type === "error" || event.type === "human_review") detail.open = true;
@@ -654,9 +652,9 @@ function appendHandoff(event) {
 
 function renderFinalResult(job) {
   currentResult = job;
-  exportButton.disabled = false;
-  finalOutput.hidden = false;
-  resultJson.textContent = JSON.stringify(job.result || { error: job.error }, null, 2);
+  if (exportButton) exportButton.disabled = false;
+  if (finalOutput) finalOutput.hidden = false;
+  if (resultJson) resultJson.textContent = JSON.stringify(job.result || { error: job.error }, null, 2);
   renderNewReferralResult(job);
 }
 
@@ -755,27 +753,72 @@ function renderAgentRegistry(modelChecks) {
   const medium = modelByRole.get("medium") || modelByRole.get("medium model");
   const communication = modelByRole.get("communication") || modelByRole.get("communication model");
   const agents = [
-    { name: "Referral Intake Normalizer", model: small },
-    { name: "Completeness Extractor", model: small },
-    { name: "Risk Reviewer", model: small },
-    { name: "Therapist Matching Planner", model: medium || small },
-    { name: "Communication Drafter", model: communication || medium },
-    { name: "Intake Collector", model: small },
-    { name: "Prep Brief Generator", model: medium || communication },
+    {
+      name: "Referral Intake Normalizer",
+      model: small,
+      purpose: "Turns inbound referral text into structured patient, referrer, insurance, contact, preference, and source-channel fields.",
+    },
+    {
+      name: "Completeness Extractor",
+      model: small,
+      purpose: "Checks the structured referral for missing administrative fields and records what the admin still needs before routing can continue.",
+    },
+    {
+      name: "Risk Reviewer",
+      model: small,
+      purpose: "Looks for elevated clinical risk and suitability signals so risky referrals are routed to human clinical review before matching.",
+    },
+    {
+      name: "Therapist Matching Planner",
+      model: medium || small,
+      purpose: "Explains therapist fit using profile data, referral needs, preferences, availability, and deterministic matching constraints.",
+    },
+    {
+      name: "Communication Drafter",
+      model: communication || medium,
+      purpose: "Drafts patient-facing emails for missing information, first contact, slot offers, intake reminders, and follow-up messages.",
+    },
+    {
+      name: "Intake Collector",
+      model: small,
+      purpose: "Tracks returned intake files, completed consents, questionnaire answers, and incomplete packet items before the first session.",
+    },
+    {
+      name: "Prep Brief Generator",
+      model: medium || communication,
+      purpose: "Summarizes referral, intake, risk, appointment, and patient context into a therapist-ready first-session preparation brief.",
+    },
   ];
-  agentRegistryList.replaceChildren(
-    ...agents.map((agent) =>
-      recordItem({
-        title: agent.name,
-        status: agent.model?.status || "configured",
-        body: agent.model?.message || "Enabled for the local demo workflow.",
-        meta: [
-          agent.model?.model ? `model ${agent.model.model}` : "model configured by environment",
-          agent.model?.provider,
-        ],
-      }),
-    ),
+  agentRegistryList.replaceChildren(...agents.map(agentRegistryCard));
+}
+
+function agentRegistryCard(agent) {
+  const status = agent.model?.status || "configured";
+  const detail = document.createElement("details");
+  detail.className = "record-item agent-registry-card";
+  detail.dataset.status = status;
+
+  const summary = document.createElement("summary");
+  const summaryBody = document.createElement("div");
+  summaryBody.className = "agent-registry-summary";
+  const message = document.createElement("p");
+  message.textContent = agent.model?.message || "Enabled for the local demo workflow.";
+  summaryBody.append(
+    heading(agent.name),
+    message,
+    metaRow([
+      agent.model?.model ? `model ${agent.model.model}` : "model configured by environment",
+      agent.model?.provider,
+    ]),
   );
+  summary.append(summaryBody, pill(status));
+
+  const purpose = document.createElement("p");
+  purpose.className = "agent-registry-purpose";
+  purpose.textContent = agent.purpose;
+
+  detail.append(summary, purpose);
+  return detail;
 }
 
 async function refreshProductWorkspace() {
@@ -1855,7 +1898,6 @@ async function loadReferrals() {
 
   renderReferralLists();
   renderSchedulingList();
-  renderOverviewActionQueue();
   renderSelectedTherapist();
 }
 
@@ -1867,11 +1909,9 @@ async function loadReferralJourney() {
   const metrics = latestJourney.metrics || {};
   metricReferrals.textContent = metrics.active_referrals ?? latestReferrals.length;
   if (metricBlocked) metricBlocked.textContent = metrics.blocked_referrals ?? "-";
-  if (metricActionQueue) metricActionQueue.textContent = metrics.needs_action ?? "-";
   if (metricReady) metricReady.textContent = `${metrics.first_session_ready ?? 0} ready`;
   if (metricReadyCount) metricReadyCount.textContent = metrics.first_session_ready ?? "-";
   renderReferralJourneyBoard(latestJourney);
-  renderOverviewActionQueue();
   renderJourneyReferralFocus();
 }
 
@@ -1971,72 +2011,6 @@ function renderReferralLists() {
   renderCollection(overviewReferralList, latestReferrals.slice(0, 8), "No referrals yet.", (referral) =>
     referralCard(referral, true),
   );
-}
-
-function renderOverviewActionQueue() {
-  if (!overviewActionList) return;
-  const actionableNextActions = new Set([
-    "review_referral",
-    "review_missing_info",
-    "clinical_review",
-    "run_matching",
-    "approve_match",
-    "approve_slots",
-    "approve_contact",
-    "confirm_appointment",
-    "start_intake",
-    "complete_intake",
-    "generate_prep_brief",
-  ]);
-
-  const sourceReferrals = journeyReferralCards().length ? journeyReferralCards() : latestReferrals || [];
-  const actionableReferrals = sourceReferrals
-    .filter((referral) => actionableNextActions.has(referral.next_action))
-    .sort((a, b) => new Date(b.updated_at || 0).getTime() - new Date(a.updated_at || 0).getTime())
-    .slice(0, 6);
-  const reviewItems = (latestReviewTasks || []).slice(0, 6);
-  const combined = [
-    ...reviewItems.map((task) => ({ kind: "task", item: task })),
-    ...actionableReferrals.map((referral) => ({ kind: "referral", item: referral })),
-  ].slice(0, 10);
-
-  if (metricActionQueue) {
-    metricActionQueue.textContent = latestJourney?.metrics?.needs_action ?? combined.length;
-  }
-
-  renderCollection(overviewActionList, combined, "No items need attention right now.", (entry) => {
-    if (entry.kind === "task") return needsAttentionTaskCard(entry.item);
-    return needsAttentionReferralCard(entry.item);
-  });
-}
-
-function needsAttentionTaskCard(task) {
-  const item = recordItem({
-    title: friendlyTaskType(task.task_type),
-    status: task.status,
-    body: task.reason,
-    meta: [
-      "human gate",
-      task.referral_id ? `referral ${shortId(task.referral_id)}` : "no referral",
-      task.payload_key,
-    ],
-  });
-  if (task.referral_id) {
-    item.classList.add("clickable");
-    item.addEventListener("click", () => openReferralWorkbench(task.referral_id));
-  }
-  return item;
-}
-
-function needsAttentionReferralCard(referral) {
-  const item = referralCard(referral, true);
-  item.appendChild(
-    keyValue(
-      "Consequence",
-      referral.next_action_label || referral.next_action || "Admin action is needed before this referral can progress.",
-    ),
-  );
-  return item;
 }
 
 function countRecentReferrals(referrals) {
@@ -2143,18 +2117,12 @@ async function loadReferralDetail(referralId) {
     }),
   );
 
-  const taskSection = operationSection("Review tasks", disclosure);
-  taskSection.section.id = "referral-review-tasks";
-  const openReviewTasks = (referral.review_tasks || []).filter((task) => task.status === "open");
-  renderSimpleList(taskSection.body, openReviewTasks, "No open review tasks for this referral.", reviewTaskCard);
-
-  const outputSection = operationSection("Agent outputs", { collapsible: true, open: false });
-  renderAgentOutputs(outputSection.body, workbenchState.agent_outputs || []);
+  const advancedTraceSection = renderWorkbenchAdvancedTrace(referral, workbenchState, emailWorkflow);
 
   const matchSection = operationSection("Deterministic match", disclosure);
   renderMatchSummary(matchSection.body, referral.match_summary);
 
-  const appointmentSection = operationSection("Appointment proposals", disclosure);
+  const appointmentSection = operationSection("Appointments", disclosure);
   appointmentSection.section.id = "referral-appointments";
   const intakeSection = operationSection("Intake status", disclosure);
   intakeSection.section.id = "referral-intake";
@@ -2185,7 +2153,6 @@ async function loadReferralDetail(referralId) {
     technicalSummary.textContent = "Technical details";
     technical.append(
       technicalSummary,
-      outputSection.section,
       matchSection.section,
       documentSection.section,
       communicationSection.section,
@@ -2199,6 +2166,7 @@ async function loadReferralDetail(referralId) {
       appointmentSection.section,
       intakeSection.section,
       briefSection.section,
+      advancedTraceSection,
       technical,
     );
   } else {
@@ -2210,8 +2178,7 @@ async function loadReferralDetail(referralId) {
       missingSection.section,
       missingReplySection.section,
       riskSection.section,
-      taskSection.section,
-      outputSection.section,
+      advancedTraceSection,
       matchSection.section,
       appointmentSection.section,
       documentSection.section,
@@ -2232,7 +2199,7 @@ function resumeEmailWorkflowMonitor(emailWorkflow) {
   if (!jobId) return;
   const eventsUrl = `/api/events/${jobId}`;
   const statusUrl = `/api/status/${jobId}`;
-  jobIdLabel.textContent = jobId;
+  if (jobIdLabel) jobIdLabel.textContent = jobId;
   setActiveJob(jobId);
   setStatus(workflow.status, `${statusLabel(workflow.status)} - ${shortId(jobId)}`);
   openEventStream(jobId, eventsUrl);
@@ -2483,11 +2450,6 @@ function renderEmailWorkflowPanel(referral, workflow) {
     body.appendChild(draft);
   }
 
-  const taskWrap = document.createElement("div");
-  taskWrap.id = "email-workflow-review-tasks";
-  renderSimpleList(taskWrap, workflow.review_tasks || [], "No email workflow review tasks are open.", reviewTaskCard);
-  body.appendChild(taskWrap);
-
   section.append(title, body);
   return section;
 }
@@ -2624,11 +2586,13 @@ function workbenchPrimaryButton(referral, state) {
   const primaryAction = state.primary_action || referral.next_action;
   const allowedActions = state.allowed_actions || [];
   const actionId = primaryAction === "revise_agent_output" ? allowedActions[0] : primaryAction;
-  if (!actionId || ["ready", "closed", "wait_patient_reply", "wait_extraction"].includes(actionId)) return null;
+  if (!actionId || ["closed", "wait_patient_reply", "wait_extraction"].includes(actionId)) return null;
+  if (actionId === "ready" && referral.status !== "first_session_ready") return null;
   const action = workbenchActionDefinitions(referral)[actionId];
   if (!action) return null;
   const button = actionButton(state.primary_action_label || action.label, action.handler);
   button.classList.remove("secondary", "compact");
+  if (actionId === "ready") button.classList.add("success");
   return button;
 }
 
@@ -2637,6 +2601,10 @@ function secondaryWorkbenchActions(referral, state) {
   const primaryAction = state.primary_action === "revise_agent_output" ? (state.allowed_actions || [])[0] : state.primary_action;
   const allowed = new Set(state.email_workflow ? [...(state.allowed_actions || [])] : [...(state.allowed_actions || []), ...defaultWorkbenchActionIds()]);
   allowed.delete(primaryAction);
+  const progress = state.progress || {};
+  if (progress.intake_complete || progress.prep_brief_ready || progress.first_session_ready || ["intake_complete", "prep_brief_ready", "first_session_ready"].includes(referral.status)) {
+    allowed.delete("start_intake");
+  }
   return [...allowed]
     .map((actionId) => definitions[actionId])
     .filter(Boolean)
@@ -2699,12 +2667,21 @@ function workbenchActionDefinitions(referral) {
     draft_intake_packet: { label: "Draft intake packet", handler: () => draftIntakePacket(referral.id) },
     draft_intake_reminder: { label: "Draft reminder", handler: () => draftIntakeReminder(referral.id) },
     generate_prep_brief: { label: "Prep brief", handler: () => generateReferralPrepBrief(referral.id) },
+    ready: { label: "Referral complete", handler: async () => {
+      navigate("/overview");
+      await refreshProductWorkspace();
+    } },
   };
 }
 
 function scrollToDetailSection(id) {
   const element = document.getElementById(id);
   if (!element) return;
+  let parent = element.parentElement;
+  while (parent) {
+    if (parent.tagName === "DETAILS") parent.open = true;
+    parent = parent.parentElement;
+  }
   element.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
@@ -2725,6 +2702,105 @@ function renderAgentOutputs(container, outputs) {
     }
     return item;
   });
+}
+
+function renderWorkbenchAdvancedTrace(referral, workbenchState, emailWorkflow) {
+  const traceSection = operationSection("Advanced trace", { collapsible: true, open: false });
+  traceSection.section.classList.add("advanced-trace", "workbench-advanced-trace");
+  traceSection.body.classList.add("monitor-stack");
+
+  const workflowSection = operationSection("Workflow runs");
+  const workflowRuns = workbenchState.advanced_trace?.workflow_runs || [];
+  renderWorkflowTraceRuns(workflowSection.body, workflowRuns);
+
+  const outputSection = operationSection("Agent outputs");
+  renderAgentOutputs(outputSection.body, workbenchState.agent_outputs || []);
+
+  const reviewSection = operationSection("Review gates");
+  reviewSection.body.id = emailWorkflow ? "email-workflow-review-tasks" : "referral-review-tasks";
+  const reviewableTasks = (referral.review_tasks || []).filter((task) => ["open", "changes_requested"].includes(task.status));
+  renderSimpleList(reviewSection.body, reviewableTasks, "No open review gates for this referral.", reviewTaskCard);
+
+  traceSection.body.append(workflowSection.section, outputSection.section, reviewSection.section);
+  return traceSection.section;
+}
+
+function renderWorkflowTraceRuns(container, workflowRuns) {
+  renderSimpleList(container, workflowRuns, "No workflow runs recorded for this referral yet.", workflowTraceRunCard);
+}
+
+function workflowTraceRunCard(run) {
+  const events = run.events || [];
+  const item = recordItem({
+    title: friendlyWorkflowType(run.workflow_type),
+    status: run.status,
+    body: run.input_summary || run.job_id || "Workflow run",
+    meta: [
+      run.job_id ? `job ${shortId(run.job_id)}` : null,
+      run.created_at ? `started ${formatDate(run.created_at)}` : null,
+      run.updated_at ? `updated ${formatDate(run.updated_at)}` : null,
+      `${events.length} event${events.length === 1 ? "" : "s"}`,
+    ],
+  });
+
+  if (events.length) {
+    const eventList = document.createElement("ol");
+    eventList.className = "timeline workflow-event-list";
+    events.forEach((event) => eventList.appendChild(workflowTraceEventItem(event)));
+    item.appendChild(eventList);
+  }
+
+  const payload = {};
+  if (run.request_payload && Object.keys(run.request_payload).length) payload.request_payload = run.request_payload;
+  if (run.approvals && Object.keys(run.approvals).length) payload.approvals = run.approvals;
+  if (run.result) payload.result = run.result;
+  if (run.error) payload.error = run.error;
+  if (Object.keys(payload).length) {
+    item.appendChild(payloadDetails("Payload, approvals, and result", payload));
+  }
+  return item;
+}
+
+function workflowTraceEventItem(event) {
+  const item = document.createElement("li");
+  item.className = "event";
+  item.dataset.status = event.status || "running";
+
+  const title = document.createElement("div");
+  title.className = "event-title";
+  const node = document.createElement("span");
+  node.textContent = event.agent || event.node || event.type || "Workflow event";
+  const type = document.createElement("span");
+  type.className = "pill";
+  type.textContent = event.type || "event";
+  title.append(node, type);
+
+  const message = document.createElement("p");
+  message.className = "event-message";
+  message.textContent = event.message || "Step updated.";
+
+  const meta = document.createElement("div");
+  meta.className = "meta-row";
+  if (event.node) meta.appendChild(pill(event.node));
+  if (event.status) meta.appendChild(pill(event.status));
+  if (event.created_at) meta.appendChild(pill(formatDate(event.created_at)));
+  if (typeof event.confidence === "number") meta.appendChild(pill(`confidence ${Math.round(event.confidence * 100)}%`));
+  (event.tools || []).forEach((tool) => meta.appendChild(pill(tool)));
+
+  item.append(title, message, meta);
+  if (event.payload) item.appendChild(payloadDetails("Event payload", event.payload));
+  return item;
+}
+
+function payloadDetails(label, payload) {
+  const detail = document.createElement("details");
+  detail.className = "handoff";
+  const summary = document.createElement("summary");
+  summary.textContent = label;
+  const pre = document.createElement("pre");
+  pre.textContent = JSON.stringify(payload, null, 2);
+  detail.append(summary, pre);
+  return detail;
 }
 
 function renderActivityTimeline(container, activity) {
@@ -2817,7 +2893,7 @@ async function retryReferralExtraction(referralId) {
     return;
   }
   resetRunState();
-  jobIdLabel.textContent = body.job_id;
+  if (jobIdLabel) jobIdLabel.textContent = body.job_id;
   setActiveJob(body.job_id);
   setStatus(body.status, `${statusLabel(body.status)} - ${shortId(body.job_id)}`);
   openEventStream(body.job_id, body.events_url);
@@ -2835,7 +2911,7 @@ async function continueEmailWorkflow(referralId) {
   const result = body.result || {};
   if (result.job_id && result.events_url && result.status_url) {
     resetRunState();
-    jobIdLabel.textContent = result.job_id;
+    if (jobIdLabel) jobIdLabel.textContent = result.job_id;
     setActiveJob(result.job_id);
     setStatus(result.status || body.status, `${statusLabel(result.status || body.status)} - ${shortId(result.job_id)}`);
     openEventStream(result.job_id, result.events_url);
@@ -3156,8 +3232,6 @@ async function loadReviewTasks() {
       }),
     );
   }
-
-  renderOverviewActionQueue();
 }
 
 async function loadEscalations() {
@@ -3194,16 +3268,12 @@ async function resetCleanDemoPath() {
   const response = await fetch("/api/demo/clean-referral/reset", { method: "POST" });
   const body = await readResponseBody(response);
   if (!response.ok) {
-    window.alert(body.detail || "Could not reset the clean demo path.");
+    window.alert(body.detail || "Could not reset the Gmail demo.");
     return;
   }
-  const referralId = body.referral?.id;
-  setStatus("completed", "Clean demo referral reset.");
+  setStatus("completed", "Gmail demo reset. Admin inbox and Clara's local appointments were cleared.");
   await refreshProductWorkspace();
-  if (referralId) {
-    navigate("/workbench");
-    await loadReferralDetail(referralId);
-  }
+  await loadGmailInbox();
 }
 
 async function loadIntakeTracker() {
@@ -3280,7 +3350,7 @@ function reviewTaskCard(task) {
   }
   if (task.status !== "open") {
     if (task.status === "changes_requested" && task.referral_id === selectedReferralId) {
-      actions.appendChild(actionButton("Open revise path", () => scrollToDetailSection("referral-review-tasks")));
+      actions.appendChild(actionButton("Open revise path", () => scrollToDetailSection(document.getElementById("email-workflow-review-tasks") ? "email-workflow-review-tasks" : "referral-review-tasks")));
     }
     item.appendChild(actions);
     return item;
@@ -3359,7 +3429,7 @@ async function submitReviewAction(taskId, action, extra = {}) {
   }
   if (body.resumed_job) {
     resetRunState();
-    jobIdLabel.textContent = body.resumed_job.job_id;
+    if (jobIdLabel) jobIdLabel.textContent = body.resumed_job.job_id;
     setActiveJob(body.resumed_job.job_id);
     setStatus(body.resumed_job.status, `${statusLabel(body.resumed_job.status)} - ${shortId(body.resumed_job.job_id)}`);
     openEventStream(body.resumed_job.job_id, `/api/events/${body.resumed_job.job_id}`);
@@ -4099,15 +4169,6 @@ async function loadIntegrationHealth() {
   renderCollection(integrationHealthList, checks, "No integration checks yet.", integrationHealthCard);
   await loadGoogleWorkspaceStatus();
   await loadGmailInbox();
-  if (overviewHealthStrip) {
-    overviewHealthStrip.replaceChildren(...checks.map(integrationHealthCard));
-  }
-  if (metricLastSync) {
-    metricLastSync.textContent = new Intl.DateTimeFormat(undefined, {
-      hour: "2-digit",
-      minute: "2-digit",
-    }).format(new Date());
-  }
 }
 
 function integrationHealthCard(check) {
@@ -4210,7 +4271,7 @@ async function convertGmailInboxMessage(documentId) {
   if (body.referral?.id) {
     if (body.job_id && body.events_url && body.status_url) {
       resetRunState();
-      jobIdLabel.textContent = body.job_id;
+      if (jobIdLabel) jobIdLabel.textContent = body.job_id;
       setActiveJob(body.job_id);
       setStatus(body.status || "queued", `${statusLabel(body.status || "queued")} - ${shortId(body.job_id)}`);
       openEventStream(body.job_id, body.events_url);
@@ -4617,13 +4678,14 @@ function renderMatchSummary(container, matchSummary) {
 
 function renderAppointments(container, appointments) {
   container.replaceChildren();
-  if (!appointments.length) {
-    container.appendChild(emptyState("No appointment proposals yet."));
+  const confirmedAppointments = (appointments || []).filter((appointment) => appointment.status === "confirmed");
+  if (!confirmedAppointments.length) {
+    container.appendChild(emptyState("No confirmed appointments yet."));
     return;
   }
-  appointments.forEach((appointment) => {
+  confirmedAppointments.forEach((appointment) => {
     const item = recordItem({
-      title: appointment.starts_at ? new Date(appointment.starts_at).toLocaleString() : "Unscheduled proposal",
+      title: appointment.starts_at ? new Date(appointment.starts_at).toLocaleString() : "Confirmed appointment",
       status: appointment.status,
       body: appointment.therapist_id ? `Therapist ${shortId(appointment.therapist_id)}` : "No therapist assigned",
       meta: [
@@ -4657,21 +4719,29 @@ function renderIntakeWorkspace(container, data, includeActions) {
   header.className = "detail-stack";
   header.append(
     heading(data.template?.name || "Intake checklist"),
-    metaRow([data.status, `${data.items?.length || 0} items`, `${data.consents?.length || 0} consents`]),
+    metaRow([
+      data.status,
+      data.intake_packet_state ? `packet ${data.intake_packet_state.replaceAll("_", " ")}` : null,
+      `${data.items?.length || 0} items`,
+      `${data.consents?.length || 0} consents`,
+    ]),
   );
   if (includeActions && data.referral?.id) {
     const actions = document.createElement("div");
     actions.className = "actions tight";
-    actions.append(
-      actionButton("Save screening", () => saveScreeningQuestionnaire(data.referral.id)),
-      actionButton("Draft reminder", () => draftIntakeReminder(data.referral.id)),
-      actionButton("Generate prep brief", () => generateReferralPrepBrief(data.referral.id)),
-    );
+    actions.appendChild(actionButton("Save screening", () => saveScreeningQuestionnaire(data.referral.id)));
+    if (data.can_draft_intake_packet) {
+      actions.appendChild(actionButton("Draft intake packet", () => draftIntakePacket(data.referral.id)));
+    }
+    if (data.can_draft_intake_reminder) {
+      actions.appendChild(actionButton("Draft reminder", () => draftIntakeReminder(data.referral.id)));
+    }
+    actions.appendChild(actionButton("Generate prep brief", () => generateReferralPrepBrief(data.referral.id)));
     header.appendChild(actions);
   }
   container.appendChild(header);
 
-  renderIntakeTemplateFiles(container, data, includeActions);
+  renderPatientFiles(container, data);
 
   (data.items || []).forEach((item) => {
     const row = recordItem({
@@ -4752,35 +4822,29 @@ function renderIntakeWorkspace(container, data, includeActions) {
   });
 }
 
-function renderIntakeTemplateFiles(container, data, includeActions) {
-  const template = data.template;
-  if (!template) return;
-  const specs = template.required_items || [];
-  if (!specs.length) return;
+function renderPatientFiles(container, data) {
   const section = document.createElement("div");
-  section.className = "detail-stack intake-template-files";
-  section.appendChild(heading("Template files"));
-  specs.forEach((spec) => {
-    const file = spec.template_file;
-    const key = spec.key || spec.label;
+  section.className = "detail-stack patient-files";
+  section.appendChild(heading("Patient files"));
+  renderSimpleList(section, data.patient_files || [], "No returned patient files yet.", (file) => {
     const row = recordItem({
-      title: spec.label || key || "Template file",
-      status: file ? "configured" : "missing",
-      body: file ? file.file_name : "Upload the active blank file for this intake item.",
+      title: file.display_name || file.file_name || file.title || "Patient file",
+      status: "completed",
+      body: (file.matched_labels || []).join(", ") || file.document_type?.replaceAll("_", " ") || "Returned patient file",
       meta: [
-        spec.type || "form",
-        file?.size_bytes ? `${file.size_bytes} bytes` : null,
-        file?.uploaded_at ? `uploaded ${formatDate(file.uploaded_at)}` : null,
+        file.document_type?.replaceAll("_", " "),
+        file.size_bytes ? `${file.size_bytes} bytes` : null,
+        file.uploaded_at ? `uploaded ${formatDate(file.uploaded_at)}` : null,
       ],
     });
-    if (includeActions && key) {
+    const documentId = file.document_id || file.id;
+    if (documentId) {
       const actions = document.createElement("div");
       actions.className = "actions tight";
-      actions.appendChild(actionButton(file ? "Replace file" : "Upload file", () => uploadIntakeTemplateFile(template.id, key)));
-      if (file?.document_id) actions.appendChild(actionButton("Download", () => openDocumentDownload(file.document_id)));
+      actions.appendChild(actionButton("Download", () => openDocumentDownload(documentId)));
       row.appendChild(actions);
     }
-    section.appendChild(row);
+    return row;
   });
   container.appendChild(section);
 }
@@ -5039,12 +5103,12 @@ function resetRunState() {
   clearInterval(pollTimer);
   pollTimer = null;
   currentResult = null;
-  timeline.replaceChildren();
-  handoffs.replaceChildren();
-  finalOutput.hidden = true;
-  resultJson.textContent = "";
-  exportButton.disabled = true;
-  jobIdLabel.textContent = "No job";
+  if (timeline) timeline.replaceChildren();
+  if (handoffs) handoffs.replaceChildren();
+  if (finalOutput) finalOutput.hidden = true;
+  if (resultJson) resultJson.textContent = "";
+  if (exportButton) exportButton.disabled = true;
+  if (jobIdLabel) jobIdLabel.textContent = "No job";
   setActiveJob(null);
   if (newReferralResultList) {
     newReferralResultList.replaceChildren(emptyState("Run a referral workflow to see captured status, missing items, risk, and the Workbench link."));

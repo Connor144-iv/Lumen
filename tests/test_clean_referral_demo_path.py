@@ -43,7 +43,7 @@ def _task(session, referral_id: str, task_type: str, payload_prefix: str | None 
     return task
 
 
-def test_clean_referral_demo_path_reaches_first_session_ready(monkeypatch) -> None:
+def test_referral_demo_path_reaches_first_session_ready(monkeypatch) -> None:
     Base.metadata.create_all(bind=engine)
     monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "true")
     send_calls = []
@@ -67,12 +67,12 @@ def test_clean_referral_demo_path_reaches_first_session_ready(monkeypatch) -> No
 
     session = SessionLocal()
     try:
-        tenant = Tenant(id=_id("tenant"), name="Clean Demo Tenant", slug=_id("clean-demo"))
+        tenant = Tenant(id=_id("tenant"), name="Gmail Route Demo Tenant", slug=_id("gmail-route-demo"))
         session.add(tenant)
         session.flush()
         therapist = Therapist(
             tenant_id=tenant.id,
-            name="Clean Demo Therapist",
+            name="Gmail Route Demo Therapist",
             email="therapist@example.com",
             specialties=["anxiety", "work stress"],
             age_groups=["adult"],
@@ -89,7 +89,7 @@ def test_clean_referral_demo_path_reaches_first_session_ready(monkeypatch) -> No
             source_channel="webform",
             raw_text="Adult referral for anxiety and work stress. Portuguese online therapy. Insurer Multicare.",
             status="needs_admin_review",
-            patient_name="Clean Demo Patient",
+            patient_name="Gmail Route Demo Patient",
             contact_email="patient@example.com",
             insurer="Multicare",
             language_preference="Portuguese",
@@ -98,7 +98,7 @@ def test_clean_referral_demo_path_reaches_first_session_ready(monkeypatch) -> No
         )
         template = IntakeTemplate(
             tenant_id=tenant.id,
-            name="Clean demo intake",
+            name="Gmail route demo intake",
             required_items=[
                 {"key": "privacy_notice", "label": "Privacy notice", "type": "consent", "consent_scope": "privacy_notice"},
                 {"key": "intake_form", "label": "Clinical intake form", "type": "form"},
@@ -164,7 +164,7 @@ def test_clean_referral_demo_path_reaches_first_session_ready(monkeypatch) -> No
         )
         intake = intake_workspace(session, referral.id)
         for item in intake["items"]:
-            complete_intake_item(session, item["id"], notes="Completed in clean demo smoke path.")
+            complete_intake_item(session, item["id"], notes="Completed in Gmail-route demo smoke path.")
         for consent in intake["consents"]:
             complete_consent_record(session, consent["id"])
         assert referral.status == "first_session_ready"

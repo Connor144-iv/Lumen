@@ -83,3 +83,52 @@ def test_workbench_does_not_render_patient_reply_simulation_controls() -> None:
 
     assert "Simulate accepted reply" not in app_js
     assert "Simulate declined" not in app_js
+
+
+def test_intake_workspace_uses_packet_state_to_gate_email_actions() -> None:
+    app_js = APP_JS.read_text()
+
+    assert "data.intake_packet_state ? `packet ${data.intake_packet_state.replaceAll" in app_js
+    assert "if (data.can_draft_intake_packet)" in app_js
+    assert "Draft intake packet" in app_js
+    assert "if (data.can_draft_intake_reminder)" in app_js
+    assert 'actionButton("Draft reminder"' in app_js
+    assert 'actions.append(\n      actionButton("Save screening"' not in app_js
+
+
+def test_workbench_renders_completion_patient_files_and_confirmed_appointments() -> None:
+    app_js = APP_JS.read_text()
+    styles = (ROOT / "frontend" / "styles.css").read_text()
+
+    assert "Referral complete" in app_js
+    assert 'button.classList.add("success")' in app_js
+    assert "button.success" in styles
+    assert 'operationSection("Appointments"' in app_js
+    assert 'appointment.status === "confirmed"' in app_js
+    assert "No confirmed appointments yet." in app_js
+    assert "Patient files" in app_js
+    assert "data.patient_files || []" in app_js
+    assert "Template files" not in app_js
+
+
+def test_overview_system_and_workbench_trace_static_contracts() -> None:
+    index_html = INDEX_HTML.read_text()
+    app_js = APP_JS.read_text()
+
+    assert "overview-action-list" not in index_html
+    assert "action-queue-title" not in index_html
+    assert "overview-health-strip" not in index_html
+    assert "overview-health-title" not in index_html
+    assert '<details class="advanced-trace">' not in index_html
+    assert 'href="/workbench" data-nav>Open Workbench</a>' in index_html
+    assert "Select a referral in Workbench to inspect persisted agent activity" in index_html
+
+    assert 'operationSection("Advanced trace"' in app_js
+    assert "renderWorkbenchAdvancedTrace" in app_js
+    assert "workbenchState.advanced_trace?.workflow_runs" in app_js
+    assert "renderSimpleList(reviewSection.body, reviewableTasks" in app_js
+    assert "reviewTaskCard" in app_js
+    assert "agent-registry-card" in app_js
+    assert "Turns inbound referral text into structured patient" in app_js
+    assert "Summarizes referral, intake, risk, appointment, and patient context" in app_js
+    assert "/api/review-tasks/${taskId}/actions" in app_js

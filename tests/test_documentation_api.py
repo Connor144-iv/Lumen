@@ -27,13 +27,11 @@ from app import (
 from backend.lumen_web.documentation import validate_session_note_json
 from backend.lumen_web.db import Base, SessionLocal, engine
 from backend.lumen_web.models import Appointment, DocumentationSession, DocumentationSessionNote, DocumentationSessionText, Patient
-from backend.lumen_web.repositories import (
-    DEMO_CLARA_PATIENT_APPOINTMENT_ID,
-    DEMO_CLEAN_PATIENT_ID,
-    DEMO_CLEAN_THERAPIST_ID,
-    reset_clean_demo_referral,
-)
+from backend.lumen_web.repositories import DEMO_CLEAN_THERAPIST_ID, reset_clean_demo_referral
 from backend.lumen_web.seed import DEMO_CLARA_THERAPIST_USER_ID, DEMO_TENANT_ID, DEMO_USER_ID
+
+DOC_PATIENT_ID = "documentation-test-patient-001"
+DOC_APPOINTMENT_ID = "documentation-test-appointment-001"
 
 
 def _request_for_user(user_id: str) -> Request:
@@ -52,12 +50,22 @@ def _prepare_documentation_demo() -> None:
         session.execute(delete(DocumentationSessionText))
         session.execute(delete(DocumentationSession))
         reset_clean_demo_referral(session)
-        session.execute(
-            delete(Appointment).where(
-                Appointment.therapist_id == DEMO_CLEAN_THERAPIST_ID,
-                Appointment.id != DEMO_CLARA_PATIENT_APPOINTMENT_ID,
-            )
-        )
+        patient = session.get(Patient, DOC_PATIENT_ID)
+        if patient is None:
+            patient = Patient(id=DOC_PATIENT_ID, tenant_id=DEMO_TENANT_ID)
+            session.add(patient)
+        patient.display_name = "Documentation Test Patient"
+        patient.contact_email = "documentation.patient@example.com"
+        session.flush()
+        appointment = session.get(Appointment, DOC_APPOINTMENT_ID)
+        if appointment is None:
+            appointment = Appointment(id=DOC_APPOINTMENT_ID, tenant_id=DEMO_TENANT_ID)
+            session.add(appointment)
+        appointment.patient_id = patient.id
+        appointment.therapist_id = DEMO_CLEAN_THERAPIST_ID
+        appointment.starts_at = patient.created_at
+        appointment.ends_at = patient.created_at
+        appointment.status = "confirmed"
         session.commit()
     finally:
         session.close()
@@ -67,7 +75,7 @@ def _create_clara_documentation_session() -> dict:
     return _call(
         documentation_session_create(
             DocumentationSessionCreateRequest(
-                patient_id=DEMO_CLEAN_PATIENT_ID,
+                patient_id=DOC_PATIENT_ID,
                 title="Clara demo documentation",
             ),
             _request_for_user(DEMO_CLARA_THERAPIST_USER_ID),
@@ -82,8 +90,8 @@ def test_clara_can_list_documentation_patients_without_hf_token(monkeypatch: pyt
     response = _call(documentation_patients(_request_for_user(DEMO_CLARA_THERAPIST_USER_ID)))
 
     patients = response["patients"]
-    assert [patient["id"] for patient in patients] == [DEMO_CLEAN_PATIENT_ID]
-    assert patients[0]["display_name"] == "Clean Demo Patient"
+    assert [patient["id"] for patient in patients] == [DOC_PATIENT_ID]
+    assert patients[0]["display_name"] == "Documentation Test Patient"
 
 
 def test_admin_cannot_use_documentation_as_therapist() -> None:
@@ -100,12 +108,12 @@ def test_clara_can_create_documentation_session_for_assigned_patient() -> None:
 
     doc_session = _create_clara_documentation_session()
     sessions = _call(
-        documentation_sessions(_request_for_user(DEMO_CLARA_THERAPIST_USER_ID), patient_id=DEMO_CLEAN_PATIENT_ID)
+        documentation_sessions(_request_for_user(DEMO_CLARA_THERAPIST_USER_ID), patient_id=DOC_PATIENT_ID)
     )["sessions"]
 
-    assert doc_session["patient_id"] == DEMO_CLEAN_PATIENT_ID
+    assert doc_session["patient_id"] == DOC_PATIENT_ID
     assert doc_session["therapist_id"] == "demo-clean-therapist-001"
-    assert doc_session["patient_label_snapshot"] == "Clean Demo Patient"
+    assert doc_session["patient_label_snapshot"] == "Documentation Test Patient"
     assert doc_session["therapist_label_snapshot"] == "Dr. Clara Demo"
     assert [item["id"] for item in sessions] == [doc_session["id"]]
 
@@ -177,7 +185,7 @@ def test_clara_cannot_list_or_access_stale_session_for_unassigned_patient() -> N
 
     request = _request_for_user(DEMO_CLARA_THERAPIST_USER_ID)
     sessions = _call(documentation_sessions(request))["sessions"]
-    filtered_sessions = _call(documentation_sessions(request, patient_id=DEMO_CLEAN_PATIENT_ID))["sessions"]
+    filtered_sessions = _call(documentation_sessions(request, patient_id=DOC_PATIENT_ID))["sessions"]
 
     assert stale_session_id not in {item["id"] for item in sessions}
     assert stale_session_id not in {item["id"] for item in filtered_sessions}
