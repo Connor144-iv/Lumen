@@ -90,6 +90,7 @@ from backend.lumen_web.repositories import (
     record_missing_info_reply,
     record_simulated_patient_reply,
     reset_clean_demo_referral,
+    reset_gmail_patient_demo,
     review_task_to_dict,
     seed_clara_demo_documentation_transcripts,
     mark_inbound_gmail_referral_workflow_started,
@@ -147,6 +148,7 @@ class ReviewActionRequest(BaseModel):
     final_text: str | None = None
     rejection_reason: str | None = None
     reviewer_id: str | None = None
+    appointment_id: str | None = None
     document_id: str | None = None
     intake_item_id: str | None = None
     consent_id: str | None = None
@@ -475,11 +477,32 @@ def referral_continue_email_workflow(referral_id: str) -> dict[str, Any]:
         with session_scope() as session:
             result = continue_email_referral_workflow(session, referral_id)
             result["workbench_state"] = referral_workbench_state(session, referral_id)
-            return result
+        workflow_request = None
+        workflow = result.get("result") or {}
+        if workflow.get("action") == "start_workflow":
+            workflow_request = WorkflowRequest(
+                workflow_type="new_referral",
+                tenant_id=workflow["tenant_id"],
+                patient_id=workflow.get("patient_id"),
+                raw_input=workflow["raw_input"],
+                referral_id=workflow.get("referral_id"),
+            )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if workflow_request is not None:
+        job = jobs.submit(workflow_request)
+        result["status"] = "workflow_started"
+        result["job"] = job
+        result["result"] = {
+            **workflow,
+            "status": "workflow_started",
+            "job_id": job["job_id"],
+            "status_url": f"/api/status/{job['job_id']}",
+            "events_url": f"/api/events/{job['job_id']}",
+        }
+    return result
 
 
 @app.post("/api/referrals/{referral_id}/match", dependencies=[Depends(require_admin)])
@@ -668,6 +691,12 @@ def demo_clean_referral_reset(tenant_id: str | None = DEMO_TENANT_ID) -> dict[st
         return reset_clean_demo_referral(session, tenant_id or DEMO_TENANT_ID)
 
 
+@app.post("/api/demo/gmail-patient/reset", status_code=201, dependencies=[Depends(require_admin)])
+def demo_gmail_patient_reset(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
+    with session_scope() as session:
+        return reset_gmail_patient_demo(session, tenant_id or DEMO_TENANT_ID)
+
+
 @app.post("/api/demo/clara-documentation-transcripts/seed", status_code=201, dependencies=[Depends(require_admin)])
 def demo_clara_documentation_transcripts_seed(tenant_id: str | None = DEMO_TENANT_ID) -> dict[str, Any]:
     with session_scope() as session:
@@ -685,6 +714,7 @@ def review_task_action(task_id: str, body: ReviewActionRequest) -> dict[str, Any
                 final_text=body.final_text,
                 rejection_reason=body.rejection_reason,
                 reviewer_id=body.reviewer_id,
+                appointment_id=body.appointment_id,
                 document_id=body.document_id,
                 intake_item_id=body.intake_item_id,
                 consent_id=body.consent_id,
@@ -695,7 +725,7 @@ def review_task_action(task_id: str, body: ReviewActionRequest) -> dict[str, Any
                 approval_payload_for_task(session, task)
                 if body.action == "approve"
                 and task.status == "approved"
-                and task.task_type in {"match_approval", "send_approval", "therapist_signoff"}
+                and task.task_type in {"match_approval", "therapist_signoff"}
                 else None
             )
             referral_payload = referral_detail(session, task.referral_id) if task.referral_id else None

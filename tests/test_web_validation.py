@@ -4,6 +4,8 @@ from fastapi.testclient import TestClient
 
 from backend.lumen_web import repositories
 from app import app
+from backend.lumen_web.db import Base, SessionLocal, engine
+from backend.lumen_web.models import Tenant, Therapist
 from backend.lumen_web.workflow_state import canonical_referral_status
 from backend.lumen_web.workflow_jobs import WorkflowJobManager, WorkflowRequest
 
@@ -36,6 +38,50 @@ def test_session_workflow_accepts_report_request_without_note() -> None:
     )
 
 
+def test_new_referral_execution_input_includes_bounded_backend_context(monkeypatch) -> None:
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "false")
+    tenant_id = "test-execution-context"
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=tenant_id, name="Execution Context Test", slug="execution-context-test")
+        therapist = Therapist(
+            tenant_id=tenant.id,
+            name="Context Therapist",
+            email="clara.demo1234@gmail.com",
+            specialties=["anxiety"],
+            languages=["Portuguese"],
+            modalities=["online"],
+            insurers=["Multicare"],
+            availability_blocks=[
+                {"weekday": day, "start": "09:00", "end": "12:00", "modality": "online"}
+                for day in ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
+            ],
+        )
+        session.merge(tenant)
+        session.add(therapist)
+        session.commit()
+    finally:
+        session.close()
+
+    manager = WorkflowJobManager(max_workers=1)
+    raw_input = manager._raw_input_for_execution(
+        WorkflowRequest(
+            workflow_type="new_referral",
+            tenant_id=tenant_id,
+            raw_input={
+                "source_channel": "email",
+                "raw_text": "Adult referral. Portuguese online therapy. Insurer Multicare. Flexible availability.",
+            },
+        )
+    )
+
+    assert raw_input["therapist_profiles"][0]["name"] == "Context Therapist"
+    assert raw_input["appointment_options"]
+    assert raw_input["appointment_options"][0]["therapist_name"] == "Context Therapist"
+    assert "slot_id" in raw_input["appointment_options"][0]
+
+
 def test_examples_endpoint_returns_samples() -> None:
     response = client.get("/api/examples")
 
@@ -51,7 +97,8 @@ def test_therapist_spa_routes_return_frontend_html() -> None:
         else:
             response = route.endpoint()
 
-        assert str(response.path).endswith("frontend/index.html")
+        assert response.path.name == "index.html"
+        assert response.path.parent.name == "frontend"
         assert response.media_type == "text/html"
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from json import JSONDecodeError
 from typing import Any, Type
 
 from pydantic import BaseModel
@@ -35,13 +36,19 @@ from .tools import EmptyRAGRetriever, RAGRetriever, build_report_formatting_tool
 
 
 def create_chat_model(settings: Settings, model_name: str):
-    """Create a chat model for Ollama, LM Studio/OpenAI-compatible, OpenAI, or Anthropic."""
+    """Create a chat model for Ollama, LM Studio/OpenAI-compatible, Hugging Face, OpenAI, or Anthropic."""
 
     provider = settings.provider.lower()
+    timeout = settings.llm_timeout_seconds
     if provider == "ollama":
         from langchain_ollama import ChatOllama
 
-        return ChatOllama(model=model_name, base_url=settings.ollama_base_url, temperature=0)
+        return ChatOllama(
+            model=model_name,
+            base_url=settings.ollama_base_url,
+            temperature=0,
+            client_kwargs={"timeout": timeout},
+        )
     if provider == "lmstudio":
         from langchain_openai import ChatOpenAI
 
@@ -50,15 +57,26 @@ def create_chat_model(settings: Settings, model_name: str):
             base_url=settings.lmstudio_base_url,
             api_key="lm-studio",
             temperature=0,
+            timeout=timeout,
         )
     if provider == "openai":
         from langchain_openai import ChatOpenAI
 
-        return ChatOpenAI(model=model_name, api_key=settings.openai_api_key, temperature=0)
+        return ChatOpenAI(model=model_name, api_key=settings.openai_api_key, temperature=0, timeout=timeout)
+    if provider == "huggingface":
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(
+            model=model_name,
+            base_url=settings.huggingface_base_url,
+            api_key=settings.huggingface_api_key,
+            temperature=0,
+            timeout=timeout,
+        )
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
-        return ChatAnthropic(model=model_name, api_key=settings.anthropic_api_key, temperature=0)
+        return ChatAnthropic(model=model_name, api_key=settings.anthropic_api_key, temperature=0, timeout=timeout)
     raise ValueError(f"Unsupported LUMEN_LLM_PROVIDER: {settings.provider}")
 
 
@@ -92,9 +110,18 @@ class StructuredAgent:
     system_prompt: str
     output_schema: Type[BaseModel]
     tools: list[Any] = field(default_factory=list)
+    provider: str = "default"
 
     def invoke(self, payload: dict[str, Any]) -> BaseModel:
         from langchain_core.messages import HumanMessage, SystemMessage
+
+        if self._uses_plain_json_output:
+            try:
+                result = self._invoke_plain_json(self.system_prompt, payload)
+                return self._validate(result)
+            except Exception as exc:
+                repaired = self._repair(payload=payload, validation_error=str(exc))
+                return self._validate(repaired)
 
         model = self.llm.bind_tools(self.tools) if self.tools else self.llm
         structured = model.with_structured_output(self.output_schema)
@@ -112,6 +139,16 @@ class StructuredAgent:
 
     def _repair(self, payload: dict[str, Any], validation_error: str) -> Any:
         from langchain_core.messages import HumanMessage, SystemMessage
+
+        if self._uses_plain_json_output:
+            return self._invoke_plain_json(
+                SCHEMA_REPAIR_SYSTEM,
+                {
+                    "agent_name": self.name,
+                    "original_payload": payload,
+                    "validation_error": validation_error,
+                },
+            )
 
         repair_model = self.llm.with_structured_output(self.output_schema)
         return repair_model.invoke(
@@ -135,6 +172,67 @@ class StructuredAgent:
         if isinstance(result, self.output_schema):
             return result
         return self.output_schema.model_validate(result)
+
+    @property
+    def _uses_plain_json_output(self) -> bool:
+        return self.provider.lower() == "huggingface"
+
+    def _invoke_plain_json(self, system_prompt: str, payload: dict[str, Any]) -> dict[str, Any]:
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        schema = self.output_schema.model_json_schema()
+        messages = [
+            SystemMessage(
+                content=(
+                    f"{system_prompt}\n\n"
+                    "Return exactly one valid JSON object and no markdown. "
+                    "Use null for unknown optional values. "
+                    "The JSON object must validate against this schema:\n"
+                    f"{json.dumps(schema, ensure_ascii=False, default=str)}"
+                )
+            ),
+            HumanMessage(content=json.dumps(payload, ensure_ascii=False, default=str)),
+        ]
+        response = self.llm.invoke(messages)
+        return _parse_json_object(_message_content(response))
+
+
+def _message_content(response: Any) -> str:
+    content = getattr(response, "content", response)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "\n".join(parts)
+    return str(content)
+
+
+def _parse_json_object(raw: str) -> dict[str, Any]:
+    text = raw.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    try:
+        parsed = json.loads(text)
+    except JSONDecodeError:
+        object_start = text.find("{")
+        if object_start < 0:
+            raise
+        parsed, _ = json.JSONDecoder().raw_decode(text[object_start:])
+
+    if not isinstance(parsed, dict):
+        raise ValueError("Agent response must be a JSON object.")
+    return parsed
 
 
 class RiskClassifierClient:
@@ -204,6 +302,7 @@ class AgentRuntime:
 
 def build_agent_runtime(settings: Settings | None = None) -> AgentRuntime:
     settings = settings or Settings()
+    provider = settings.provider.lower()
     small_llm = create_chat_model(settings, settings.small_model)
     medium_llm = create_chat_model(settings, settings.medium_model)
     communication_llm = create_chat_model(settings, settings.communication_model)
@@ -218,18 +317,21 @@ def build_agent_runtime(settings: Settings | None = None) -> AgentRuntime:
             llm=medium_llm,
             system_prompt=WORKFLOW_ORCHESTRATOR_SYSTEM,
             output_schema=OrchestratorDecision,
+            provider=provider,
         ),
         referral_intake=StructuredAgent(
             name="referral_intake_normalizer",
             llm=small_llm,
             system_prompt=REFERRAL_INTAKE_NORMALIZER_SYSTEM,
             output_schema=ReferralRecord,
+            provider=provider,
         ),
         clinical_signal=StructuredAgent(
             name="clinical_signal_extractor",
             llm=small_llm,
             system_prompt=CLINICAL_SIGNAL_EXTRACTOR_SYSTEM,
             output_schema=ClinicalSignals,
+            provider=provider,
         ),
         risk_classifier=RiskClassifierClient(),
         therapist_matching=StructuredAgent(
@@ -237,18 +339,21 @@ def build_agent_runtime(settings: Settings | None = None) -> AgentRuntime:
             llm=small_llm,
             system_prompt=THERAPIST_MATCHING_PLANNER_SYSTEM,
             output_schema=TherapistMatchRecommendation,
+            provider=provider,
         ),
         communication_drafter=StructuredAgent(
             name="patient_communication_drafter",
             llm=communication_llm,
             system_prompt=PATIENT_COMMUNICATION_DRAFTER_SYSTEM,
             output_schema=CommunicationDraft,
+            provider=provider,
         ),
         consent_collector=StructuredAgent(
             name="consent_intake_collector",
             llm=small_llm,
             system_prompt=CONSENT_INTAKE_COLLECTOR_SYSTEM,
             output_schema=ConsentIntakeSummary,
+            provider=provider,
         ),
         protocol_matcher=StructuredAgent(
             name="clinical_documentation_protocol_matcher",
@@ -256,6 +361,7 @@ def build_agent_runtime(settings: Settings | None = None) -> AgentRuntime:
             system_prompt=CLINICAL_DOCUMENTATION_PROTOCOL_MATCHER_SYSTEM,
             output_schema=ProtocolCoverageMap,
             tools=[retrieval_tool],
+            provider=provider,
         ),
         report_writer=StructuredAgent(
             name="report_treatment_review_writer",
@@ -263,6 +369,7 @@ def build_agent_runtime(settings: Settings | None = None) -> AgentRuntime:
             system_prompt=REPORT_TREATMENT_REVIEW_WRITER_SYSTEM,
             output_schema=ReportDraft,
             tools=[retrieval_tool, report_formatting_tool],
+            provider=provider,
         ),
         clinical_retriever=retriever,
     )

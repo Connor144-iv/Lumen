@@ -51,6 +51,15 @@ def _check_model(settings: Settings, role: str, model: str) -> ModelCheck:
                 status, message = _check_openai_compatible_model(
                     "https://api.openai.com/v1", model, api_key=settings.openai_api_key
                 )
+        elif provider == "huggingface":
+            if not settings.huggingface_api_key:
+                status, message = "unconfigured", "HUGGINGFACE_API_KEY is not set."
+            else:
+                status, message = _check_openai_compatible_model(
+                    settings.huggingface_base_url,
+                    model,
+                    api_key=settings.huggingface_api_key,
+                )
         elif provider == "anthropic":
             if not settings.anthropic_api_key:
                 status, message = "unconfigured", "ANTHROPIC_API_KEY is not set."

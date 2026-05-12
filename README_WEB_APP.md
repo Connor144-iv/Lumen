@@ -31,6 +31,16 @@ $env:LUMEN_MEDIUM_MODEL="local-model-name"
 $env:LUMEN_COMMUNICATION_MODEL="local-model-name"
 ```
 
+For the shared Hugging Face demo model:
+
+```powershell
+$env:LUMEN_LLM_PROVIDER="huggingface"
+$env:HUGGINGFACE_API_KEY="<your-hugging-face-token>"
+$env:LUMEN_SMALL_MODEL="openai/gpt-oss-120b:fastest"
+$env:LUMEN_MEDIUM_MODEL="openai/gpt-oss-120b:fastest"
+$env:LUMEN_COMMUNICATION_MODEL="openai/gpt-oss-120b:fastest"
+```
+
 ## Database
 
 By default, Lumen creates `lumen_dev.db` in the project root. For PostgreSQL:

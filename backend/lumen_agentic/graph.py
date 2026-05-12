@@ -30,7 +30,7 @@ def build_lumen_graph(runtime: AgentRuntime):
     graph.add_node("clinical_signal", _agent_node(runtime.clinical_signal, "clinical_signals"))
     graph.add_node("risk_review", risk_review_node(runtime))
     graph.add_node("human_clinical_review", human_gate_node("clinical_review", "risk_review"))
-    graph.add_node("therapist_matching", _agent_node(runtime.therapist_matching, "match_recommendation"))
+    graph.add_node("therapist_matching", therapist_matching_node(runtime))
     graph.add_node("human_match_approval", human_gate_node("match_approval", "match_recommendation"))
     graph.add_node("communication_drafter", communication_node(runtime))
     graph.add_node("human_send_approval", human_gate_node("send_approval", "communication_draft"))
@@ -66,7 +66,11 @@ def build_lumen_graph(runtime: AgentRuntime):
     )
 
     graph.add_edge("human_clinical_review", END)
-    graph.add_edge("therapist_matching", "human_match_approval")
+    graph.add_conditional_edges(
+        "therapist_matching",
+        match_router,
+        {"failed": END, "match_approval": "human_match_approval"},
+    )
     graph.add_conditional_edges(
         "human_match_approval",
         approval_router("match_approval", "communication"),
@@ -209,6 +213,46 @@ def risk_router(state: LumenGraphState) -> str:
     if state.get("workflow_type") == "session_completed":
         return "report"
     return "failed"
+
+
+def therapist_matching_node(runtime: AgentRuntime):
+    def _node(state: LumenGraphState) -> dict[str, Any]:
+        workflow_id = state.get("workflow_id", str(uuid4()))
+        try:
+            result = runtime.therapist_matching.invoke(_minimum_payload(state, "match_recommendation"))
+            if _invalid_match_repair_output(result):
+                return _fail_closed(
+                    workflow_id=workflow_id,
+                    node_name="match_recommendation",
+                    agent_name=runtime.therapist_matching.name,
+                    message="Therapist matching returned a parser or schema error instead of a usable recommendation.",
+                )
+            return {
+                "match_recommendation": result.model_dump(mode="json"),
+                "audit_events": [
+                    AuditEvent(
+                        workflow_id=workflow_id,
+                        node_name="match_recommendation",
+                        agent_name=runtime.therapist_matching.name,
+                        status="ok",
+                        confidence=_confidence_for("match_recommendation", result),
+                        message="therapist_matching_planner produced validated match_recommendation.",
+                    ).model_dump(mode="json")
+                ],
+            }
+        except (ValidationError, Exception) as exc:
+            return _fail_closed(
+                workflow_id=workflow_id,
+                node_name="match_recommendation",
+                agent_name=getattr(runtime.therapist_matching, "name", "match_recommendation"),
+                message=str(exc),
+            )
+
+    return _node
+
+
+def match_router(state: LumenGraphState) -> str:
+    return "failed" if state.get("errors") else "match_approval"
 
 
 def protocol_matcher_node(runtime: AgentRuntime):
@@ -406,12 +450,21 @@ def _minimum_payload(state: LumenGraphState, target: str) -> dict[str, Any]:
     if target == "match_recommendation":
         raw_input = state.get("raw_input", {})
         return {
+            "referral": state.get("referral"),
             "clinical_signals": state.get("clinical_signals"),
             "risk_review": state.get("risk_review"),
             "therapist_profiles": raw_input.get("therapist_profiles", []),
         }
     if target == "communication_draft":
-        return {"match": state.get("match_recommendation"), "referral": state.get("referral")}
+        raw_input = state.get("raw_input", {})
+        clinical_signals = state.get("clinical_signals") or {}
+        return {
+            "match": state.get("match_recommendation"),
+            "referral": state.get("referral"),
+            "clinical_signals": clinical_signals,
+            "missing_required_fields": clinical_signals.get("missing_required_fields", []),
+            "appointment_options": raw_input.get("appointment_options", []),
+        }
     if target == "consent_summary":
         return {"patient_id": state.get("patient_id"), "referral": state.get("referral")}
     return dict(state)
@@ -426,6 +479,25 @@ def _risk_text(state: LumenGraphState) -> str:
         str(state.get("clinical_signals", "")),
     ]
     return "\n".join(part for part in parts if part)
+
+
+def _invalid_match_repair_output(result: Any) -> bool:
+    ranked = list(getattr(result, "ranked_matches", []) or [])
+    excluded = list(getattr(result, "excluded_therapists", []) or [])
+    if ranked or excluded:
+        return False
+    rationale = str(getattr(result, "rationale", "") or "").lower()
+    error_terms = (
+        "invalid json",
+        "trailing comma",
+        "parser",
+        "parse",
+        "schema",
+        "validation",
+        "exception",
+        "error",
+    )
+    return any(term in rationale for term in error_terms)
 
 
 def _confidence_for(state_key: str, result: Any) -> float | None:

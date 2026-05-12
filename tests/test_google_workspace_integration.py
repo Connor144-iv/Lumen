@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import uuid4
@@ -10,6 +11,7 @@ from sqlalchemy import select
 
 import app as app_module
 from backend.lumen_web import google_workspace
+from backend.lumen_web import repositories as repository_module
 from backend.lumen_web.db import Base, SessionLocal, engine
 from backend.lumen_web.models import (
     AuditLog,
@@ -26,6 +28,7 @@ from backend.lumen_web.models import (
     Tenant,
     Therapist,
     TherapistPrepBrief,
+    WorkflowEvent,
     WorkflowRun,
 )
 from backend.lumen_web.repositories import (
@@ -33,6 +36,8 @@ from backend.lumen_web.repositories import (
     continue_email_referral_workflow,
     create_intake_template_file,
     create_referral_for_request,
+    deterministic_match_for_referral,
+    draft_first_contact_message,
     draft_intake_packet,
     draft_missing_info_request,
     finish_workflow_run,
@@ -46,6 +51,7 @@ from backend.lumen_web.repositories import (
     record_missing_info_reply,
     request_appointment_reschedule,
     reset_clean_demo_referral,
+    reset_gmail_patient_demo,
     start_intake_for_referral,
     therapist_calendar_capacity,
 )
@@ -57,6 +63,12 @@ def _id(prefix: str) -> str:
 
 def _template_file_meta(name: str, content: bytes = b"Blank intake form") -> dict[str, str | int | dict]:
     return app_module.store_uploaded_document(_id("template-file"), name, "text/plain", content)
+
+
+def _write_demo_intake_assets(directory) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    for spec in repository_module.DEMO_GMAIL_INTAKE_REQUIRED_ITEMS:
+        (directory / spec["demo_asset_file"]).write_bytes(f"Blank {spec['label']}".encode("utf-8"))
 
 
 def test_google_status_shape_without_real_credentials(monkeypatch, tmp_path) -> None:
@@ -203,6 +215,114 @@ def test_gmail_sync_falls_back_to_recent_demo_patient_messages(monkeypatch) -> N
         session.close()
 
 
+def test_new_gmail_from_existing_patient_email_stays_unmatched_without_reply_context() -> None:
+    Base.metadata.create_all(bind=engine)
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Gmail Sender Collision", slug=_id("gmail-sender-collision"))
+        referral = Referral(
+            tenant_id=tenant.id,
+            source_channel="webform",
+            raw_text="Legacy demo referral.",
+            status="needs_admin_review",
+            patient_name="Clean Demo Patient",
+            contact_email="lumenpatientdemo@gmail.com",
+            insurer="Multicare",
+            language_preference="Portuguese",
+            missing_fields=["date_of_birth"],
+        )
+        session.add(tenant)
+        session.flush()
+        session.add(referral)
+        session.flush()
+
+        result = ingest_gmail_message(
+            session,
+            tenant_id=tenant.id,
+            message={
+                "message_id": f"simon-new-referral-{uuid4()}",
+                "thread_id": "fresh-thread-without-lumen-draft",
+                "from": "Simon Anderson <lumenpatientdemo@gmail.com>",
+                "subject": "Appointment request",
+                "body": (
+                    "My name is Simon Anderson, I would like to book an appointment with one of your therapists. "
+                    "I fear that my toes are slowly turning into mushy bananas. "
+                    "You can use this email to contact me. Thanks, Simon"
+                ),
+            },
+        )
+
+        assert result["action"] == "unmatched"
+        assert result["match_reason"] == "unmatched"
+        session.refresh(referral)
+        assert referral.patient_name == "Clean Demo Patient"
+        assert referral.insurer == "Multicare"
+        assert referral.language_preference == "Portuguese"
+        assert session.scalar(
+            select(Document).where(
+                Document.storage_uri == f"gmail:message:{result['message_id']}",
+                Document.document_type == "inbound_email_unmatched",
+            )
+        )
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_reply_like_gmail_without_thread_can_match_sent_draft_by_sender() -> None:
+    Base.metadata.create_all(bind=engine)
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Gmail Reply Fallback", slug=_id("gmail-reply-fallback"))
+        referral = Referral(
+            tenant_id=tenant.id,
+            source_channel="email",
+            raw_text="Referral waiting for date of birth.",
+            status="waiting_for_missing_info",
+            patient_name="Reply Patient",
+            contact_email="lumenpatientdemo@gmail.com",
+            missing_fields=["date_of_birth"],
+        )
+        session.add(tenant)
+        session.flush()
+        session.add(referral)
+        session.flush()
+        session.add(
+            CommunicationDraft(
+                tenant_id=tenant.id,
+                referral_id=referral.id,
+                channel="email",
+                subject="Please confirm missing details",
+                body="Please send your DOB.",
+                status="sent",
+                recipient_email="lumenpatientdemo@gmail.com",
+                gmail_message_id="sent-without-thread",
+            )
+        )
+        session.flush()
+
+        result = ingest_gmail_message(
+            session,
+            tenant_id=tenant.id,
+            message={
+                "message_id": f"reply-no-thread-{uuid4()}",
+                "thread_id": "gmail-lost-thread-id",
+                "from": "Reply Patient <lumenpatientdemo@gmail.com>",
+                "subject": "Re: Please confirm missing details",
+                "body": "DOB: 1990-01-01.",
+            },
+        )
+
+        assert result["referral_id"] == referral.id
+        assert result["match_reason"] == "sender_email_reply"
+        assert result["action"] == "missing_info_reply"
+        session.refresh(referral)
+        assert referral.date_of_birth == "1990-01-01"
+    finally:
+        session.rollback()
+        session.close()
+
+
 def test_gmail_sync_rejects_wrong_authorized_mailbox(monkeypatch) -> None:
     monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "true")
     monkeypatch.setattr(google_workspace, "gmail_profile_email", lambda: "clara.demo1234@gmail.com")
@@ -296,16 +416,224 @@ def test_email_referral_placeholder_does_not_create_premature_missing_info_task(
 
         assert referral is not None
         assert referral.status == "normalising"
-        assert referral.patient_name == "Ben"
+        assert referral.patient_name is None
         assert referral.contact_email == "lumenpatientdemo@gmail.com"
-        assert referral.missing_fields == ["contact_phone_or_date_of_birth", "insurer"]
+        assert referral.missing_fields == []
         assert session.scalar(select(HumanReviewTask).where(HumanReviewTask.referral_id == referral.id)) is None
     finally:
         session.rollback()
         session.close()
 
 
-def test_running_email_workflow_can_continue_from_deterministic_email_facts(monkeypatch) -> None:
+def test_gmail_patient_demo_reset_removes_email_referral_and_repairs_inbound_doc() -> None:
+    Base.metadata.create_all(bind=engine)
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Demo Clinic", slug=_id("demo-reset"))
+        referral = Referral(
+            tenant_id=tenant.id,
+            source_channel="email",
+            raw_text="Email referral.",
+            status="needs_admin_review",
+            patient_name="Anna Anderson",
+            contact_email="lumenpatientdemo@gmail.com",
+            duplicate_candidates=["gmail-doc-id"],
+        )
+        session.add(tenant)
+        session.flush()
+        session.add(referral)
+        session.flush()
+        workflow = WorkflowRun(
+            id=_id("workflow"),
+            tenant_id=tenant.id,
+            referral_id=referral.id,
+            workflow_type="new_referral",
+            status="failed",
+            input_summary="Old Gmail workflow.",
+            request_payload={"raw_input": {"source_channel": "email"}},
+            approvals={},
+        )
+        referral.workflow_run_id = workflow.id
+        session.add(workflow)
+        session.flush()
+        event = WorkflowEvent(
+            tenant_id=tenant.id,
+            workflow_run_id=workflow.id,
+            index=0,
+            type="workflow",
+            status="failed",
+            message="Old failed run.",
+            node="workflow",
+        )
+        draft = CommunicationDraft(
+            tenant_id=tenant.id,
+            referral_id=referral.id,
+            workflow_run_id=workflow.id,
+            channel="email",
+            subject="Old draft",
+            body="Old body",
+            status="draft_pending_review",
+        )
+        document = Document(
+            tenant_id=tenant.id,
+            document_type="inbound_email_unmatched",
+            title="Therapy enquiry",
+            storage_uri="gmail:message:demo-reset-message",
+            metadata_json={
+                "sender_email": "lumenpatientdemo@gmail.com",
+                "referral_id": referral.id,
+                "workflow_job_id": "old-job",
+                "converted_to_referral": True,
+            },
+        )
+        task = HumanReviewTask(
+            tenant_id=tenant.id,
+            workflow_run_id=workflow.id,
+            referral_id=referral.id,
+            task_type="inbound_reply_review",
+            status="open",
+            reason="Old task.",
+            payload_key="old",
+        )
+        session.add_all([event, draft, document, task])
+        session.flush()
+
+        result = reset_gmail_patient_demo(session, tenant_id=tenant.id)
+
+        assert referral.id in result["removed_referral_ids"]
+        assert session.get(Referral, referral.id) is None
+        assert session.get(HumanReviewTask, task.id) is None
+        assert session.get(CommunicationDraft, draft.id) is None
+        assert session.get(WorkflowEvent, event.id) is None
+        assert session.get(WorkflowRun, workflow.id) is None
+        session.refresh(document)
+        assert "referral_id" not in document.metadata_json
+        assert "workflow_job_id" not in document.metadata_json
+        assert "converted_to_referral" not in document.metadata_json
+        assert result["repaired_inbound_documents"] == 1
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_gmail_patient_demo_reset_registers_intake_packet_docx_assets(monkeypatch, tmp_path) -> None:
+    Base.metadata.create_all(bind=engine)
+    asset_dir = tmp_path / "intake-assets"
+    _write_demo_intake_assets(asset_dir)
+    monkeypatch.setattr(repository_module, "DEMO_GMAIL_INTAKE_PACKET_ASSET_DIR", asset_dir)
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Demo Intake Assets", slug=_id("demo-intake-assets"))
+        session.add(tenant)
+        session.flush()
+
+        result = reset_gmail_patient_demo(session, tenant_id=tenant.id)
+
+        assert result["missing_intake_template_files"] == []
+        assert len(result["intake_template_files"]) == 4
+        assert {item["file_name"] for item in result["intake_template_files"]} == {
+            "privacy_notice_acknowledged.docx",
+            "telehealth_consent.docx",
+            "clinical_intake_form.docx",
+            "pre_session_screening_questionnaire.docx",
+        }
+        template = session.get(IntakeTemplate, result["intake_template"]["id"])
+        assert template is not None
+        assert template.source_channel == "email"
+        assert [item["key"] for item in template.required_items] == [
+            "privacy_notice",
+            "telehealth_consent",
+            "intake_form",
+            "screening_questionnaire",
+        ]
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_gmail_patient_demo_reset_reports_missing_intake_packet_asset(monkeypatch, tmp_path) -> None:
+    Base.metadata.create_all(bind=engine)
+    asset_dir = tmp_path / "partial-intake-assets"
+    _write_demo_intake_assets(asset_dir)
+    (asset_dir / "telehealth_consent.docx").unlink()
+    monkeypatch.setattr(repository_module, "DEMO_GMAIL_INTAKE_PACKET_ASSET_DIR", asset_dir)
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Missing Demo Intake Asset", slug=_id("missing-demo-intake"))
+        session.add(tenant)
+        session.flush()
+
+        result = reset_gmail_patient_demo(session, tenant_id=tenant.id)
+
+        assert any(item["file_name"] == "telehealth_consent.docx" for item in result["missing_intake_template_files"])
+        assert len(result["intake_template_files"]) == 3
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_gmail_demo_intake_packet_sends_all_seeded_docx_attachments(monkeypatch) -> None:
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "true")
+    asset_dir = repository_module.REPO_ROOT / "storage" / "test-demo-intake-assets" / _id("assets")
+    _write_demo_intake_assets(asset_dir)
+    monkeypatch.setattr(repository_module, "DEMO_GMAIL_INTAKE_PACKET_ASSET_DIR", asset_dir)
+    send_calls = []
+
+    def fake_send(**kwargs):
+        send_calls.append(kwargs)
+        return {"message_id": "gmail-demo-intake-message", "thread_id": "gmail-demo-intake-thread"}
+
+    monkeypatch.setattr(google_workspace, "send_approved_draft", fake_send)
+
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Demo Intake Send", slug=_id("demo-intake-send"))
+        session.add(tenant)
+        session.flush()
+        reset_gmail_patient_demo(session, tenant_id=tenant.id)
+        referral = Referral(
+            tenant_id=tenant.id,
+            source_channel="email",
+            raw_text="Referral with confirmed appointment.",
+            status="appointment_confirmed",
+            patient_name="Demo Intake Patient",
+            contact_email="lumenpatientdemo@gmail.com",
+        )
+        session.add(referral)
+        session.flush()
+
+        draft = draft_intake_packet(session, referral.id)
+        task = session.scalar(
+            select(HumanReviewTask).where(
+                HumanReviewTask.referral_id == referral.id,
+                HumanReviewTask.task_type == "send_approval",
+            )
+        )
+        apply_review_action(session, task_id=task.id, action="approve")
+
+        draft_row = session.get(CommunicationDraft, draft["id"])
+        assert len(draft["outbound_attachment_manifest"]) == 4
+        assert len(send_calls) == 1
+        assert [item["file_name"] for item in send_calls[0]["attachments"]] == [
+            "privacy_notice_acknowledged.docx",
+            "telehealth_consent.docx",
+            "clinical_intake_form.docx",
+            "pre_session_screening_questionnaire.docx",
+        ]
+        assert {item["content_type"] for item in send_calls[0]["attachments"]} == {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        }
+        assert draft_row.gmail_message_id == "gmail-demo-intake-message"
+        assert draft_row.gmail_thread_id == "gmail-demo-intake-thread"
+        assert referral.status == "intake_packet_sent"
+    finally:
+        session.rollback()
+        session.close()
+        shutil.rmtree(asset_dir, ignore_errors=True)
+
+
+def test_running_email_workflow_returns_active_canonical_state_without_deterministic_side_effects(monkeypatch) -> None:
     Base.metadata.create_all(bind=engine)
     monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "false")
     session = SessionLocal()
@@ -357,37 +685,26 @@ def test_running_email_workflow_can_continue_from_deterministic_email_facts(monk
 
         detail = referral_detail(session, referral.id)
         packet = detail["workbench_state"]["email_workflow"]
-        assert detail["patient_name"] == "Ben Anderson"
-        assert packet["next_action"] == "continue_email_workflow"
+        assert detail["patient_name"] is None
+        assert packet["next_action"] == "wait_extraction"
 
         result = continue_email_referral_workflow(session, referral.id)
 
-        assert result["status"] == "prepared"
+        assert result["status"] == "running"
+        assert result["result"]["action"] == "wait"
         session.refresh(referral)
-        assert referral.patient_name == "Ben Anderson"
-        assert referral.duplicate_candidates == []
+        assert referral.patient_name is None
+        assert referral.duplicate_candidates == ["demo-duplicate-candidate"]
         appointments = list(session.scalars(select(Appointment).where(Appointment.referral_id == referral.id)))
-        assert len(appointments) == 1
-        assert appointments[0].status == "proposed"
-        draft = session.get(CommunicationDraft, referral.communication_draft_id)
-        assert draft is not None
-        assert "Ben Anderson" in draft.body
-        assert "date of birth" in draft.body
-        assert "insurer" in draft.body
-        task_types = {
-            task.task_type
-            for task in session.scalars(select(HumanReviewTask).where(HumanReviewTask.referral_id == referral.id))
-        }
-        assert {"match_approval", "slot_offer_approval", "send_approval"} <= task_types
-        refreshed = referral_detail(session, referral.id)
-        assert "duplicate_candidate" not in refreshed["secondary_flags"]
-        assert refreshed["workbench_state"]["email_workflow"]["next_action"] == "review_first_response"
+        drafts = list(session.scalars(select(CommunicationDraft).where(CommunicationDraft.referral_id == referral.id)))
+        tasks = list(session.scalars(select(HumanReviewTask).where(HumanReviewTask.referral_id == referral.id)))
+        assert appointments == []
+        assert drafts == []
+        assert tasks == []
+        assert session.scalar(select(AuditLog).where(AuditLog.entity_id == referral.id, AuditLog.action == "deterministic_email_extract")) is None
         assert session.scalar(
-            select(AuditLog).where(
-                AuditLog.entity_id == referral.id,
-                AuditLog.action == "demo_bypass_email_duplicate_candidates",
-            )
-        )
+            select(AuditLog).where(AuditLog.entity_id == referral.id, AuditLog.action == "demo_bypass_email_duplicate_candidates")
+        ) is None
     finally:
         session.rollback()
         session.close()
@@ -419,7 +736,7 @@ def test_stale_email_workflow_exposes_retry_action() -> None:
             request_payload={"raw_input": {"source_channel": "email", "raw_text": referral.raw_text}},
             approvals={},
         )
-        old_time = datetime.now(timezone.utc) - timedelta(minutes=11)
+        old_time = datetime.now(timezone.utc) - timedelta(minutes=31)
         run.created_at = old_time
         run.updated_at = old_time
         referral.workflow_run_id = run.id
@@ -433,6 +750,46 @@ def test_stale_email_workflow_exposes_retry_action() -> None:
         assert run.status == "failed"
         assert referral.status == "needs_admin_review"
         assert detail["workbench_state"]["email_workflow"]["next_action"] == "retry_extraction"
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_email_missing_fields_continue_on_canonical_workflow() -> None:
+    Base.metadata.create_all(bind=engine)
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Email Missing Continue", slug=_id("email-missing-continue"))
+        referral = Referral(
+            tenant_id=tenant.id,
+            source_channel="email",
+            raw_text="My name is Simon Anderson. I need an appointment.",
+            status="needs_admin_review",
+            patient_name="Simon Anderson",
+            contact_email="lumenpatientdemo@gmail.com",
+            missing_fields=["date_of_birth", "insurer"],
+        )
+        run = WorkflowRun(
+            id=_id("workflow"),
+            tenant_id=tenant.id,
+            referral_id=referral.id,
+            workflow_type="new_referral",
+            status="needs_review",
+            input_summary="Email referral extracted missing fields.",
+            request_payload={"raw_input": {"source_channel": "email", "raw_text": referral.raw_text}},
+            approvals={},
+        )
+        session.add(tenant)
+        session.flush()
+        session.add_all([referral, run])
+        session.flush()
+
+        detail = referral_detail(session, referral.id)
+        state = detail["workbench_state"]
+
+        assert state["primary_action"] == "continue_email_workflow"
+        assert state["primary_action_label"] == "Draft missing-info email"
+        assert state["email_workflow"]["next_action"] == "continue_email_workflow"
     finally:
         session.rollback()
         session.close()
@@ -577,16 +934,16 @@ def test_workflow_contact_draft_creates_linked_send_approval(monkeypatch) -> Non
         session.close()
 
 
-def test_email_followup_prepares_local_hold_and_combined_contact_draft(monkeypatch) -> None:
+def test_email_workflow_persists_agent_draft_slots_and_canonical_send_gate(monkeypatch) -> None:
     Base.metadata.create_all(bind=engine)
     monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "false")
 
     session = SessionLocal()
     try:
-        tenant = Tenant(id=_id("tenant"), name="Email Followup Test", slug=_id("email-followup"))
+        tenant = Tenant(id=_id("tenant"), name="Email Agent Draft Test", slug=_id("email-agent-draft"))
         therapist = Therapist(
             tenant_id=tenant.id,
-            name="Email Followup Therapist",
+            name="Email Agent Therapist",
             specialties=["anxiety"],
             languages=["Portuguese"],
             modalities=["online"],
@@ -602,7 +959,7 @@ def test_email_followup_prepares_local_hold_and_combined_contact_draft(monkeypat
                 "Available Tuesday 10:00 to 12:00."
             ),
             status="needs_admin_review",
-            patient_name="Email Followup Patient",
+            patient_name="Email Agent Patient",
             contact_email="lumenpatientdemo@gmail.com",
             insurer="Multicare",
             language_preference="Portuguese",
@@ -613,33 +970,311 @@ def test_email_followup_prepares_local_hold_and_combined_contact_draft(monkeypat
         session.flush()
         session.add_all([therapist, referral])
         session.flush()
+        starts_at = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=3)
+        ends_at = starts_at + timedelta(minutes=60)
+        slot_id = f"{therapist.id}:agent-slot-1"
+        run = WorkflowRun(
+            id=_id("workflow"),
+            tenant_id=tenant.id,
+            referral_id=referral.id,
+            workflow_type="new_referral",
+            status="running",
+            input_summary="Agent email draft",
+            request_payload={
+                "raw_input": {
+                    "source_channel": "email",
+                    "raw_text": referral.raw_text,
+                    "appointment_options": [
+                        {
+                            "slot_id": slot_id,
+                            "option_code": "OPT1",
+                            "option_number": 1,
+                            "therapist_id": therapist.id,
+                            "therapist_name": therapist.name,
+                            "therapist_email": "therapist@example.com",
+                            "starts_at": starts_at.isoformat(),
+                            "ends_at": ends_at.isoformat(),
+                            "weekday": starts_at.strftime("%A"),
+                            "modality": "online",
+                        }
+                    ],
+                }
+            },
+            approvals={"match_approval": True},
+        )
+        session.add(run)
+        session.add(
+            HumanReviewTask(
+                tenant_id=tenant.id,
+                referral_id=referral.id,
+                task_type="match_approval",
+                status="approved",
+                reason="Previously approved match.",
+                payload_key="match_recommendation",
+                source_payload={},
+            )
+        )
+        session.flush()
 
-        result = prepare_email_referral_followup(session, referral.id)
+        finish_workflow_run(
+            session,
+            job_id=run.id,
+            status="needs_review",
+            result={
+                "outputs": {
+                    "clinical_signals": {"missing_required_fields": ["date_of_birth"]},
+                    "match_recommendation": {
+                        "ranked_matches": [{"therapist_id": therapist.id, "name": therapist.name}],
+                        "excluded_therapists": [],
+                        "rationale": "Best bounded match.",
+                        "hard_constraints_checked": ["availability"],
+                        "requires_human_approval": True,
+                    },
+                    "communication_draft": {
+                        "channel": "email",
+                        "subject": "Appointment option",
+                        "body": f"Can you attend option 1 (OPT1)? Please also send your date of birth. Slot {slot_id}.",
+                        "proposed_slots": [slot_id],
+                        "requires_human_send": True,
+                        "prohibited_content_check_passed": True,
+                    },
+                },
+                "human_review_queue": [
+                    {
+                        "gate": "send_approval",
+                        "payload_key": "communication_draft",
+                        "reason": "Approve prepared email.",
+                    }
+                ],
+            },
+            error=None,
+        )
 
-        assert result["status"] == "prepared"
         appointments = session.scalars(select(Appointment).where(Appointment.referral_id == referral.id)).all()
         assert len(appointments) == 1
         assert appointments[0].status == "proposed"
         assert appointments[0].google_calendar_event_id is None
-        tasks = {
-            task.task_type: task
-            for task in session.scalars(select(HumanReviewTask).where(HumanReviewTask.referral_id == referral.id))
-        }
-        assert tasks["match_approval"].status == "open"
-        assert tasks["slot_offer_approval"].status == "open"
-        assert tasks["send_approval"].status == "open"
+        tasks = list(session.scalars(select(HumanReviewTask).where(HumanReviewTask.referral_id == referral.id)))
+        task_types = [task.task_type for task in tasks]
+        assert task_types.count("send_approval") == 1
+        assert "slot_offer_approval" not in task_types
         draft = session.get(CommunicationDraft, referral.communication_draft_id)
         assert draft is not None
         assert draft.proposed_slots == [appointments[0].id]
         assert "date of birth" in draft.body
-        assert "confirm that you can attend this date and time" in draft.body
 
         detail = referral_detail(session, referral.id)
         packet = detail["workbench_state"]["email_workflow"]
-        assert packet["next_action"] == "review_first_response"
+        assert packet["next_action"] == "send_email"
         assert packet["held_appointment"]["id"] == appointments[0].id
         assert packet["draft"]["id"] == draft.id
         assert packet["facts"]["missing_fields"] == ["date_of_birth"]
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_workflow_filters_untrusted_dedupe_candidates() -> None:
+    Base.metadata.create_all(bind=engine)
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Dedupe Filter Test", slug=_id("dedupe-filter"))
+        referral = Referral(
+            tenant_id=tenant.id,
+            source_channel="email",
+            raw_text="Email referral.",
+            status="normalising",
+            patient_name="Current Patient",
+            contact_email="lumenpatientdemo@gmail.com",
+        )
+        valid_duplicate = Referral(
+            tenant_id=tenant.id,
+            source_channel="email",
+            raw_text="Earlier email referral.",
+            status="needs_admin_review",
+            patient_name="Earlier Patient",
+            contact_email="earlier@example.com",
+        )
+        document = Document(
+            tenant_id=tenant.id,
+            document_type="inbound_email_unmatched",
+            title="Inbound Gmail",
+            metadata_json={},
+        )
+        session.add(tenant)
+        session.flush()
+        session.add_all([referral, valid_duplicate, document])
+        session.flush()
+        run = WorkflowRun(
+            id=_id("workflow"),
+            tenant_id=tenant.id,
+            referral_id=referral.id,
+            workflow_type="new_referral",
+            status="running",
+            input_summary="Dedupe output",
+            request_payload={"raw_input": {"source_channel": "email"}},
+            approvals={},
+        )
+        session.add(run)
+        session.flush()
+
+        finish_workflow_run(
+            session,
+            job_id=run.id,
+            status="needs_review",
+            result={
+                "outputs": {
+                    "referral": {
+                        "patient_name": "Current Patient",
+                        "dedupe_candidates": [referral.id, document.id, valid_duplicate.id],
+                    }
+                },
+                "human_review_queue": [],
+            },
+            error=None,
+        )
+
+        session.refresh(referral)
+        assert referral.duplicate_candidates == [valid_duplicate.id]
+        audit = session.scalar(
+            select(AuditLog).where(
+                AuditLog.entity_id == referral.id,
+                AuditLog.action == "discard_untrusted_dedupe_candidates",
+            )
+        )
+        assert audit is not None
+        assert referral.id in audit.after["discarded_candidates"]
+        assert document.id in audit.after["discarded_candidates"]
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_email_slot_offer_body_is_normalized_to_one_slot_per_option(monkeypatch) -> None:
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "false")
+
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Slot Body Test", slug=_id("slot-body"))
+        therapist = Therapist(tenant_id=tenant.id, name="Dr. Clara Demo", availability_blocks=[])
+        referral = Referral(
+            tenant_id=tenant.id,
+            source_channel="email",
+            raw_text="Email referral.",
+            status="match_approved",
+            patient_name="Anna Anderson",
+            contact_email="lumenpatientdemo@gmail.com",
+            missing_fields=["date_of_birth", "insurer"],
+        )
+        session.add(tenant)
+        session.flush()
+        session.add_all([therapist, referral])
+        session.flush()
+        start_one = datetime(2026, 6, 4, 9, 0, tzinfo=timezone.utc)
+        start_two = datetime(2026, 6, 4, 10, 10, tzinfo=timezone.utc)
+        options = []
+        for index, starts_at in enumerate([start_one, start_two], start=1):
+            options.append(
+                {
+                    "slot_id": f"{therapist.id}:slot-{index}",
+                    "option_code": f"OPT{index}",
+                    "option_number": index,
+                    "therapist_id": therapist.id,
+                    "starts_at": starts_at.isoformat(),
+                    "ends_at": (starts_at + timedelta(minutes=60)).isoformat(),
+                    "modality": "online",
+                }
+            )
+        run = WorkflowRun(
+            id=_id("workflow"),
+            tenant_id=tenant.id,
+            referral_id=referral.id,
+            workflow_type="new_referral",
+            status="running",
+            input_summary="Grouped slots",
+            request_payload={"raw_input": {"source_channel": "email", "appointment_options": options}},
+            approvals={"match_approval": True},
+        )
+        session.add(run)
+        session.flush()
+
+        finish_workflow_run(
+            session,
+            job_id=run.id,
+            status="needs_review",
+            result={
+                "outputs": {
+                    "communication_draft": {
+                        "channel": "email",
+                        "subject": "Appointment availability",
+                        "body": "Option 1: Dr. Clara Demo, Thursday at 09:00 or 10:10. Slot OPT1 / OPT2.",
+                        "proposed_slots": ["OPT1", "OPT2"],
+                        "requires_human_send": True,
+                        "prohibited_content_check_passed": True,
+                    }
+                },
+                "human_review_queue": [],
+            },
+            error=None,
+        )
+
+        draft = session.get(CommunicationDraft, referral.communication_draft_id)
+        assert draft is not None
+        assert len(draft.proposed_slots) == 2
+        assert "Option 1: Dr. Clara Demo, Thursday, 2026-06-04 at 09:00." in draft.body
+        assert "Option 2: Dr. Clara Demo, Thursday, 2026-06-04 at 10:10." in draft.body
+        assert "09:00 or 10:10" not in draft.body
+        assert "date of birth" in draft.body
+        assert "insurer" in draft.body
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_email_referrals_reject_parallel_deterministic_actions(monkeypatch) -> None:
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "false")
+
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Email Deterministic Guard", slug=_id("email-deterministic-guard"))
+        therapist = Therapist(tenant_id=tenant.id, name="Guard Therapist", availability_blocks=[])
+        referral = Referral(
+            tenant_id=tenant.id,
+            source_channel="email",
+            raw_text="Email referral that must stay on LangGraph.",
+            status="needs_admin_review",
+            patient_name="Guard Patient",
+            contact_email="lumenpatientdemo@gmail.com",
+            missing_fields=["date_of_birth"],
+        )
+        session.add(tenant)
+        session.flush()
+        session.add_all([therapist, referral])
+        session.flush()
+        session.add(
+            Appointment(
+                tenant_id=tenant.id,
+                referral_id=referral.id,
+                therapist_id=therapist.id,
+                starts_at=datetime.now(timezone.utc) + timedelta(days=2),
+                ends_at=datetime.now(timezone.utc) + timedelta(days=2, hours=1),
+                status="proposed",
+            )
+        )
+        session.flush()
+
+        guarded = [
+            lambda: prepare_email_referral_followup(session, referral.id),
+            lambda: draft_missing_info_request(session, referral.id),
+            lambda: deterministic_match_for_referral(session, referral.id),
+            lambda: propose_appointment_slots(session, referral.id),
+            lambda: draft_first_contact_message(session, referral.id),
+        ]
+        for action in guarded:
+            with pytest.raises(ValueError, match="canonical LangGraph workflow"):
+                action()
     finally:
         session.rollback()
         session.close()
@@ -772,6 +1407,103 @@ def test_approved_draft_sends_once_and_progresses_referral(monkeypatch) -> None:
         actions = [row.action for row in session.scalars(select(AuditLog).where(AuditLog.tenant_id == tenant.id))]
         assert "provider_send" in actions
         assert "draft_review_approve" in actions
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_send_approval_route_does_not_submit_resume_workflow(monkeypatch) -> None:
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "false")
+    submitted = []
+
+    def fake_submit(request):
+        submitted.append(request)
+        return {"job_id": "unexpected-resume-job", "status": "queued"}
+
+    monkeypatch.setattr(app_module, "jobs", SimpleNamespace(submit=fake_submit))
+
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="No Resume Send Test", slug=_id("no-resume-send"))
+        referral = Referral(
+            tenant_id=tenant.id,
+            source_channel="email",
+            raw_text="Canonical email referral.",
+            status="awaiting_patient_contact",
+            patient_name="No Resume Patient",
+            contact_email="lumenpatientdemo@gmail.com",
+        )
+        run = WorkflowRun(
+            id=_id("workflow"),
+            tenant_id=tenant.id,
+            workflow_type="new_referral",
+            status="needs_review",
+            input_summary="Send approval run",
+            request_payload={"raw_input": {"source_channel": "email"}},
+            approvals={"match_approval": True},
+        )
+        session.add(tenant)
+        session.flush()
+        session.add_all([referral, run])
+        session.flush()
+        run.referral_id = referral.id
+        referral.workflow_run_id = run.id
+        draft = CommunicationDraft(
+            tenant_id=tenant.id,
+            referral_id=referral.id,
+            workflow_run_id=run.id,
+            channel="email",
+            subject="Appointment option",
+            body="Please confirm option 1.",
+            status="draft_pending_review",
+            proposed_slots=["canonical-slot-id"],
+            recipient_email="lumenpatientdemo@gmail.com",
+        )
+        match_task = HumanReviewTask(
+            tenant_id=tenant.id,
+            referral_id=referral.id,
+            workflow_run_id=run.id,
+            task_type="match_approval",
+            status="approved",
+            reason="Match approved.",
+            payload_key="match_recommendation",
+            source_payload={},
+        )
+        session.add_all([draft, match_task])
+        session.flush()
+        task = HumanReviewTask(
+            tenant_id=tenant.id,
+            referral_id=referral.id,
+            workflow_run_id=run.id,
+            task_type="send_approval",
+            status="open",
+            reason="Approve prepared email.",
+            payload_key="communication_draft",
+            source_payload={"id": draft.id},
+            draft_text=draft.body,
+        )
+        session.add(task)
+        session.commit()
+
+        client = TestClient(app_module.app)
+        response = client.post(f"/api/review-tasks/{task.id}/actions", json={"action": "approve", "final_text": "Approved body"})
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["resumed_job"] is None
+        assert submitted == []
+
+        refreshed = session.get(Referral, referral.id)
+        refreshed_draft = session.get(CommunicationDraft, draft.id)
+        refreshed_task = session.get(HumanReviewTask, task.id)
+        session.refresh(refreshed)
+        session.refresh(refreshed_draft)
+        session.refresh(refreshed_task)
+        assert refreshed.status == "contact_sent"
+        assert refreshed_draft.status == "approved_pending_send"
+        assert refreshed_draft.body == "Approved body"
+        assert refreshed_task.status == "approved"
     finally:
         session.rollback()
         session.close()
@@ -1275,6 +2007,20 @@ def test_gmail_missing_info_reply_updates_referral_and_is_idempotent(monkeypatch
         session.flush()
         session.add_all([therapist, referral])
         session.flush()
+        session.add(
+            CommunicationDraft(
+                tenant_id=tenant.id,
+                referral_id=referral.id,
+                channel="email",
+                subject="Missing info",
+                body="Please confirm DOB and insurer.",
+                status="sent",
+                recipient_email="lumenpatientdemo@gmail.com",
+                gmail_thread_id="thread-missing-1",
+                gmail_message_id="sent-missing-info-1",
+            )
+        )
+        session.flush()
 
         message = {
             "message_id": "missing-reply-1",
@@ -1292,7 +2038,7 @@ def test_gmail_missing_info_reply_updates_referral_and_is_idempotent(monkeypatch
         assert referral.date_of_birth == "1990-01-01"
         assert referral.insurer == "Multicare"
         assert referral.missing_fields == []
-        assert referral.status == "awaiting_patient_contact"
+        assert referral.status == "ready_for_matching"
     finally:
         session.rollback()
         session.close()
@@ -1461,6 +2207,106 @@ def test_gmail_reply_can_update_missing_info_and_auto_confirm_accepted_slot(monk
         session.close()
 
 
+def test_gmail_ambiguous_slot_reply_requires_admin_choice_then_confirms(monkeypatch) -> None:
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "true")
+    calendar_calls = []
+
+    def fake_create_event(**kwargs):
+        calendar_calls.append(kwargs)
+        return {"calendar_id": "primary", "event_id": "event-selected-slot", "event_link": "https://calendar.example/selected"}
+
+    monkeypatch.setattr(google_workspace, "query_calendar_busy", lambda **kwargs: [])
+    monkeypatch.setattr(google_workspace, "create_appointment_event", fake_create_event)
+
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Gmail Ambiguous Slot", slug=_id("gmail-ambiguous-slot"))
+        therapist = Therapist(tenant_id=tenant.id, name="Dr. Clara Demo", email="clara.demo1234@gmail.com")
+        referral = Referral(
+            tenant_id=tenant.id,
+            source_channel="email",
+            raw_text="Referral with two held slots.",
+            status="contact_sent",
+            patient_name="Anna Anderson",
+            contact_email="lumenpatientdemo@gmail.com",
+            missing_fields=[],
+        )
+        session.add(tenant)
+        session.flush()
+        session.add_all([therapist, referral])
+        session.flush()
+        start_one = datetime(2026, 6, 4, 9, 0, tzinfo=timezone.utc)
+        start_two = datetime(2026, 6, 4, 10, 10, tzinfo=timezone.utc)
+        appointment_one = Appointment(
+            tenant_id=tenant.id,
+            referral_id=referral.id,
+            therapist_id=therapist.id,
+            starts_at=start_one,
+            ends_at=start_one + timedelta(minutes=60),
+            status="proposed",
+        )
+        appointment_two = Appointment(
+            tenant_id=tenant.id,
+            referral_id=referral.id,
+            therapist_id=therapist.id,
+            starts_at=start_two,
+            ends_at=start_two + timedelta(minutes=60),
+            status="proposed",
+        )
+        session.add_all([appointment_one, appointment_two])
+        session.flush()
+        draft = CommunicationDraft(
+            tenant_id=tenant.id,
+            referral_id=referral.id,
+            channel="email",
+            subject="Appointment options",
+            body="Option 1: 09:00\nOption 2: 10:10",
+            status="sent",
+            proposed_slots=[appointment_one.id, appointment_two.id],
+            gmail_thread_id="thread-ambiguous-1",
+            gmail_message_id="sent-ambiguous-1",
+        )
+        session.add(draft)
+        session.flush()
+
+        result = ingest_gmail_message(
+            session,
+            tenant_id=tenant.id,
+            message={
+                "message_id": "ambiguous-reply-1",
+                "thread_id": "thread-ambiguous-1",
+                "from": "Demo Patient <lumenpatientdemo@gmail.com>",
+                "subject": "Re: appointment options",
+                "body": "Can I proceed with Dr. Clara Demo, Thursday, online session at 09:00 or 10:10?\n\nOn Monday wrote:\n> Option 1: 09:00\n> Option 2: 10:10",
+            },
+        )
+
+        assert result["action"] == "reply_resolution_required"
+        assert result["reply_type"] == "ambiguous_slot"
+        task = session.scalar(
+            select(HumanReviewTask).where(
+                HumanReviewTask.referral_id == referral.id,
+                HumanReviewTask.task_type == "inbound_reply_review",
+                HumanReviewTask.status == "open",
+            )
+        )
+        assert task is not None
+        assert task.source_payload["candidate_appointment_ids"] == [appointment_one.id, appointment_two.id]
+
+        apply_review_action(session, task_id=task.id, action="approve", appointment_id=appointment_two.id)
+
+        session.refresh(appointment_one)
+        session.refresh(appointment_two)
+        assert appointment_one.status == "proposed"
+        assert appointment_two.status == "confirmed"
+        assert appointment_two.google_calendar_event_id == "event-selected-slot"
+        assert len(calendar_calls) == 1
+    finally:
+        session.rollback()
+        session.close()
+
+
 def test_gmail_alternative_reply_supersedes_hold_and_prepares_rebooking(monkeypatch) -> None:
     Base.metadata.create_all(bind=engine)
     monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "false")
@@ -1537,8 +2383,9 @@ def test_gmail_alternative_reply_supersedes_hold_and_prepares_rebooking(monkeypa
 
         appointments = list(session.scalars(select(Appointment).where(Appointment.referral_id == referral.id)))
         assert result["action"] == "rebooking_requested"
+        assert result["replacement"] is None
         assert old_appointment.status == "cancelled"
-        assert any(item.status == "proposed" and item.id != old_appointment.id for item in appointments)
+        assert not any(item.status == "proposed" and item.id != old_appointment.id for item in appointments)
         assert session.scalar(
             select(HumanReviewTask).where(
                 HumanReviewTask.referral_id == referral.id,
@@ -1623,6 +2470,115 @@ def test_gmail_intake_reply_with_attachment_creates_document_review_and_is_idemp
         assert task.task_type == "intake_submission_review"
         assert task.source_payload["document_id"] == document.id
         assert task.source_payload["missing_intake_items"][0]["label"] == "Intake form"
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_gmail_demo_intake_reply_auto_maps_completed_forms_and_marks_ready(monkeypatch) -> None:
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "false")
+
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Demo Intake Auto Map", slug=_id("demo-intake-auto"))
+        therapist = Therapist(tenant_id=tenant.id, name="Demo Intake Therapist")
+        referral = Referral(
+            tenant_id=tenant.id,
+            source_channel="email",
+            raw_text="Referral with the Gmail demo intake packet sent.",
+            status="appointment_confirmed",
+            patient_name="Demo Intake Patient",
+            contact_email="lumenpatientdemo@gmail.com",
+        )
+        template = IntakeTemplate(
+            tenant_id=tenant.id,
+            name="Demo auto-map template",
+            required_items=repository_module.DEMO_GMAIL_INTAKE_REQUIRED_ITEMS,
+        )
+        session.add(tenant)
+        session.flush()
+        session.add_all([therapist, referral, template])
+        session.flush()
+        starts_at = datetime.now(timezone.utc) + timedelta(days=4)
+        session.add(
+            Appointment(
+                tenant_id=tenant.id,
+                referral_id=referral.id,
+                therapist_id=therapist.id,
+                starts_at=starts_at,
+                ends_at=starts_at + timedelta(minutes=60),
+                status="confirmed",
+            )
+        )
+        session.flush()
+        start_intake_for_referral(session, referral.id)
+        referral.status = "intake_packet_sent"
+        session.add(
+            CommunicationDraft(
+                tenant_id=tenant.id,
+                referral_id=referral.id,
+                channel="email",
+                subject="Intake packet",
+                body="Please reply to this same email thread with files attached.",
+                status="sent",
+                gmail_thread_id="intake-thread-demo-auto",
+                gmail_message_id="sent-intake-demo-auto",
+            )
+        )
+        session.flush()
+
+        attachments = [
+            "completed_privacy_notice_acknowledged.docx",
+            "telehealth_consent_completed.docx",
+            "completed_clinical_intake_form.docx",
+            "pre_session_screening_questionnaire_completed.docx",
+        ]
+        result = ingest_gmail_message(
+            session,
+            tenant_id=tenant.id,
+            message={
+                "message_id": "intake-demo-auto-reply-1",
+                "thread_id": "intake-thread-demo-auto",
+                "from": "Demo Patient <lumenpatientdemo@gmail.com>",
+                "subject": "Re: Intake packet",
+                "body": "Completed forms attached.",
+                "attachments": [
+                    {
+                        "file_name": file_name,
+                        "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        "storage_uri": f"storage/uploads/intake/test/{file_name}",
+                        "sha256": f"sha-{index}",
+                        "extracted_text": "Completed demo form",
+                        "download_status": "stored",
+                    }
+                    for index, file_name in enumerate(attachments, start=1)
+                ],
+            },
+        )
+
+        session.refresh(referral)
+        items = list(session.scalars(select(IntakeChecklistItem).where(IntakeChecklistItem.referral_id == referral.id)))
+        consents = list(session.scalars(select(ConsentRecord).where(ConsentRecord.patient_id == referral.patient_id)))
+        review_tasks = list(session.scalars(select(HumanReviewTask).where(HumanReviewTask.referral_id == referral.id)))
+
+        assert result["action"] == "intake_submission_review"
+        assert len(result["document_ids"]) == 4
+        assert result["auto_mapping"]["completed_all_required"] is True
+        assert {item.item_key: item.status for item in items} == {
+            "privacy_notice": "completed",
+            "telehealth_consent": "completed",
+            "intake_form": "completed",
+            "screening_questionnaire": "completed",
+        }
+        assert {consent.scope: consent.status for consent in consents} == {
+            "privacy_notice": "completed",
+            "telehealth": "completed",
+        }
+        assert all(task.status == "completed" for task in review_tasks if task.task_type == "intake_submission_review")
+        assert session.scalar(select(TherapistPrepBrief).where(TherapistPrepBrief.referral_id == referral.id)) is not None
+        assert referral.status == "first_session_ready"
     finally:
         session.rollback()
         session.close()
@@ -1874,7 +2830,12 @@ def test_unsupported_intake_attachment_creates_reviewable_error(monkeypatch) -> 
         assert result["document_ids"] == []
         task = session.get(HumanReviewTask, result["task_id"])
         assert task.source_payload["attachment_errors"][0]["error"] == "Unsupported file type."
-        assert not session.scalar(select(Document).where(Document.document_type == "intake_submission"))
+        assert not session.scalar(
+            select(Document).where(
+                Document.document_type == "intake_submission",
+                Document.patient_id == referral.patient_id,
+            )
+        )
         item = session.scalar(select(IntakeChecklistItem).where(IntakeChecklistItem.referral_id == referral.id))
         assert item.status == "missing"
     finally:

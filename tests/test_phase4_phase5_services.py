@@ -80,7 +80,7 @@ def test_phase4_matching_and_phase5_intake_services() -> None:
 
         missing_referral = Referral(
             tenant_id=tenant.id,
-            source_channel="email",
+            source_channel="webform",
             raw_text="Referral missing contact details.",
             status="new_referral",
             patient_name="Missing Info Patient",
@@ -109,7 +109,7 @@ def test_phase4_matching_and_phase5_intake_services() -> None:
             notes="Patient replied with missing fields.",
         )
         assert missing_reply["reply"]["document_type"] == "missing_info_reply"
-        assert missing_referral.status == "awaiting_patient_contact"
+        assert missing_referral.status == "ready_for_matching"
         assert session.query(HumanReviewTask).filter_by(
             referral_id=missing_referral.id,
             task_type="admin_missing_info_review",

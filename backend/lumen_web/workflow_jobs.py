@@ -16,11 +16,13 @@ from backend.lumen_agentic.graph import build_lumen_graph
 from .db import init_database, session_scope
 from .repositories import (
     append_workflow_event,
+    appointment_options_for_workflow,
     create_referral_for_request,
     create_workflow_run,
     ensure_patient,
     ensure_tenant,
     finish_workflow_run,
+    set_workflow_execution_input,
     therapist_facts_for_tenant,
     update_workflow_status,
     workflow_events_since,
@@ -141,6 +143,7 @@ class WorkflowJobManager:
         self._append_event(job_id, "workflow", "running", "Workflow started.", node="orchestrator")
 
         raw_input = self._raw_input_for_execution(request)
+        self._set_execution_input(job_id, raw_input)
         initial_state = {
             "workflow_id": job_id,
             "workflow_type": request.workflow_type,
@@ -181,9 +184,16 @@ class WorkflowJobManager:
             return raw_input
         with session_scope() as session:
             therapist_profiles = therapist_facts_for_tenant(session, request.tenant_id)
+            appointment_options = appointment_options_for_workflow(session, request.tenant_id, raw_input)
         if therapist_profiles:
             raw_input["therapist_profiles"] = therapist_profiles
+        if appointment_options:
+            raw_input["appointment_options"] = appointment_options
         return raw_input
+
+    def _set_execution_input(self, job_id: str, raw_input: dict[str, Any]) -> None:
+        with self._lock, session_scope() as session:
+            set_workflow_execution_input(session, job_id, raw_input)
 
     def _get_graph(self) -> Any:
         with self._graph_lock:

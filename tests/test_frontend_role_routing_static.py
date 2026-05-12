@@ -76,3 +76,10 @@ def test_dev_identity_switcher_requires_explicit_local_opt_in() -> None:
     assert 'get("devUserSwitcher") === "1"' in app_js
     assert 'localStorage.getItem(DEV_SWITCHER_STORAGE_KEY) === "true"' in app_js
     assert 'refreshProductButton.addEventListener("click", () => refreshWorkspaceForCurrentRole())' in app_js
+
+
+def test_workbench_does_not_render_patient_reply_simulation_controls() -> None:
+    app_js = APP_JS.read_text()
+
+    assert "Simulate accepted reply" not in app_js
+    assert "Simulate declined" not in app_js

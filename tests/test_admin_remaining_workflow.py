@@ -70,7 +70,7 @@ def test_clean_demo_reset_is_idempotent_and_actionable() -> None:
 
         assert first["referral"]["id"] == second["referral"]["id"]
         assert referral["status"] == "needs_admin_review"
-        assert referral["contact_email"] == "lumenpatientdemo@gmail.com"
+        assert referral["contact_email"] == "clean.demo.patient@example.com"
         assert referral["missing_fields"] == ["date_of_birth"]
         assert second["therapist"]["availability_blocks"]
         assert second["intake_template"]["required_items"]

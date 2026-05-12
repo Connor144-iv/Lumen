@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -441,5 +442,5 @@ def test_therapist_spa_entry_routes_are_registered_for_index_html() -> None:
         route = next(item for item in app.routes if getattr(item, "path", None) == path)
         response = route.endpoint(patient_key=DEMO_CLEAN_PATIENT_ID) if "{patient_key}" in path else route.endpoint()
 
-        assert str(response.path).endswith("frontend/index.html")
+        assert Path(response.path).as_posix().endswith("frontend/index.html")
         assert response.media_type == "text/html"
