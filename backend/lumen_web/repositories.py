@@ -25,6 +25,7 @@ from .models import (
     DocumentChunk,
     DocumentationSession,
     DocumentationSessionNote,
+    DocumentationProgressOverview,
     DocumentationSessionText,
     DraftFeedback,
     HumanReviewTask,
@@ -2373,6 +2374,7 @@ def _delete_demo_stage_referral_state(session: Session, *, tenant_id: str) -> di
         session.execute(delete(SessionNote).where(SessionNote.patient_id.in_(ids)))
         session.execute(delete(ReportDraft).where(ReportDraft.patient_id.in_(ids)))
         session.execute(delete(ConsentRecord).where(ConsentRecord.patient_id.in_(ids)))
+        session.execute(delete(DocumentationProgressOverview).where(DocumentationProgressOverview.patient_id.in_(ids)))
     session.execute(
         delete(HumanReviewTask).where(
             HumanReviewTask.tenant_id == tenant_id,

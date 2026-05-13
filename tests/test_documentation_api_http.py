@@ -12,6 +12,7 @@ from app import app
 from backend.lumen_web.db import Base, SessionLocal, engine
 from backend.lumen_web.models import (
     Appointment,
+    DocumentationProgressOverview,
     DocumentationSession,
     DocumentationSessionNote,
     DocumentationSessionText,
@@ -37,6 +38,7 @@ def _prepare_documentation_demo() -> None:
     try:
         session.execute(delete(DocumentationSessionNote))
         session.execute(delete(DocumentationSessionText))
+        session.execute(delete(DocumentationProgressOverview))
         session.execute(delete(DocumentationSession))
         reset_clean_demo_referral(session)
         patient = session.get(Patient, DOC_PATIENT_ID)
@@ -187,10 +189,11 @@ def test_clara_can_use_documentation_api_over_http() -> None:
     assert status == 201
     generated_note = body["note"]
     assert generated_note["status"] == "draft"
-    assert generated_note["note_json"]["version"] == "session_note_v0.1"
+    assert generated_note["note_json"]["version"] == "sessionNoteV0.2"
 
     reviewed_json = dict(generated_note["note_json"])
-    reviewed_json["summary"] = "Reviewed generated note over HTTP."
+    reviewed_json["sessionSummary"]["briefSummary"] = "Reviewed generated note over HTTP."
+    reviewed_json["clinicalImpression"]["summary"] = "Reviewed generated note over HTTP."
     status, _, body = _http_request(
         "PUT",
         f"/api/documentation/notes/{generated_note['id']}/reviewed",
@@ -199,17 +202,24 @@ def test_clara_can_use_documentation_api_over_http() -> None:
     )
     assert status == 200
     assert body["note"]["status"] == "reviewed"
-    assert body["note"]["reviewed_json"]["summary"] == "Reviewed generated note over HTTP."
+    assert body["note"]["reviewed_json"]["sessionSummary"]["briefSummary"] == "Reviewed generated note over HTTP."
+
+    status, _, body = _http_request(
+        "POST",
+        f"/api/documentation/sessions/{doc_session['id']}/delete",
+        user_id=DEMO_CLARA_THERAPIST_USER_ID,
+    )
+    assert status == 200
+    assert body["deleted"]["id"] == doc_session["id"]
+    assert body["deleted"]["text_count"] == 1
+    assert body["deleted"]["note_count"] == 3
 
     status, _, body = _http_request(
         "GET",
         f"/api/documentation/sessions/{doc_session['id']}",
         user_id=DEMO_CLARA_THERAPIST_USER_ID,
     )
-    assert status == 200
-    assert body["session"]["id"] == doc_session["id"]
-    assert [item["id"] for item in body["texts"]] == [text["id"]]
-    assert {item["id"] for item in body["notes"]} >= {generated_note["id"]}
+    assert status == 404
 
 
 def test_admin_can_seed_clara_transcript_only_documentation_sessions() -> None:
@@ -291,6 +301,8 @@ def test_admin_is_denied_documentation_api_over_http() -> None:
         ("POST", "/api/documentation/sessions", {"patient_id": DOC_PATIENT_ID}),
         ("GET", f"/api/documentation/sessions/{doc_session_id}", None),
         ("POST", f"/api/documentation/sessions/{doc_session_id}/texts", {"text": "Blocked."}),
+        ("DELETE", f"/api/documentation/sessions/{doc_session_id}", None),
+        ("POST", f"/api/documentation/sessions/{doc_session_id}/delete", None),
         ("POST", f"/api/documentation/sessions/{doc_session_id}/notes/generate", {}),
         (
             "POST",

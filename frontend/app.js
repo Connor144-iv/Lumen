@@ -47,7 +47,7 @@ const DOCUMENTATION_NOTE_LIST_FIELDS = [
   ["plan", "Plan"],
   ["uncertainty_flags", "Uncertainty flags"],
 ];
-const DOCUMENTATION_NOTE_VERSION = "session_note_v0.1";
+const DOCUMENTATION_NOTE_VERSION = "sessionNoteV0.2";
 const nativeFetch = window.fetch.bind(window);
 const DEV_IDENTITY_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 
@@ -170,6 +170,7 @@ let selectedDocumentationPatientId = null;
 let selectedDocumentationSessionId = null;
 let latestPatientDashboard = null;
 let selectedDashboardPatientKey = null;
+let progressOverviewGenerationInFlight = false;
 let securityContextLoaded = false;
 let selectedReferralId = null;
 let selectedTherapistId = null;
@@ -901,7 +902,7 @@ async function loadMyTherapistPatients() {
     setMyPatientsMessage("");
     renderMyTherapistPatients();
     if (selectedDashboardPatientKey) {
-      await loadPatientDashboard(selectedDashboardPatientKey, { autoGenerateProgress: true });
+      await loadPatientDashboard(selectedDashboardPatientKey);
     }
   } catch (error) {
     currentTherapistPatients = [];
@@ -1125,7 +1126,7 @@ async function saveDocumentationReviewedNote(noteValue, sourceTextId) {
   if (!selectedDocumentationSessionId) return;
   const noteJson =
     noteValue && typeof noteValue === "object" ? noteValue : { summary: typeof noteValue === "string" ? noteValue.trim() : "" };
-  if (!String(noteJson.summary || "").trim()) throw new Error("Reviewed note is required.");
+  if (!String(noteSummary(noteJson)).trim()) throw new Error("Reviewed note is required.");
   const payload = {
     source_text_id: sourceTextId || null,
     note_json: noteJson,
@@ -1158,17 +1159,40 @@ async function generateDocumentationNote(sourceTextId) {
   await loadDocumentationDetail(selectedDocumentationSessionId);
 }
 
-async function uploadDocumentationAudio(sessionId, file) {
+async function deleteDocumentationSession(sessionId) {
+  if (!sessionId) return;
+  let response = await fetch(`/api/documentation/sessions/${encodeURIComponent(sessionId)}/delete`, {
+    method: "POST",
+  });
+  let data = await readResponseBody(response);
+  if (response.status === 404 || response.status === 405) {
+    response = await fetch(`/api/documentation/sessions/${encodeURIComponent(sessionId)}`, {
+      method: "DELETE",
+    });
+    data = await readResponseBody(response);
+  }
+  if (!response.ok) throw new Error(data.detail || "Documentation session could not be deleted.");
+  if (selectedDocumentationSessionId === sessionId) {
+    selectedDocumentationSessionId = null;
+    latestDocumentationDetail = null;
+    sessionStorage.removeItem(DOCUMENTATION_SESSION_STORAGE_KEY);
+  }
+  await loadDocumentationSessions();
+  renderDocumentationDetail();
+}
+
+async function uploadDocumentationSource(sessionId, file) {
   if (!sessionId || !file) return;
   const formData = new FormData();
-  formData.append("audio", file);
-  const response = await fetch(`/api/documentation/sessions/${encodeURIComponent(sessionId)}/audio/transcribe`, {
+  formData.append("file", file);
+  const response = await fetch(`/api/documentation/sessions/${encodeURIComponent(sessionId)}/uploads/extract`, {
     method: "POST",
     body: formData,
   });
   const data = await readResponseBody(response);
-  if (!response.ok) throw new Error(data.detail || "Audio transcription failed.");
+  if (!response.ok) throw new Error(data.detail || "File text extraction failed.");
   await loadDocumentationDetail(sessionId);
+  return data.text;
 }
 
 async function updateDocumentationReviewedNote(noteId, reviewedJson) {
@@ -1234,6 +1258,18 @@ function documentationSessionCard(session) {
   const actions = document.createElement("div");
   actions.className = "actions tight";
   actions.appendChild(actionButton(session.id === selectedDocumentationSessionId ? "Selected" : "Open", () => selectDocumentationSession(session.id)));
+  const deleteButton = actionButton("Delete", async () => {
+    const confirmed = window.confirm(`Delete "${session.title || "Documentation session"}"? This will remove its transcript and notes.`);
+    if (!confirmed) return;
+    setDocumentationMessage("Deleting documentation session...");
+    try {
+      await deleteDocumentationSession(session.id);
+      setDocumentationMessage("Documentation session deleted.");
+    } catch (error) {
+      setDocumentationMessage(friendlyClientError(error), true);
+    }
+  }, "danger compact");
+  actions.appendChild(deleteButton);
   item.appendChild(actions);
   return item;
 }
@@ -1270,11 +1306,11 @@ function renderDocumentationDetail() {
   transcriptInput.placeholder = "Enter transcript or session text.";
   transcriptInput.rows = 16;
   transcriptInput.value = latestText?.text || "";
-  const audioLabel = documentationFieldLabel("Audio file");
-  const audioInput = document.createElement("input");
-  audioInput.type = "file";
-  audioInput.accept = "audio/*";
-  audioLabel.appendChild(audioInput);
+  const uploadLabel = documentationFieldLabel("Transcript source file");
+  const uploadInput = document.createElement("input");
+  uploadInput.type = "file";
+  uploadInput.accept = "audio/*,image/*,application/pdf,.pdf";
+  uploadLabel.appendChild(uploadInput);
   const transcriptActions = document.createElement("div");
   transcriptActions.className = "actions tight";
   const transcriptSubmit = document.createElement("button");
@@ -1283,30 +1319,31 @@ function renderDocumentationDetail() {
   const transcribeButton = document.createElement("button");
   transcribeButton.type = "button";
   transcribeButton.className = "secondary compact";
-  transcribeButton.textContent = "Upload audio and transcribe";
+  transcribeButton.textContent = "Extract text from upload";
   transcribeButton.addEventListener("click", async () => {
-    if (!audioInput.files?.[0]) {
-      setDocumentationMessage("Choose an audio file before transcription.", true);
+    if (!uploadInput.files?.[0]) {
+      setDocumentationMessage("Choose an audio, image, or PDF file before extracting text.", true);
       return;
     }
-    setDocumentationMessage("Transcribing audio...");
+    setDocumentationMessage("Extracting transcript text...");
     transcribeButton.disabled = true;
     transcriptSubmit.disabled = true;
-    audioInput.disabled = true;
-    transcribeButton.textContent = "Transcribing...";
+    uploadInput.disabled = true;
+    transcribeButton.textContent = "Extracting...";
     try {
-      await uploadDocumentationAudio(session.id, audioInput.files[0]);
-      setDocumentationMessage("Audio transcribed. Review and edit the transcript text above.");
+      const text = await uploadDocumentationSource(session.id, uploadInput.files[0]);
+      if (text?.text) transcriptInput.value = text.text;
+      setDocumentationMessage("Text extracted into the transcript field. Review and edit before saving.");
     } catch (error) {
       setDocumentationMessage(friendlyClientError(error), true);
       transcribeButton.disabled = false;
       transcriptSubmit.disabled = false;
-      audioInput.disabled = false;
-      transcribeButton.textContent = "Upload audio and transcribe";
+      uploadInput.disabled = false;
+      transcribeButton.textContent = "Extract text from upload";
     }
   });
   transcriptActions.append(transcriptSubmit, transcribeButton);
-  transcriptForm.append(transcriptInput, audioLabel, transcriptActions);
+  transcriptForm.append(transcriptInput, uploadLabel, transcriptActions);
   transcriptForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     setDocumentationMessage("Saving transcript...");
@@ -1327,7 +1364,7 @@ function renderDocumentationNotePanel(latestText, latestNote) {
   const noteForm = document.createElement("form");
   noteForm.className = "record-item documentation-note-form";
   noteForm.dataset.status = latestNote ? latestNote.status : "pending";
-  noteForm.append(heading("Draft and reviewed note"), pill(latestNote ? latestNote.status : "no draft"));
+  noteForm.append(heading("Session Notes"), pill(latestNote ? latestNote.status : "no draft"));
 
   const draftJson = latestNote?.reviewed_json || latestNote?.note_json || createEmptyDocumentationNoteJson();
   const fields = createDocumentationNoteFields(draftJson);
@@ -1363,7 +1400,7 @@ function renderDocumentationNotePanel(latestText, latestNote) {
   noteForm.append(...fields.elements, actions, raw);
   noteForm.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const reviewedJson = readDocumentationNoteFields(fields.inputs);
+    const reviewedJson = readDocumentationNoteFields(fields.inputs, draftJson);
     setDocumentationMessage("Saving reviewed note...");
     try {
       if (latestNote?.id) {
@@ -1380,13 +1417,14 @@ function renderDocumentationNotePanel(latestText, latestNote) {
 }
 
 function createDocumentationNoteFields(noteJson) {
+  const fieldValues = documentationNoteFieldValues(noteJson);
   const inputs = {};
   const elements = [];
   const summaryLabel = documentationFieldLabel("Summary");
   summaryLabel.classList.add("documentation-note-field", "is-wide");
   const summaryInput = document.createElement("textarea");
   summaryInput.rows = 4;
-  summaryInput.value = noteJson.summary || "";
+  summaryInput.value = fieldValues.summary || "";
   summaryInput.placeholder = "Reviewed session summary.";
   summaryLabel.appendChild(summaryInput);
   inputs.summary = summaryInput;
@@ -1397,7 +1435,7 @@ function createDocumentationNoteFields(noteJson) {
     wrapper.classList.add("documentation-note-field");
     const input = document.createElement("textarea");
     input.rows = key === "uncertainty_flags" ? 3 : 4;
-    input.value = listToLines(noteJson[key]);
+    input.value = listToLines(fieldValues[key]);
     input.placeholder = "One item per line.";
     wrapper.appendChild(input);
     inputs[key] = input;
@@ -1410,7 +1448,7 @@ function createDocumentationNoteFields(noteJson) {
   ["not_assessed", "mentioned", "assessed_denied"].forEach((status) => {
     riskStatus.appendChild(new Option(status.replace("_", " "), status));
   });
-  riskStatus.value = noteJson.risk_or_safety?.status || "not_assessed";
+  riskStatus.value = fieldValues.risk_or_safety?.status || "not_assessed";
   riskStatusLabel.appendChild(riskStatus);
   inputs.risk_status = riskStatus;
   elements.push(riskStatusLabel);
@@ -1419,12 +1457,83 @@ function createDocumentationNoteFields(noteJson) {
   riskDetailsLabel.classList.add("documentation-note-field");
   const riskDetails = document.createElement("textarea");
   riskDetails.rows = 3;
-  riskDetails.value = noteJson.risk_or_safety?.details || "";
+  riskDetails.value = fieldValues.risk_or_safety?.details || "";
   riskDetails.placeholder = "Use source wording when risk or safety was discussed.";
   riskDetailsLabel.appendChild(riskDetails);
   inputs.risk_details = riskDetails;
   elements.push(riskDetailsLabel);
   return { elements, inputs };
+}
+
+function documentationNoteFieldValues(noteJson) {
+  if (noteJson?.version !== "sessionNoteV0.2") return noteJson || {};
+  const risk = noteJson.riskAndSafety || {};
+  const riskDetails = [
+    ...(risk.riskIndicatorsMentioned || []),
+    ...(risk.protectiveIndicatorsMentioned || []),
+    risk.recommendedFollowUp,
+  ].filter(Boolean).join("\n");
+  return {
+    summary: noteSummary(noteJson),
+    key_points_discussed: [
+      ...(noteJson.sessionSummary?.mainClinicalThemes || []),
+      ...(noteJson.presentingConcern?.clientDescription || []),
+      ...flattenNoteItems(noteJson.currentStressors || []),
+    ],
+    presenting_topics: [
+      noteJson.presentingConcern?.primaryConcern,
+      noteJson.presentingConcern?.onsetContext,
+      noteJson.presentingConcern?.durationMentioned,
+      ...flattenNoteItems(noteJson.relevantHistory?.relationships?.relevantEvents || []),
+    ].filter(Boolean),
+    subjective: [
+      ...(noteJson.symptomsAndFunctioning?.emotionalSymptoms || []),
+      ...(noteJson.symptomsAndFunctioning?.cognitiveSymptoms || []),
+      ...(noteJson.symptomsAndFunctioning?.physicalSymptoms || []),
+      ...flattenNoteItems(noteJson.cbtFormulation?.situationExamples || []),
+    ],
+    objective_observations: [
+      noteJson.symptomsAndFunctioning?.educationImpact,
+      noteJson.symptomsAndFunctioning?.workImpact,
+      noteJson.symptomsAndFunctioning?.socialImpact,
+      noteJson.symptomsAndFunctioning?.dailyRoutineImpact,
+    ].filter(Boolean),
+    observed_behavior_patterns: noteJson.symptomsAndFunctioning?.behaviouralPatterns || [],
+    interventions: flattenNoteItems(noteJson.interventionsUsedInSession),
+    patient_response: [
+      noteJson.clientResponseToSession?.engagement,
+      noteJson.clientResponseToSession?.motivation,
+      noteJson.clientResponseToSession?.insight,
+      ...flattenNoteItems(noteJson.clientResponseToSession?.notableResponses || []),
+      ...flattenNoteItems(noteJson.progressSignals?.clientReportedProgress || []),
+      ...flattenNoteItems(noteJson.progressSignals?.observedProgress || []),
+    ].filter(Boolean),
+    recommendations: [
+      ...(noteJson.planAndFollowUp?.possibleHomework || []),
+      ...(noteJson.cbtFormulation?.protectiveFactors || []),
+      ...(noteJson.cbtFormulation?.maintainingFactors || []),
+      ...flattenNoteItems(noteJson.progressSignals?.betweenSessionPractice?.assigned || []),
+    ],
+    follow_up_items: [
+      ...(noteJson.planAndFollowUp?.nextSessionFocus || []),
+      ...flattenNoteItems(noteJson.progressSignals?.nextSessionDecisionPoints || []),
+    ],
+    plan: noteJson.planAndFollowUp?.therapyDirection || [],
+    uncertainty_flags: [
+      ...flattenNoteItems(noteJson.uncertaintyFlags || []),
+      ...flattenNoteItems(noteJson.progressSignals?.openClinicalQuestions || []),
+    ],
+    risk_or_safety: {
+      status: richRiskStatusToLegacy(risk.status),
+      details: riskDetails,
+    },
+  };
+}
+
+function richRiskStatusToLegacy(status) {
+  if (status === "assessed") return "assessed_denied";
+  if (status === "partiallyAssessed") return "mentioned";
+  return "not_assessed";
 }
 
 function documentationFieldLabel(text) {
@@ -1433,56 +1542,209 @@ function documentationFieldLabel(text) {
   return label;
 }
 
-function readDocumentationNoteFields(inputs) {
-  return {
-    version: DOCUMENTATION_NOTE_VERSION,
-    summary: inputs.summary.value.trim(),
-    source_basis: {
-      raw_source_stored: false,
-      input_used: "extracted_session_text",
-    },
-    key_points_discussed: linesToList(inputs.key_points_discussed.value),
-    presenting_topics: linesToList(inputs.presenting_topics.value),
-    subjective: linesToList(inputs.subjective.value),
-    objective_observations: linesToList(inputs.objective_observations.value),
-    observed_behavior_patterns: linesToList(inputs.observed_behavior_patterns.value),
-    interventions: linesToList(inputs.interventions.value),
-    patient_response: linesToList(inputs.patient_response.value),
-    recommendations: linesToList(inputs.recommendations.value),
-    follow_up_items: linesToList(inputs.follow_up_items.value),
-    risk_or_safety: {
-      status: inputs.risk_status.value,
-      details: inputs.risk_details.value.trim(),
-    },
-    plan: linesToList(inputs.plan.value),
-    uncertainty_flags: linesToList(inputs.uncertainty_flags.value),
+function readDocumentationNoteFields(inputs, baseNote = null) {
+  const summary = inputs.summary.value.trim();
+  const keyPoints = linesToList(inputs.key_points_discussed.value);
+  const presentingTopics = linesToList(inputs.presenting_topics.value);
+  const subjective = linesToList(inputs.subjective.value);
+  const objective = linesToList(inputs.objective_observations.value);
+  const behaviourPatterns = linesToList(inputs.observed_behavior_patterns.value);
+  const interventions = linesToList(inputs.interventions.value);
+  const patientResponse = linesToList(inputs.patient_response.value);
+  const recommendations = linesToList(inputs.recommendations.value);
+  const followUps = linesToList(inputs.follow_up_items.value);
+  const plan = linesToList(inputs.plan.value);
+  const uncertaintyFlags = linesToList(inputs.uncertainty_flags.value);
+  const riskDetails = inputs.risk_details.value.trim();
+  const note =
+    baseNote?.version === DOCUMENTATION_NOTE_VERSION
+      ? JSON.parse(JSON.stringify(baseNote))
+      : createEmptyDocumentationNoteJson();
+  note.version = DOCUMENTATION_NOTE_VERSION;
+  note.noteType = note.noteType || "ProgressNote";
+  note.sourceBasis = {
+    ...(note.sourceBasis || {}),
+    rawSourceStored: false,
+    inputUsed: "sessionTranscript",
+    extractionConfidence: note.sourceBasis?.extractionConfidence || "medium",
   };
+  note.sessionSummary = {
+    ...(note.sessionSummary || {}),
+    briefSummary: summary,
+    mainClinicalThemes: keyPoints,
+  };
+  note.presentingConcern = {
+    ...(note.presentingConcern || {}),
+    primaryConcern: presentingTopics[0] || null,
+    onsetContext: presentingTopics[1] || null,
+    durationMentioned: presentingTopics[2] || null,
+    clientDescription: presentingTopics,
+  };
+  note.symptomsAndFunctioning = {
+    ...(note.symptomsAndFunctioning || {}),
+    emotionalSymptoms: subjective,
+    behaviouralPatterns: behaviourPatterns,
+    educationImpact: objective[0] || null,
+    workImpact: objective[1] || null,
+    socialImpact: objective[2] || null,
+    dailyRoutineImpact: objective[3] || null,
+  };
+  note.riskAndSafety = {
+    ...(note.riskAndSafety || {}),
+    status: legacyRiskStatusToRich(inputs.risk_status.value),
+    riskIndicatorsMentioned: riskDetails ? linesToList(riskDetails) : [],
+    recommendedFollowUp: riskDetails || null,
+  };
+  note.interventionsUsedInSession = interventions.map((item) => ({
+    intervention: item,
+    description: item,
+    evidence: [],
+  }));
+  note.clientResponseToSession = {
+    ...(note.clientResponseToSession || {}),
+    engagement: patientResponse[0] || null,
+    notableResponses: patientResponse.slice(1),
+  };
+  note.clinicalImpression = {
+    ...(note.clinicalImpression || {}),
+    summary,
+    diagnosisStatus: note.clinicalImpression?.diagnosisStatus || "notDiagnosedFromTranscript",
+  };
+  note.progressSignals = {
+    ...(note.progressSignals || {}),
+    progressSinceLastSession: patientResponse,
+    setbacksOrBarriers: behaviourPatterns,
+    betweenSessionPractice: {
+      ...(note.progressSignals?.betweenSessionPractice || {}),
+      assigned: recommendations,
+    },
+    observedProgress: objective,
+    clientReportedProgress: patientResponse,
+    openClinicalQuestions: uncertaintyFlags,
+    nextSessionDecisionPoints: followUps,
+  };
+  note.planAndFollowUp = {
+    ...(note.planAndFollowUp || {}),
+    therapyDirection: plan,
+    possibleHomework: recommendations,
+    nextSessionFocus: followUps,
+  };
+  note.uncertaintyFlags = uncertaintyFlags.map((item) => ({
+    item,
+    reason: item,
+  }));
+  return note;
 }
 
 function createEmptyDocumentationNoteJson() {
   return {
     version: DOCUMENTATION_NOTE_VERSION,
-    summary: "",
-    source_basis: {
-      raw_source_stored: false,
-      input_used: "extracted_session_text",
+    noteType: "Unknown",
+    sourceBasis: {
+      rawSourceStored: false,
+      inputUsed: "sessionTranscript",
+      extractionConfidence: "low",
     },
-    key_points_discussed: [],
-    presenting_topics: [],
-    subjective: [],
-    objective_observations: [],
-    observed_behavior_patterns: [],
-    interventions: [],
-    patient_response: [],
-    recommendations: [],
-    follow_up_items: [],
-    risk_or_safety: {
-      status: "not_assessed",
-      details: "",
+    client: {
+      nameUsedInSession: null,
+      roleOrContext: null,
+      demographicsMentioned: [],
     },
-    plan: [],
-    uncertainty_flags: [],
+    sessionSummary: {
+      briefSummary: "",
+      mainClinicalThemes: [],
+    },
+    presentingConcern: {
+      primaryConcern: null,
+      onsetContext: null,
+      durationMentioned: null,
+      clientDescription: [],
+    },
+    relevantHistory: {
+      mentalHealthHistory: {
+        previousEpisodesMentioned: null,
+        details: null,
+      },
+      educationOrWork: {
+        currentStatus: null,
+        context: null,
+        impact: null,
+      },
+      relationships: {
+        relevantEvents: [],
+        impact: null,
+      },
+      familyContext: {
+        livingSituation: null,
+        familyInvolvement: null,
+      },
+    },
+    currentStressors: [],
+    symptomsAndFunctioning: {
+      emotionalSymptoms: [],
+      cognitiveSymptoms: [],
+      physicalSymptoms: [],
+      behaviouralPatterns: [],
+      educationImpact: null,
+      workImpact: null,
+      socialImpact: null,
+      dailyRoutineImpact: null,
+    },
+    cbtFormulation: {
+      situationExamples: [],
+      maintainingFactors: [],
+      protectiveFactors: [],
+      possibleCognitiveDistortions: [],
+      coreBeliefsOrSchemasToExplore: [],
+    },
+    riskAndSafety: {
+      status: "notAssessed",
+      suicidalIdeation: "notAssessed",
+      selfHarm: "notAssessed",
+      homicidalIdeation: "notAssessed",
+      riskIndicatorsMentioned: [],
+      protectiveIndicatorsMentioned: [],
+      recommendedFollowUp: null,
+    },
+    interventionsUsedInSession: [],
+    clientResponseToSession: {
+      engagement: null,
+      motivation: null,
+      insight: null,
+      notableResponses: [],
+    },
+    clinicalImpression: {
+      summary: "",
+      diagnosisStatus: "notDiagnosedFromTranscript",
+      areasForFurtherAssessment: [],
+    },
+    progressSignals: {
+      progressSinceLastSession: [],
+      setbacksOrBarriers: [],
+      betweenSessionPractice: {
+        assigned: [],
+        attempted: [],
+        helped: [],
+        barriers: [],
+      },
+      observedProgress: [],
+      clientReportedProgress: [],
+      openClinicalQuestions: [],
+      nextSessionDecisionPoints: [],
+    },
+    planAndFollowUp: {
+      therapyDirection: [],
+      possibleHomework: [],
+      nextSessionFocus: [],
+    },
+    uncertaintyFlags: [],
   };
+}
+
+function legacyRiskStatusToRich(status) {
+  if (status === "assessed_denied") return "assessed";
+  if (status === "mentioned") return "partiallyAssessed";
+  return "notAssessed";
 }
 
 function listToLines(value) {
@@ -1711,11 +1973,12 @@ function renderProgressOverview(overview) {
     .map((session) => session.session_date || session.created_at)
     .filter(Boolean)
     .sort();
-  const holistic = buildHolisticProgressFields(progress, sessions);
+  const sections = progressOverviewSections(progress);
+  const overviewSummary = progress.overviewSummary || {};
   const item = recordItem({
     title: "Progress overview",
     status: progress.generated_at ? "AI-generated" : "review required",
-    body: progress.summary || "Generate a progress overview after transcripts and notes are ready.",
+    body: overviewSummary.summary || progress.summary || "Generate a progress overview after transcripts and notes are ready.",
     meta: [
       "review required",
       patient.patient_label || patient.display_name,
@@ -1726,28 +1989,140 @@ function renderProgressOverview(overview) {
       progress.generated_at ? formatDate(progress.generated_at) : null,
     ],
   });
-  const lists = document.createElement("div");
-  lists.className = "dashboard-note-grid";
-  holistic.forEach(({ label, values }) => lists.appendChild(noteListBlock(label, values)));
+  const cards = document.createElement("div");
+  cards.className = "progress-overview-card-grid";
+  sections.forEach((section) => cards.appendChild(progressOverviewSectionCard(section)));
   const actions = document.createElement("div");
   actions.className = "actions tight";
   actions.appendChild(actionButton("Refresh Progress Overview", () => generatePatientProgressOverview()));
-  item.append(lists, actions);
+  item.append(cards, actions);
   patientDashboardProgress.replaceChildren(item);
 }
 
+function progressOverviewSections(progress) {
+  const sectionKeys = [
+    ["caseFrame", "Case Frame"],
+    ["longitudinalPatterns", "Patterns Across Sessions"],
+    ["changesSinceIntake", "Change Since Intake"],
+    ["interventionResponse", "Interventions And Response"],
+    ["stuckPointsAndBarriers", "Stuck Points And Barriers"],
+    ["riskAndSafety", "Risk And Safety"],
+    ["openClinicalQuestions", "Open Clinical Questions"],
+    ["nextSessionPriorities", "Next Session Priorities"],
+    ["evidenceGaps", "Evidence Gaps"],
+  ];
+  if (progress?.overviewSummary) {
+    const sections = sectionKeys
+      .map(([key, title]) => normalizeProgressSection(progress[key], title))
+      .filter((section) => section.summary || section.supportingDetails.length || section.evidence.length);
+    return sections.length ? sections : [normalizeProgressSection(progress.overviewSummary, "Overview Summary")];
+  }
+  return buildHolisticProgressFields(progress || {}, latestPatientDashboard?.sessions || []).map(({ label, values }) =>
+    normalizeProgressSection(
+      {
+        title: label,
+        summary: values[0] || "Insufficient documented information to establish a longitudinal pattern.",
+        trajectory: values.length ? "ongoing" : "insufficientData",
+        supportingDetails: values,
+        recommendedFollowUp: null,
+      },
+      label,
+    ),
+  );
+}
+
+function normalizeProgressSection(section, fallbackTitle) {
+  const value = section && typeof section === "object" ? section : {};
+  const details = Array.isArray(value.supportingDetails) ? value.supportingDetails : [];
+  const evidence = Array.isArray(value.evidence)
+    ? value.evidence
+        .map((item) => {
+          if (typeof item === "string") return { detail: humanizeClinicalText(item) };
+          if (!item || typeof item !== "object") return null;
+          return {
+            sessionNumber: item.sessionNumber,
+            date: item.date,
+            detail: humanizeClinicalText(item.detail || item.excerpt || item.summary || ""),
+          };
+        })
+        .filter((item) => item && item.detail)
+    : [];
+  return {
+    title: humanizeClinicalText(value.title || fallbackTitle),
+    summary: humanizeClinicalText(value.summary || "No therapist-reviewed evidence has been synthesized for this section yet."),
+    trajectory: value.trajectory ?? value.status ?? null,
+    supportingDetails: conciseUnique(details.map(humanizeClinicalText), 4),
+    evidence: evidence.slice(0, 3),
+    recommendedFollowUp: value.recommendedFollowUp ? humanizeClinicalText(value.recommendedFollowUp) : null,
+  };
+}
+
+function progressOverviewSectionCard(section) {
+  const card = document.createElement("article");
+  card.className = "progress-overview-card";
+  card.dataset.trajectory = section.trajectory || "unclear";
+  const header = document.createElement("div");
+  header.className = "progress-overview-card-header";
+  const title = document.createElement("h4");
+  title.textContent = section.title;
+  header.appendChild(title);
+  if (section.trajectory) {
+    header.appendChild(pill(humanizeClinicalText(section.trajectory)));
+  }
+  const summary = document.createElement("p");
+  summary.textContent = section.summary;
+  card.append(header, summary);
+  if (section.supportingDetails.length) {
+    const details = document.createElement("ul");
+    section.supportingDetails.forEach((detail) => {
+      const item = document.createElement("li");
+      item.textContent = detail;
+      details.appendChild(item);
+    });
+    card.appendChild(details);
+  }
+  if (section.evidence.length) {
+    const evidence = document.createElement("div");
+    evidence.className = "progress-evidence";
+    const label = document.createElement("span");
+    label.textContent = "Evidence";
+    evidence.appendChild(label);
+    const list = document.createElement("ul");
+    section.evidence.forEach((item) => {
+      const row = document.createElement("li");
+      const source = item.sessionNumber ? `Session ${item.sessionNumber}` : item.date ? formatDate(item.date) : "Reviewed note";
+      row.textContent = `${source}: ${item.detail}`;
+      list.appendChild(row);
+    });
+    evidence.appendChild(list);
+    card.appendChild(evidence);
+  }
+  if (section.recommendedFollowUp) {
+    const followUp = document.createElement("p");
+    followUp.className = "progress-follow-up";
+    followUp.textContent = `Follow-up: ${section.recommendedFollowUp}`;
+    card.appendChild(followUp);
+  }
+  return card;
+}
+
+function humanizeClinicalText(value) {
+  const text = String(value || "").replaceAll("_", " ").replace(/([a-z])([A-Z])/g, "$1 $2").replace(/\s+/g, " ").trim();
+  return text ? text.charAt(0).toUpperCase() + text.slice(1) : "";
+}
+
 function buildHolisticProgressFields(progress, sessions) {
-  const subjective = collectSessionNoteItems(sessions, "subjective");
-  const patientResponse = collectSessionNoteItems(sessions, "patient_response");
+  const subjective = collectSessionNoteItems(sessions, "subjective", "symptomsAndFunctioning.emotionalSymptoms");
+  const patientResponse = collectSessionNoteItems(sessions, "patient_response", "clientResponseToSession.notableResponses");
   const summaries = collectSessionSummaries(sessions);
-  const presentingTopics = collectSessionNoteItems(sessions, "presenting_topics");
-  const keyPoints = collectSessionNoteItems(sessions, "key_points_discussed");
-  const observations = collectSessionNoteItems(sessions, "objective_observations");
-  const followUps = collectSessionNoteItems(sessions, "follow_up_items");
-  const interventions = collectSessionNoteItems(sessions, "interventions");
-  const plan = collectSessionNoteItems(sessions, "plan");
-  const recommendations = collectSessionNoteItems(sessions, "recommendations");
-  const uncertainty = collectSessionNoteItems(sessions, "uncertainty_flags");
+  const presentingTopics = collectSessionNoteItems(sessions, "presenting_topics", "sessionSummary.mainClinicalThemes");
+  const keyPoints = collectSessionNoteItems(sessions, "key_points_discussed", "presentingConcern.clientDescription");
+  const observations = collectSessionNoteItems(sessions, "objective_observations", "symptomsAndFunctioning.behaviouralPatterns");
+  const followUps = collectSessionNoteItems(sessions, "follow_up_items", "planAndFollowUp.nextSessionFocus");
+  const interventions = collectSessionNoteItems(sessions, "interventions", "interventionsUsedInSession");
+  const plan = collectSessionNoteItems(sessions, "plan", "planAndFollowUp.therapyDirection");
+  const recommendations = collectSessionNoteItems(sessions, "recommendations", "planAndFollowUp.possibleHomework");
+  const uncertainty = collectSessionNoteItems(sessions, "uncertainty_flags", "uncertaintyFlags");
   return [
     {
       label: "Overall Mood / Emotional Trends",
@@ -1791,12 +2166,13 @@ function buildHolisticProgressFields(progress, sessions) {
   ];
 }
 
-function collectSessionNoteItems(sessions, key) {
+function collectSessionNoteItems(sessions, key, richPath = null) {
   const values = [];
   sessions.forEach((session) => {
     const note = latestSessionNoteJson(session);
     const items = note[key];
     if (Array.isArray(items)) values.push(...items);
+    if (richPath) values.push(...flattenNoteItems(valueAtPath(note, richPath)));
   });
   return [...new Set(values.filter(Boolean))];
 }
@@ -1807,16 +2183,50 @@ function latestSessionNoteJson(session) {
 
 function collectSessionSummaries(sessions) {
   return sessions
-    .map((session) => latestSessionNoteJson(session).summary || session.generated_note_summary)
+    .map((session) => noteSummary(latestSessionNoteJson(session)) || session.generated_note_summary)
     .filter(Boolean);
 }
 
 function collectRiskSafetyItems(sessions) {
   return sessions
     .map((session) => {
-      const risk = latestSessionNoteJson(session).risk_or_safety || {};
+      const note = latestSessionNoteJson(session);
+      const risk = note.riskAndSafety || note.risk_or_safety || {};
       const status = risk.status ? `Status: ${String(risk.status).replaceAll("_", " ")}` : "";
-      return [status, risk.details].filter(Boolean).join(" - ");
+      const detail = risk.details || risk.recommendedFollowUp || [...(risk.riskIndicatorsMentioned || []), ...(risk.protectiveIndicatorsMentioned || [])].join("; ");
+      return [status, detail].filter(Boolean).join(" - ");
+    })
+    .filter(Boolean);
+}
+
+function noteSummary(note) {
+  return note?.summary || note?.sessionSummary?.briefSummary || note?.clinicalImpression?.summary || "";
+}
+
+function valueAtPath(value, path) {
+  return path.split(".").reduce((current, key) => current?.[key], value);
+}
+
+function flattenNoteItems(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      if (typeof item === "string") return item;
+      if (!item || typeof item !== "object") return "";
+      return (
+        item.description ||
+        item.intervention ||
+        item.item ||
+        item.reason ||
+        item.stressor ||
+        item.clientMeaning ||
+        item.situation ||
+        item.pattern ||
+        item.example ||
+        item.thought ||
+        item.summary ||
+        ""
+      );
     })
     .filter(Boolean);
 }
@@ -1837,10 +2247,11 @@ function noteListBlock(label, values) {
 }
 
 async function generatePatientProgressOverview(options = {}) {
-  if (!selectedDashboardPatientKey) return;
+  if (!selectedDashboardPatientKey || progressOverviewGenerationInFlight) return;
+  progressOverviewGenerationInFlight = true;
   setPatientDashboardMessage(options.auto ? "Updating progress overview..." : "Generating progress overview...");
-  if (options.auto && patientDashboardProgress) {
-    patientDashboardProgress.replaceChildren(emptyState("Updating AI progress overview..."));
+  if (patientDashboardProgress) {
+    patientDashboardProgress.replaceChildren(emptyState("Generating complete progress overview..."));
   }
   try {
     const response = await fetch(
@@ -1849,13 +2260,33 @@ async function generatePatientProgressOverview(options = {}) {
     );
     const data = await readResponseBody(response);
     if (!response.ok) throw new Error(data.detail || "Progress overview could not be generated.");
+    if (!isCompleteProgressOverview(data.progress_overview)) {
+      throw new Error("Progress overview response was incomplete. Please retry after saving reviewed notes.");
+    }
     latestPatientDashboard.progress_overview = data.progress_overview;
     setPatientDashboardMessage(options.auto ? "" : "Progress overview generated.");
     renderPatientDashboard();
   } catch (error) {
     setPatientDashboardMessage(friendlyClientError(error), true);
     renderPatientDashboard();
+  } finally {
+    progressOverviewGenerationInFlight = false;
   }
+}
+
+function isCompleteProgressOverview(progress) {
+  if (!progress || typeof progress !== "object" || !progress.overviewSummary) return false;
+  return [
+    "caseFrame",
+    "longitudinalPatterns",
+    "changesSinceIntake",
+    "interventionResponse",
+    "stuckPointsAndBarriers",
+    "riskAndSafety",
+    "openClinicalQuestions",
+    "nextSessionPriorities",
+    "evidenceGaps",
+  ].every((key) => progress[key] && typeof progress[key] === "object" && "summary" in progress[key]);
 }
 
 function setMyPatientsMessage(message, isError = false) {
@@ -5007,10 +5438,10 @@ function renderCollection(container, items, emptyText, renderer) {
   items.forEach((item) => container.appendChild(renderer(item)));
 }
 
-function actionButton(label, handler) {
+function actionButton(label, handler, className = "secondary compact") {
   const button = document.createElement("button");
   button.type = "button";
-  button.className = "secondary compact";
+  button.className = className;
   button.textContent = label;
   button.addEventListener("click", handler);
   return button;

@@ -18,7 +18,18 @@ def test_documentation_frontend_uses_scoped_current_user_endpoints() -> None:
     assert "/progress-overview/generate" in app_js
     assert "/api/documentation/sessions?patient_id=" in app_js
     assert "/api/documentation/sessions/" in app_js
-    assert "/audio/transcribe" in app_js
+    assert "/uploads/extract" in app_js
+
+
+def test_progress_refresh_uses_complete_response_and_loading_state() -> None:
+    app_js = APP_JS.read_text()
+
+    assert "progressOverviewGenerationInFlight" in app_js
+    assert 'patientDashboardProgress.replaceChildren(emptyState("Generating complete progress overview..."))' in app_js
+    assert "isCompleteProgressOverview(data.progress_overview)" in app_js
+    assert "throw new Error(\"Progress overview response was incomplete" in app_js
+    assert "latestPatientDashboard.progress_overview = data.progress_overview" in app_js
+    assert "if (section.trajectory)" in app_js
 
 
 def test_documentation_frontend_does_not_render_old_manual_identity_controls() -> None:
@@ -51,7 +62,7 @@ def test_frontend_marks_admin_and_therapist_workspaces_for_role_routing() -> Non
     assert 'href="/new-referral" data-nav data-admin-only hidden' in index_html
     assert "refreshWorkspaceForCurrentRole" in app_js
     assert 'class="workspace-grid therapist-patients-grid"' in index_html
-    assert "Back to Dashboard" in index_html
+    assert "Patient Overview" in index_html
     assert "/patients/:patientKey/dashboard" in app_js
     assert "openDocumentationSessionFromDashboard" in app_js
     assert "lumen.documentation.selectedSession" in app_js

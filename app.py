@@ -24,13 +24,14 @@ from backend.lumen_web.documentation import (
     documentation_patient_dashboard_for_therapist,
     documentation_patients_overview_for_therapist,
     documentation_session_detail_for_therapist,
+    delete_documentation_session_for_therapist,
+    extract_documentation_session_upload_for_therapist,
     generate_progress_overview_for_therapist,
     generate_documentation_note_for_therapist,
     list_documentation_patients_for_therapist,
     list_documentation_sessions_for_therapist,
     save_reviewed_documentation_note_for_therapist,
     save_reviewed_documentation_note_update_for_therapist,
-    transcribe_documentation_session_audio_for_therapist,
     update_documentation_session_text_for_therapist,
 )
 from backend.lumen_web.model_health import check_configured_models
@@ -889,6 +890,45 @@ async def documentation_session_get(session_id: str, request: Request) -> dict[s
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@app.delete("/api/documentation/sessions/{session_id}")
+async def documentation_session_delete(session_id: str, request: Request) -> dict[str, Any]:
+    return _delete_documentation_session(session_id, request)
+
+
+@app.delete("/api/documentation/sessions/{session_id}/")
+async def documentation_session_delete_slash(session_id: str, request: Request) -> dict[str, Any]:
+    return _delete_documentation_session(session_id, request)
+
+
+@app.post("/api/documentation/sessions/{session_id}/delete")
+async def documentation_session_delete_action(session_id: str, request: Request) -> dict[str, Any]:
+    return _delete_documentation_session(session_id, request)
+
+
+@app.post("/api/documentation/sessions/{session_id}/delete/")
+async def documentation_session_delete_action_slash(session_id: str, request: Request) -> dict[str, Any]:
+    return _delete_documentation_session(session_id, request)
+
+
+def _delete_documentation_session(session_id: str, request: Request) -> dict[str, Any]:
+    try:
+        with session_scope() as session:
+            therapist = _current_active_therapist(session, request)
+            return {
+                "deleted": delete_documentation_session_for_therapist(
+                    session,
+                    therapist_id=therapist["id"],
+                    documentation_session_id=session_id,
+                )
+            }
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/documentation/sessions/{session_id}/texts", status_code=201)
 async def documentation_session_text_create(
     session_id: str,
@@ -916,22 +956,29 @@ async def documentation_session_text_create(
 
 @app.post("/api/documentation/sessions/{session_id}/audio/transcribe", status_code=201)
 async def documentation_session_audio_transcribe(session_id: str, request: Request) -> dict[str, Any]:
+    return await documentation_session_upload_extract(session_id, request)
+
+
+@app.post("/api/documentation/sessions/{session_id}/uploads/extract", status_code=201)
+async def documentation_session_upload_extract(session_id: str, request: Request) -> dict[str, Any]:
     try:
         form = await request.form()
-        audio = form.get("audio")
-        if audio is None or not hasattr(audio, "read"):
-            raise ValueError("Audio file is required.")
-        audio_bytes = await audio.read()
-        filename = getattr(audio, "filename", None) or "session-audio"
+        upload = form.get("file") or form.get("audio")
+        if upload is None or not hasattr(upload, "read"):
+            raise ValueError("Upload file is required.")
+        file_bytes = await upload.read()
+        filename = getattr(upload, "filename", None) or "session-upload"
+        content_type = getattr(upload, "content_type", None)
         with session_scope() as session:
             therapist = _current_active_therapist(session, request)
             return {
-                "text": transcribe_documentation_session_audio_for_therapist(
+                "text": extract_documentation_session_upload_for_therapist(
                     session,
                     therapist_id=therapist["id"],
                     documentation_session_id=session_id,
-                    audio_bytes=audio_bytes,
+                    file_bytes=file_bytes,
                     filename=filename,
+                    content_type=content_type,
                 )
             }
     except PermissionError as exc:

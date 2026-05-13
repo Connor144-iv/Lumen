@@ -440,6 +440,18 @@ class DocumentationSessionNote(Base, TimestampMixin):
     reviewer_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
 
 
+class DocumentationProgressOverview(Base, TimestampMixin):
+    __tablename__ = "documentation_progress_overviews"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), nullable=False, index=True)
+    patient_id: Mapped[str] = mapped_column(ForeignKey("patients.id"), nullable=False, index=True)
+    therapist_id: Mapped[str] = mapped_column(ForeignKey("therapists.id"), nullable=False, index=True)
+    overview_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    source_metadata: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
 class ReferralImportBatch(Base, TimestampMixin):
     __tablename__ = "referral_import_batches"
 
