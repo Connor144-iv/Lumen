@@ -146,6 +146,7 @@ def test_overview_system_and_workbench_trace_static_contracts() -> None:
     assert "Select a referral in Workbench to inspect persisted agent activity" in index_html
     assert 'id="workbench-gmail-sync-button"' in index_html
     assert "workbenchGmailSyncButton.addEventListener" in app_js
+    assert "const referralId = body.referral?.id || body.referral_id" in app_js
 
     assert 'operationSection("Advanced trace"' in app_js
     assert "renderWorkbenchAdvancedTrace" in app_js

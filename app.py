@@ -1752,12 +1752,14 @@ def gmail_inbox_convert(body: GmailInboxConvertRequest, request: Request) -> dic
                 tenant_id=body.tenant_id or DEMO_TENANT_ID,
             )
         if prepared["status"] == "already_converted":
+            job_id = prepared.get("job_id")
             return {
                 "status": "already_converted",
                 "conversion_status": "already_converted",
-                "job_id": prepared.get("job_id"),
+                "job_id": job_id,
                 "referral_id": prepared.get("referral_id"),
-                "events_url": f"/api/events/{prepared['job_id']}" if prepared.get("job_id") else None,
+                "status_url": f"/api/status/{job_id}" if job_id else None,
+                "events_url": f"/api/events/{job_id}" if job_id else None,
                 "referral": prepared.get("referral"),
                 "document": prepared.get("document"),
             }

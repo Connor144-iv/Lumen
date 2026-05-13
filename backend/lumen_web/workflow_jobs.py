@@ -21,7 +21,9 @@ from .repositories import (
     create_workflow_run,
     ensure_patient,
     ensure_tenant,
+    finish_deterministic_email_initial_handoff,
     finish_workflow_run,
+    recover_stale_workflow_runs,
     set_workflow_execution_input,
     therapist_facts_for_tenant,
     update_workflow_status,
@@ -95,6 +97,8 @@ class WorkflowJobManager:
 
     def __init__(self, max_workers: int | None = None) -> None:
         init_database()
+        with session_scope() as session:
+            recover_stale_workflow_runs(session)
         workers = max_workers or int(os.getenv("LUMEN_WORKER_COUNT", "2"))
         self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lumen-workflow")
         self._lock = Lock()
@@ -126,6 +130,13 @@ class WorkflowJobManager:
                 message="Workflow queued for background execution.",
                 node="queue",
             )
+            if self._uses_deterministic_email_handoff(request):
+                finish_deterministic_email_initial_handoff(
+                    session,
+                    job_id=job_id,
+                    raw_input=request.raw_input,
+                )
+                return workflow_snapshot(session, job_id)
 
         self._executor.submit(self._run_job, job_id, request)
         return self.snapshot(job_id)
@@ -161,7 +172,21 @@ class WorkflowJobManager:
         final_state: dict[str, Any] | None = None
 
         try:
+            self._append_event(
+                job_id,
+                "workflow",
+                "running",
+                "Preparing agent graph and model runtime.",
+                node="graph_setup",
+            )
             graph = self._get_graph()
+            self._append_event(
+                job_id,
+                "workflow",
+                "running",
+                "Agent graph ready; starting workflow execution.",
+                node="graph_setup",
+            )
             for snapshot in graph.stream(initial_state, stream_mode="values"):
                 final_state = json_safe(snapshot)
                 self._ingest_snapshot(job_id, final_state, tracker)
@@ -190,6 +215,11 @@ class WorkflowJobManager:
         if appointment_options:
             raw_input["appointment_options"] = appointment_options
         return raw_input
+
+    def _uses_deterministic_email_handoff(self, request: WorkflowRequest) -> bool:
+        if request.workflow_type != "new_referral":
+            return False
+        return str((request.raw_input or {}).get("source_channel") or "").strip().lower() == "email"
 
     def _set_execution_input(self, job_id: str, raw_input: dict[str, Any]) -> None:
         with self._lock, session_scope() as session:

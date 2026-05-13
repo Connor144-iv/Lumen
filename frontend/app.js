@@ -3683,7 +3683,7 @@ async function loadReviewTasks() {
   if (overviewReviewList) {
     renderCollection(overviewReviewList, latestReviewTasks.slice(0, 4), "No open review tasks.", (task) =>
       recordItem({
-        title: friendlyTaskType(task.task_type),
+        title: friendlyTaskTitle(task),
         status: task.status,
         body: task.reason,
         meta: [task.payload_key, task.referral_id ? `referral ${shortId(task.referral_id)}` : "no referral"],
@@ -3704,11 +3704,11 @@ function escalationCard(item) {
   const referral = item.referral || {};
   const task = item.task || {};
   const card = recordItem({
-    title: referral.patient_name || friendlyTaskType(task.task_type) || "Escalation",
+    title: referral.patient_name || friendlyTaskTitle(task) || "Escalation",
     status: item.status || task.status || referral.status,
     body: item.reason || task.reason || "Escalation requires admin recovery.",
     meta: [
-      item.type === "review_task" ? friendlyTaskType(task.task_type) : "Referral escalation",
+      item.type === "review_task" ? friendlyTaskTitle(task) : "Referral escalation",
       referral.id ? `referral ${shortId(referral.id)}` : null,
       item.updated_at ? formatDate(item.updated_at) : null,
     ],
@@ -3758,7 +3758,7 @@ async function loadIntakeTracker() {
 
 function reviewTaskCard(task) {
   const item = recordItem({
-    title: friendlyTaskType(task.task_type),
+    title: friendlyTaskTitle(task),
     status: task.status,
     body: task.reason,
     meta: [
@@ -3819,7 +3819,9 @@ function reviewTaskCard(task) {
     return item;
   }
   const approveLabel =
-    task.task_type === "send_approval"
+    isEmailInitialFactsTask(task)
+      ? "Approve facts"
+      : task.task_type === "send_approval"
       ? "Send email to patient"
       : task.task_type === "appointment_confirmation_approval"
         ? "Create Google Calendar event"
@@ -4731,7 +4733,8 @@ async function convertGmailInboxMessage(documentId) {
     return;
   }
   await refreshProductWorkspace();
-  if (body.referral?.id) {
+  const referralId = body.referral?.id || body.referral_id;
+  if (referralId) {
     if (body.job_id && body.events_url && body.status_url) {
       resetRunState();
       if (jobIdLabel) jobIdLabel.textContent = body.job_id;
@@ -4740,7 +4743,7 @@ async function convertGmailInboxMessage(documentId) {
       openEventStream(body.job_id, body.events_url);
       startPolling(body.status_url);
     }
-    await openReferralWorkbench(body.referral.id);
+    await openReferralWorkbench(referralId);
   }
 }
 
@@ -5611,6 +5614,17 @@ function friendlyTaskType(value) {
     report_signoff: "Report signoff",
   };
   return labels[value] || String(value || "review task").replaceAll("_", " ");
+}
+
+function isEmailInitialFactsTask(task) {
+  return (
+    task?.task_type === "admin_missing_info_review" &&
+    (task?.payload_key === "email_initial_facts" || task?.source_payload?.review_mode === "email_initial_facts")
+  );
+}
+
+function friendlyTaskTitle(task) {
+  return isEmailInitialFactsTask(task) ? "Extracted facts review" : friendlyTaskType(task?.task_type);
 }
 
 function shortId(value) {

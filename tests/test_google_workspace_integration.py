@@ -35,6 +35,7 @@ from backend.lumen_web.models import (
 from backend.lumen_web.repositories import (
     apply_review_action,
     appointment_options_for_workflow,
+    approval_payload_for_task,
     continue_email_referral_workflow,
     create_intake_template_file,
     create_referral_for_request,
@@ -42,6 +43,7 @@ from backend.lumen_web.repositories import (
     draft_first_contact_message,
     draft_intake_packet,
     draft_missing_info_request,
+    finish_deterministic_email_initial_handoff,
     finish_workflow_run,
     generate_missing_intake_reminder,
     generate_prep_brief,
@@ -50,6 +52,7 @@ from backend.lumen_web.repositories import (
     list_intake_templates,
     prepare_email_referral_followup,
     propose_appointment_slots,
+    recover_stale_workflow_runs,
     referral_detail,
     record_missing_info_reply,
     request_appointment_reschedule,
@@ -58,6 +61,7 @@ from backend.lumen_web.repositories import (
     start_intake_for_referral,
     therapist_calendar_capacity,
 )
+from backend.lumen_web.workflow_jobs import WorkflowJobManager, WorkflowRequest
 
 
 def _id(prefix: str) -> str:
@@ -267,6 +271,38 @@ def test_new_gmail_from_existing_patient_email_stays_unmatched_without_reply_con
                 Document.document_type == "inbound_email_unmatched",
             )
         )
+        tasks = list(session.scalars(select(HumanReviewTask).where(HumanReviewTask.task_type == "inbound_reply_review")))
+        assert all((task.source_payload or {}).get("message_id") != result["message_id"] for task in tasks)
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_true_unmatched_gmail_reply_still_creates_admin_review_task() -> None:
+    Base.metadata.create_all(bind=engine)
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Gmail True Unmatched", slug=_id("gmail-true-unmatched"))
+        session.add(tenant)
+        session.flush()
+
+        result = ingest_gmail_message(
+            session,
+            tenant_id=tenant.id,
+            message={
+                "message_id": f"unmatched-reply-{uuid4()}",
+                "thread_id": "unknown-thread",
+                "from": "Unknown Patient <unknown@example.test>",
+                "subject": "Re: follow up",
+                "body": "Can someone call me about the previous message?",
+            },
+        )
+
+        assert result["action"] == "unmatched"
+        assert result["task_id"]
+        task = session.get(HumanReviewTask, result["task_id"])
+        assert task is not None
+        assert task.task_type == "inbound_reply_review"
     finally:
         session.rollback()
         session.close()
@@ -395,7 +431,7 @@ def test_gmail_inbox_convert_starts_referral_workflow(monkeypatch) -> None:
         session.close()
 
 
-def test_email_referral_placeholder_does_not_create_premature_missing_info_task() -> None:
+def test_email_referral_creation_applies_deterministic_facts_without_premature_task() -> None:
     Base.metadata.create_all(bind=engine)
     session = SessionLocal()
     try:
@@ -418,14 +454,96 @@ def test_email_referral_placeholder_does_not_create_premature_missing_info_task(
         )
 
         assert referral is not None
-        assert referral.status == "normalising"
-        assert referral.patient_name is None
+        assert referral.status == "needs_admin_review"
+        assert referral.patient_name == "Ben"
         assert referral.contact_email == "lumenpatientdemo@gmail.com"
-        assert referral.missing_fields == []
+        assert referral.missing_fields == ["date_of_birth", "contact_phone", "insurer", "referring_entity"]
         assert session.scalar(select(HumanReviewTask).where(HumanReviewTask.referral_id == referral.id)) is None
     finally:
         session.rollback()
         session.close()
+
+
+def test_email_workflow_manager_finishes_initial_facts_gate_without_langgraph(monkeypatch) -> None:
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "false")
+    tenant_id = _id("tenant")
+    manager = WorkflowJobManager(max_workers=1)
+    monkeypatch.setattr(
+        manager._executor,
+        "submit",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("email handoff should not submit LangGraph job")),
+    )
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=tenant_id, name="Sync Email Handoff", slug=_id("sync-email"))
+        therapist = Therapist(tenant_id=tenant.id, name="Sync Email Therapist")
+        session.add(tenant)
+        session.flush()
+        session.add(therapist)
+        session.commit()
+
+        job = manager.submit(
+            WorkflowRequest(
+                workflow_type="new_referral",
+                tenant_id=tenant_id,
+                raw_input={
+                    "source_channel": "email",
+                    "raw_text": (
+                        "From: lumenpatientdemo@gmail.com\n"
+                        "Subject: Therapy request\n"
+                        "My name is Simon Cowell. I need help with work stress."
+                    ),
+                    "sender": "lumenpatientdemo@gmail.com",
+                    "contact_email": "lumenpatientdemo@gmail.com",
+                },
+            )
+        )
+
+        referral = session.get(Referral, job["referral_id"])
+        facts_task = session.scalar(
+            select(HumanReviewTask).where(
+                HumanReviewTask.referral_id == job["referral_id"],
+                HumanReviewTask.task_type == "admin_missing_info_review",
+            )
+        )
+        match_task = session.scalar(
+            select(HumanReviewTask).where(
+                HumanReviewTask.referral_id == job["referral_id"],
+                HumanReviewTask.task_type == "match_approval",
+            )
+        )
+        run = session.get(WorkflowRun, job["job_id"])
+        assert job["status"] == "needs_review"
+        assert run is not None
+        assert run.status == "needs_review"
+        assert run.error is None
+        assert referral is not None
+        assert referral.patient_name == "Simon Cowell"
+        assert referral.status == "needs_admin_review"
+        assert referral.match_summary == {}
+        assert facts_task is not None
+        assert facts_task.status == "open"
+        assert facts_task.payload_key == "email_initial_facts"
+        assert facts_task.source_payload["review_mode"] == "email_initial_facts"
+        assert match_task is None
+
+        apply_review_action(session, task_id=facts_task.id, action="approve")
+
+        session.refresh(referral)
+        match_task = session.scalar(
+            select(HumanReviewTask).where(
+                HumanReviewTask.referral_id == job["referral_id"],
+                HumanReviewTask.task_type == "match_approval",
+            )
+        )
+        assert referral.status == "match_recommended"
+        assert referral.match_summary["ranked_matches"][0]["therapist_id"] == therapist.id
+        assert match_task is not None
+        assert match_task.status == "open"
+    finally:
+        session.close()
+        manager._executor.shutdown(wait=False)
 
 
 def test_gmail_patient_demo_reset_removes_email_referral_and_clears_inbound_doc() -> None:
@@ -908,7 +1026,7 @@ def test_gmail_demo_intake_packet_sends_all_seeded_docx_attachments(monkeypatch)
         shutil.rmtree(asset_dir, ignore_errors=True)
 
 
-def test_running_email_workflow_returns_active_canonical_state_without_deterministic_side_effects(monkeypatch) -> None:
+def test_running_email_workflow_uses_deterministic_state_before_model_finishes(monkeypatch) -> None:
     Base.metadata.create_all(bind=engine)
     monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "false")
     session = SessionLocal()
@@ -943,7 +1061,6 @@ def test_running_email_workflow_returns_active_canonical_state_without_determini
             ),
         )
         assert referral is not None
-        referral.duplicate_candidates = ["demo-duplicate-candidate"]
         run = WorkflowRun(
             id=_id("workflow"),
             tenant_id=tenant.id,
@@ -960,46 +1077,45 @@ def test_running_email_workflow_returns_active_canonical_state_without_determini
 
         detail = referral_detail(session, referral.id)
         packet = detail["workbench_state"]["email_workflow"]
-        assert detail["patient_name"] is None
+        assert detail["patient_name"] == "Ben Anderson"
+        assert detail["missing_fields"] == ["date_of_birth", "contact_phone", "insurer", "referring_entity"]
         assert packet["next_action"] == "wait_extraction"
+        assert packet["next_action_label"] == "Waiting for extraction"
 
         result = continue_email_referral_workflow(session, referral.id)
 
         assert result["status"] == "running"
         assert result["result"]["action"] == "wait"
         session.refresh(referral)
-        assert referral.patient_name is None
-        assert referral.duplicate_candidates == ["demo-duplicate-candidate"]
+        assert referral.patient_name == "Ben Anderson"
         appointments = list(session.scalars(select(Appointment).where(Appointment.referral_id == referral.id)))
         drafts = list(session.scalars(select(CommunicationDraft).where(CommunicationDraft.referral_id == referral.id)))
         tasks = list(session.scalars(select(HumanReviewTask).where(HumanReviewTask.referral_id == referral.id)))
         assert appointments == []
         assert drafts == []
         assert tasks == []
-        assert session.scalar(select(AuditLog).where(AuditLog.entity_id == referral.id, AuditLog.action == "deterministic_email_extract")) is None
-        assert session.scalar(
-            select(AuditLog).where(AuditLog.entity_id == referral.id, AuditLog.action == "demo_bypass_email_duplicate_candidates")
-        ) is None
+        assert session.scalar(select(AuditLog).where(AuditLog.entity_id == referral.id, AuditLog.action == "deterministic_email_extract")) is not None
     finally:
         session.rollback()
         session.close()
 
 
-def test_stale_email_workflow_exposes_retry_action() -> None:
+def test_stale_email_workflow_recovers_to_facts_review() -> None:
     Base.metadata.create_all(bind=engine)
     session = SessionLocal()
     try:
         tenant = Tenant(id=_id("tenant"), name="Stale Workflow Test", slug=_id("stale-workflow"))
+        therapist = Therapist(tenant_id=tenant.id, name="Stale Match Therapist")
         referral = Referral(
             tenant_id=tenant.id,
             source_channel="email",
-            raw_text="Email referral text.",
+            raw_text="From: lumenpatientdemo@gmail.com\nSubject: Therapy request\nMy name is Ben Anderson. I need help with work stress.",
             status="normalising",
             contact_email="lumenpatientdemo@gmail.com",
         )
         session.add(tenant)
         session.flush()
-        session.add(referral)
+        session.add_all([therapist, referral])
         session.flush()
         run = WorkflowRun(
             id=_id("workflow"),
@@ -1022,9 +1138,164 @@ def test_stale_email_workflow_exposes_retry_action() -> None:
 
         session.refresh(run)
         session.refresh(referral)
-        assert run.status == "failed"
+        task = session.scalar(select(HumanReviewTask).where(HumanReviewTask.referral_id == referral.id, HumanReviewTask.task_type == "admin_missing_info_review"))
+        assert run.status == "needs_review"
+        assert run.error is None
+        assert referral.patient_name == "Ben Anderson"
         assert referral.status == "needs_admin_review"
-        assert detail["workbench_state"]["email_workflow"]["next_action"] == "retry_extraction"
+        assert referral.match_summary == {}
+        assert task is not None
+        assert task.status == "open"
+        assert task.payload_key == "email_initial_facts"
+        assert task.source_payload["review_mode"] == "email_initial_facts"
+        assert detail["workbench_state"]["primary_action"] == "review_gate"
+        assert detail["workbench_state"]["primary_action_label"] == "Review extracted facts"
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_failed_named_email_workflow_recovers_to_facts_review() -> None:
+    Base.metadata.create_all(bind=engine)
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Stale Email Fallback", slug=_id("stale-email-fallback"))
+        therapist = Therapist(tenant_id=tenant.id, name="Recovered Email Therapist")
+        raw_text = "From: lumenpatientdemo@gmail.com\nSubject: Therapy request\nMy name is Ben Anderson. I need help with work stress."
+        referral = Referral(
+            tenant_id=tenant.id,
+            source_channel="email",
+            raw_text=raw_text,
+            status="needs_admin_review",
+            patient_name="Ben Anderson",
+            contact_email="lumenpatientdemo@gmail.com",
+            missing_fields=["date_of_birth", "contact_phone", "insurer", "referring_entity"],
+            risk_category="none",
+            urgency="standard",
+        )
+        session.add(tenant)
+        session.flush()
+        session.add_all([therapist, referral])
+        session.flush()
+        run = WorkflowRun(
+            id=_id("workflow"),
+            tenant_id=tenant.id,
+            referral_id=referral.id,
+            workflow_type="new_referral",
+            status="failed",
+            input_summary="Email referral text.",
+            request_payload={"raw_input": {"source_channel": "email", "raw_text": raw_text}},
+            approvals={},
+            error="Workflow was still running; deterministic email facts were applied.",
+        )
+        old_time = datetime.now(timezone.utc) - timedelta(minutes=5)
+        run.created_at = old_time
+        run.updated_at = old_time
+        referral.workflow_run_id = run.id
+        session.add(run)
+        session.flush()
+
+        result = recover_stale_workflow_runs(session)
+        detail = referral_detail(session, referral.id)
+
+        session.refresh(run)
+        session.refresh(referral)
+        task = session.scalar(select(HumanReviewTask).where(HumanReviewTask.referral_id == referral.id, HumanReviewTask.task_type == "admin_missing_info_review"))
+        assert result["recovered"] >= 1
+        assert run.status == "needs_review"
+        assert run.error is None
+        assert referral.patient_name == "Ben Anderson"
+        assert referral.status == "needs_admin_review"
+        assert referral.missing_fields == ["date_of_birth", "contact_phone", "insurer", "referring_entity"]
+        assert referral.match_summary == {}
+        assert task is not None
+        assert task.status == "open"
+        assert task.payload_key == "email_initial_facts"
+        assert task.source_payload["review_mode"] == "email_initial_facts"
+        assert detail["workbench_state"]["primary_action"] == "review_gate"
+        assert detail["workbench_state"]["primary_action_label"] == "Review extracted facts"
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_stale_queued_email_workflow_recovers_on_startup_recovery() -> None:
+    Base.metadata.create_all(bind=engine)
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Queued Email Recovery", slug=_id("queued-email-recovery"))
+        therapist = Therapist(tenant_id=tenant.id, name="Queued Recovery Therapist")
+        raw_text = "From: lumenpatientdemo@gmail.com\nSubject: Therapy request\nMy name is Simon Cowell. I need help with work stress."
+        referral = Referral(
+            tenant_id=tenant.id,
+            source_channel="email",
+            raw_text=raw_text,
+            status="normalising",
+            contact_email="lumenpatientdemo@gmail.com",
+        )
+        session.add(tenant)
+        session.flush()
+        session.add_all([therapist, referral])
+        session.flush()
+        run = WorkflowRun(
+            id=_id("workflow"),
+            tenant_id=tenant.id,
+            referral_id=referral.id,
+            workflow_type="new_referral",
+            status="queued",
+            input_summary="Email referral text.",
+            request_payload={"raw_input": {"source_channel": "email", "raw_text": raw_text}},
+            approvals={},
+        )
+        old_time = datetime.now(timezone.utc) - timedelta(minutes=3)
+        run.created_at = old_time
+        run.updated_at = old_time
+        referral.workflow_run_id = run.id
+        session.add(run)
+        session.flush()
+
+        result = recover_stale_workflow_runs(session)
+
+        session.refresh(run)
+        session.refresh(referral)
+        task = session.scalar(select(HumanReviewTask).where(HumanReviewTask.referral_id == referral.id, HumanReviewTask.task_type == "admin_missing_info_review"))
+        assert result["recovered"] >= 1
+        assert run.status == "needs_review"
+        assert run.error is None
+        assert referral.patient_name == "Simon Cowell"
+        assert referral.status == "needs_admin_review"
+        assert referral.missing_fields == ["date_of_birth", "contact_phone", "insurer", "referring_entity"]
+        assert referral.match_summary == {}
+        assert task is not None
+        assert task.status == "open"
+        assert task.payload_key == "email_initial_facts"
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_email_workbench_normalises_model_missing_field_aliases() -> None:
+    Base.metadata.create_all(bind=engine)
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Email Missing Alias", slug=_id("email-missing-alias"))
+        referral = Referral(
+            tenant_id=tenant.id,
+            source_channel="email",
+            raw_text="My name is Simon Cowell. I need an appointment.",
+            status="needs_admin_review",
+            patient_name="Simon Cowell",
+            contact_email="lumenpatientdemo@gmail.com",
+            missing_fields=["date_of_birth", "phone", "referral_date", "insurer", "referring_entity", "contact_phone"],
+        )
+        session.add(tenant)
+        session.flush()
+        session.add(referral)
+        session.flush()
+
+        detail = referral_detail(session, referral.id)
+
+        assert detail["missing_fields"] == ["date_of_birth", "contact_phone", "insurer", "referring_entity"]
     finally:
         session.rollback()
         session.close()
@@ -1063,8 +1334,258 @@ def test_email_missing_fields_continue_on_canonical_workflow() -> None:
         state = detail["workbench_state"]
 
         assert state["primary_action"] == "continue_email_workflow"
-        assert state["primary_action_label"] == "Draft missing-info email"
+        assert state["primary_action_label"] == "Continue from email"
         assert state["email_workflow"]["next_action"] == "continue_email_workflow"
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_email_extraction_with_missing_fields_creates_facts_review_not_match_or_draft() -> None:
+    Base.metadata.create_all(bind=engine)
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Email Match Gate", slug=_id("email-match-gate"))
+        therapist = Therapist(tenant_id=tenant.id, name="Email Match Therapist")
+        referral = Referral(
+            tenant_id=tenant.id,
+            source_channel="email",
+            raw_text="My name is Simon Anderson. I need help with work stress.",
+            status="normalising",
+            contact_email="lumenpatientdemo@gmail.com",
+        )
+        session.add(tenant)
+        session.flush()
+        session.add_all([therapist, referral])
+        session.flush()
+        run = WorkflowRun(
+            id=_id("workflow"),
+            tenant_id=tenant.id,
+            referral_id=referral.id,
+            workflow_type="new_referral",
+            status="running",
+            input_summary="Email referral extracted missing fields.",
+            request_payload={"raw_input": {"source_channel": "email", "raw_text": referral.raw_text}},
+            approvals={},
+        )
+        session.add(run)
+        session.flush()
+
+        finish_deterministic_email_initial_handoff(
+            session,
+            job_id=run.id,
+            raw_input={"source_channel": "email", "raw_text": referral.raw_text, "sender": "lumenpatientdemo@gmail.com"},
+        )
+
+        session.refresh(referral)
+        tasks = list(session.scalars(select(HumanReviewTask).where(HumanReviewTask.referral_id == referral.id)))
+        drafts = list(session.scalars(select(CommunicationDraft).where(CommunicationDraft.referral_id == referral.id)))
+        assert referral.patient_name == "Simon Anderson"
+        assert referral.missing_fields == ["date_of_birth", "contact_phone", "insurer", "referring_entity"]
+        assert referral.status == "needs_admin_review"
+        assert referral.match_summary == {}
+        assert [task.task_type for task in tasks] == ["admin_missing_info_review"]
+        assert tasks[0].payload_key == "email_initial_facts"
+        assert tasks[0].source_payload["review_mode"] == "email_initial_facts"
+        assert drafts == []
+        state = referral_detail(session, referral.id)["workbench_state"]
+        assert state["primary_action"] == "review_gate"
+        assert state["primary_action_label"] == "Review extracted facts"
+        assert state["email_workflow"]["next_action"] == "review_gate"
+
+        apply_review_action(session, task_id=tasks[0].id, action="approve")
+
+        session.refresh(referral)
+        match_task = session.scalar(
+            select(HumanReviewTask).where(
+                HumanReviewTask.referral_id == referral.id,
+                HumanReviewTask.task_type == "match_approval",
+            )
+        )
+        assert referral.status == "match_recommended"
+        assert referral.match_summary["ranked_matches"][0]["therapist_id"] == therapist.id
+        assert match_task is not None
+        assert match_task.status == "open"
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_email_missing_fields_continue_prepares_combined_first_contact_when_match_is_ready() -> None:
+    Base.metadata.create_all(bind=engine)
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Email Missing Draft", slug=_id("email-missing-draft"))
+        therapist = Therapist(
+            tenant_id=tenant.id,
+            name="Email Missing Therapist",
+            availability_blocks=[{"weekday": "Monday", "start": "09:00", "end": "12:00"}],
+        )
+        referral = Referral(
+            tenant_id=tenant.id,
+            source_channel="email",
+            raw_text="My name is Simon Anderson. I need an appointment.",
+            status="match_approved",
+            patient_name="Simon Anderson",
+            contact_email="lumenpatientdemo@gmail.com",
+            missing_fields=["date_of_birth", "insurer"],
+        )
+        session.add(tenant)
+        session.flush()
+        session.add_all([therapist, referral])
+        session.flush()
+        referral.match_summary = {"ranked_matches": [{"therapist_id": therapist.id, "name": therapist.name}]}
+        run = WorkflowRun(
+            id=_id("workflow"),
+            tenant_id=tenant.id,
+            referral_id=referral.id,
+            workflow_type="new_referral",
+            status="running",
+            input_summary="Email referral resume",
+            request_payload={"raw_input": {"source_channel": "email", "raw_text": referral.raw_text}},
+            approvals={"match_approval": True},
+        )
+        session.add(run)
+        session.flush()
+
+        state = referral_detail(session, referral.id)["workbench_state"]
+        assert state["primary_action"] == "continue_email_workflow"
+        assert state["primary_action_label"] == "Review prepared email"
+
+        result = continue_email_referral_workflow(session, referral.id)
+
+        session.refresh(run)
+        draft = session.scalar(select(CommunicationDraft).where(CommunicationDraft.referral_id == referral.id))
+        task = session.scalar(
+            select(HumanReviewTask).where(
+                HumanReviewTask.referral_id == referral.id,
+                HumanReviewTask.task_type == "send_approval",
+            )
+        )
+        assert result["status"] == "prepared"
+        assert result["result"]["action"] == "first_contact_prepared"
+        assert run.status == "failed"
+        assert "Superseded" in (run.error or "")
+        assert draft is not None
+        assert draft.proposed_slots
+        assert "Option 1" in draft.body
+        assert "date of birth" in draft.body
+        assert "insurer" in draft.body
+        assert task is not None
+        assert task.task_type == "send_approval"
+        assert (
+            session.scalar(
+                select(HumanReviewTask).where(
+                    HumanReviewTask.referral_id == referral.id,
+                    HumanReviewTask.task_type == "admin_missing_info_review",
+                )
+            )
+            is None
+        )
+
+        next_state = referral_detail(session, referral.id)["workbench_state"]
+        assert next_state["primary_action"] == "review_prepared_email"
+        assert next_state["primary_action_label"] == "Review prepared email"
+    finally:
+        session.rollback()
+        session.close()
+
+
+def test_email_match_approval_with_missing_fields_creates_combined_first_contact_without_resume(monkeypatch) -> None:
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "true")
+    send_calls = []
+
+    def fake_send(**kwargs):
+        send_calls.append(kwargs)
+        return {"message_id": "gmail-first-contact-1", "thread_id": "thread-first-contact-1"}
+
+    monkeypatch.setattr(google_workspace, "send_approved_draft", fake_send)
+    session = SessionLocal()
+    try:
+        tenant = Tenant(id=_id("tenant"), name="Email Match Approval", slug=_id("email-match-approval"))
+        therapist = Therapist(
+            tenant_id=tenant.id,
+            name="Email Approved Therapist",
+            email="approved.therapist@example.com",
+            availability_blocks=[{"weekday": "Tuesday", "start": "09:00", "end": "13:00"}],
+        )
+        referral = Referral(
+            tenant_id=tenant.id,
+            source_channel="email",
+            raw_text="My name is Simon Anderson. I need an appointment.",
+            status="match_recommended",
+            patient_name="Simon Anderson",
+            contact_email="lumenpatientdemo@gmail.com",
+            missing_fields=["date_of_birth", "insurer"],
+        )
+        session.add(tenant)
+        session.flush()
+        session.add_all([therapist, referral])
+        session.flush()
+        referral.match_summary = {"ranked_matches": [{"therapist_id": therapist.id, "name": therapist.name}]}
+        run = WorkflowRun(
+            id=_id("workflow"),
+            tenant_id=tenant.id,
+            referral_id=referral.id,
+            workflow_type="new_referral",
+            status="needs_review",
+            input_summary="Email referral match",
+            request_payload={"raw_input": {"source_channel": "email", "raw_text": referral.raw_text}},
+            approvals={},
+        )
+        session.add(run)
+        session.flush()
+        task = HumanReviewTask(
+            tenant_id=tenant.id,
+            workflow_run_id=run.id,
+            referral_id=referral.id,
+            task_type="match_approval",
+            status="open",
+            reason="Approve therapist match.",
+            payload_key="match_recommendation",
+            source_payload=referral.match_summary,
+        )
+        session.add(task)
+        session.flush()
+
+        approved = apply_review_action(session, task_id=task.id, action="approve")
+
+        draft = session.scalar(select(CommunicationDraft).where(CommunicationDraft.referral_id == referral.id))
+        send_task = session.scalar(
+            select(HumanReviewTask).where(
+                HumanReviewTask.referral_id == referral.id,
+                HumanReviewTask.task_type == "send_approval",
+            )
+        )
+        appointments = list(session.scalars(select(Appointment).where(Appointment.referral_id == referral.id)))
+        assert approved.status == "approved"
+        assert approval_payload_for_task(session, approved) is None
+        assert draft is not None
+        assert draft.proposed_slots == [appointment.id for appointment in appointments]
+        assert "Option 1" in draft.body
+        assert "date of birth" in draft.body
+        assert "insurer" in draft.body
+        assert send_task is not None
+        assert send_task.status == "open"
+        apply_review_action(session, task_id=send_task.id, action="approve")
+        session.refresh(draft)
+        session.refresh(referral)
+        assert len(send_calls) == 1
+        assert send_calls[0]["recipient_email"] == "lumenpatientdemo@gmail.com"
+        assert draft.status == "sent"
+        assert draft.gmail_message_id == "gmail-first-contact-1"
+        assert draft.gmail_thread_id == "thread-first-contact-1"
+        assert referral.status == "contact_sent"
+        assert (
+            session.scalar(
+                select(HumanReviewTask).where(
+                    HumanReviewTask.referral_id == referral.id,
+                    HumanReviewTask.task_type == "admin_missing_info_review",
+                )
+            )
+            is None
+        )
     finally:
         session.rollback()
         session.close()
@@ -1340,7 +1861,8 @@ def test_email_workflow_persists_agent_draft_slots_and_canonical_send_gate(monke
 
         detail = referral_detail(session, referral.id)
         packet = detail["workbench_state"]["email_workflow"]
-        assert packet["next_action"] == "send_email"
+        assert packet["next_action"] == "review_prepared_email"
+        assert packet["next_action_label"] == "Review prepared email"
         assert packet["held_appointment"]["id"] == appointments[0].id
         assert packet["draft"]["id"] == draft.id
         assert packet["facts"]["missing_fields"] == ["date_of_birth"]
@@ -2589,11 +3111,16 @@ def test_gmail_reply_can_update_missing_info_and_auto_confirm_accepted_slot(monk
             status="contact_sent",
             patient_name="Gmail Accept Patient",
             contact_email="lumenpatientdemo@gmail.com",
-            missing_fields=["date_of_birth"],
+            missing_fields=["date_of_birth", "contact_phone", "insurer", "referring_entity"],
+        )
+        template = IntakeTemplate(
+            tenant_id=tenant.id,
+            name="Auto-confirm intake template",
+            required_items=[{"key": "intake_form", "label": "Intake form", "type": "form"}],
         )
         session.add(tenant)
         session.flush()
-        session.add_all([therapist, referral])
+        session.add_all([therapist, referral, template])
         session.flush()
         starts_at = datetime.now(timezone.utc) + timedelta(days=4)
         appointment = Appointment(
@@ -2628,18 +3155,48 @@ def test_gmail_reply_can_update_missing_info_and_auto_confirm_accepted_slot(monk
                 "thread_id": "thread-accepted-1",
                 "from": "Demo Patient <lumenpatientdemo@gmail.com>",
                 "subject": "Re: first appointment",
-                "body": "DOB: 1990-01-01. I can attend option 1.",
+                "body": (
+                    "I can attend option 1. DOB: 1990-01-01. "
+                    "Phone: +351 912 345 678. Insurer: Multicare. Referrer: Dr Silva."
+                ),
             },
         )
 
         assert result["action"] == "appointment_auto_confirmed"
         assert result["reply_type"] == "accepted_slot"
-        assert result["missing_updates"] == {"date_of_birth": "1990-01-01"}
+        assert result["missing_updates"] == {
+            "date_of_birth": "1990-01-01",
+            "contact_phone": "+351 912 345 678",
+            "insurer": "Multicare",
+            "referring_entity": "Dr Silva",
+        }
         assert referral.date_of_birth == "1990-01-01"
+        assert referral.contact_phone == "+351 912 345 678"
+        assert referral.insurer == "Multicare"
+        assert referral.referring_entity == "Dr Silva"
         assert referral.missing_fields == []
         assert appointment.status == "confirmed"
         assert appointment.google_calendar_event_id == "event-gmail-accept"
         assert len(calendar_calls) == 1
+        assert calendar_calls[0]["therapist_email"] == "therapist@example.com"
+        assert (
+            session.scalar(
+                select(HumanReviewTask).where(
+                    HumanReviewTask.referral_id == referral.id,
+                    HumanReviewTask.task_type == "appointment_confirmation_approval",
+                )
+            )
+            is None
+        )
+        intake_task = session.scalar(
+            select(HumanReviewTask).where(
+                HumanReviewTask.referral_id == referral.id,
+                HumanReviewTask.task_type == "send_approval",
+                HumanReviewTask.payload_key.like("intake_packet_draft:%"),
+            )
+        )
+        assert intake_task is not None
+        assert session.scalar(select(IntakeChecklistItem).where(IntakeChecklistItem.referral_id == referral.id)) is not None
     finally:
         session.rollback()
         session.close()
