@@ -1,0 +1,199 @@
+{
+  "correct": [
+    {
+      "id": "synthetic-0090",
+      "true_label": "none",
+      "predicted_label": "none",
+      "confidence": 0.26869720220565796,
+      "recommended_future_route": "clinician_review",
+      "text": "Subject: new referral\nFrom: self referral\n\nCliente refere preocupacao geral e cansaco, mas diz sentir-se seguro em casa.\nPreferred modality: online se possivel. Availability: after 17:00."
+    },
+    {
+      "id": "synthetic-0048",
+      "true_label": "unclear",
+      "predicted_label": "unclear",
+      "confidence": 0.3407481014728546,
+      "recommended_future_route": "clinician_review",
+      "text": "Copied notes:\n- concern: Intake has crossed-out notes about crisis but the final wording is unclear.\n- insurer: insurance unclear\n- admin note: No previous therapy listed.\n\nAdditional unstructured note: Texto copiado de email com erros."
+    },
+    {
+      "id": "synthetic-0185",
+      "true_label": "none",
+      "predicted_label": "none",
+      "confidence": 0.3051575720310211,
+      "recommended_future_route": "clinician_review",
+      "text": "Copied notes:\n- concern: Estudante quer apoio para organizacao, sono e ansiedade antes dos exames.\n- insurer: insurance unclear\n- admin note: Patient prefers Portuguese."
+    },
+    {
+      "id": "synthetic-0176",
+      "true_label": "unclear",
+      "predicted_label": "unclear",
+      "confidence": 0.3677882254123688,
+      "recommended_future_route": "clinician_review",
+      "text": "Copied notes:\n- concern: Encaminhamento diz 'urgente por favor' sem motivo nem historico de risco.\n- insurer: Multicare\n- admin note: Need admin cleanup before booking."
+    },
+    {
+      "id": "synthetic-0004",
+      "true_label": "self_harm_or_suicidality",
+      "predicted_label": "self_harm_or_suicidality",
+      "confidence": 0.24760355055332184,
+      "recommended_future_route": "clinician_review",
+      "text": "GP referral note - presenting issue: Client disclosed self-harm urges and cannot agree to stay safe. Please triage for appropriate pathway."
+    },
+    {
+      "id": "synthetic-0058",
+      "true_label": "unclear",
+      "predicted_label": "unclear",
+      "confidence": 0.36213579773902893,
+      "recommended_future_route": "clinician_review",
+      "text": "WEBFORM ENTRY\nReason for referral: Formulario tem notas riscadas sobre crise, mas a versao final e pouco clara.\nLanguage: Portuguese. Contact details: email + phone."
+    },
+    {
+      "id": "synthetic-0081",
+      "true_label": "unclear",
+      "predicted_label": "unclear",
+      "confidence": 0.2446536272764206,
+      "recommended_future_route": "clinician_review",
+      "text": "Subject: new referral\nFrom: private clinic\n\nMensagem diz que o cliente esta mal e a familia preocupada, seguranca nao avaliada.\nPreferred modality: in person. Availability: flexible."
+    },
+    {
+      "id": "synthetic-0270",
+      "true_label": "none",
+      "predicted_label": "none",
+      "confidence": 0.3234997093677521,
+      "recommended_future_route": "clinician_review",
+      "text": "WEBFORM ENTRY\nReason for referral: Pessoa adulta procura apoio por stress e insonia, nega pensamentos de se magoar.\nLanguage: Portuguese. Contact details: contacto parcial."
+    },
+    {
+      "id": "synthetic-0202",
+      "true_label": "acute_crisis",
+      "predicted_label": "acute_crisis",
+      "confidence": 0.3504900336265564,
+      "recommended_future_route": "clinician_review",
+      "text": "Short message from referrer: GP note: acute deterioration, no food for two days, crisis team may be needed . pls call when possible . Referrer sent duplicate attachment ."
+    },
+    {
+      "id": "synthetic-0275",
+      "true_label": "none",
+      "predicted_label": "none",
+      "confidence": 0.36857396364212036,
+      "recommended_future_route": "clinician_review",
+      "text": "Copied notes:\n- concern: Parent requests support for adolescent social anxiety, stable at home and school .\n- insurer: AdvanceCare\n- admin note: Referrer sent duplicate attachment ."
+    },
+    {
+      "id": "synthetic-0064",
+      "true_label": "acute_crisis",
+      "predicted_label": "acute_crisis",
+      "confidence": 0.3461940884590149,
+      "recommended_future_route": "clinician_review",
+      "text": "Copied notes:\n- concern: Family says patient is hearing voices, highly agitated, and needs same-day review .\n- insurer: insurance unclear\n- admin note: DOB missing .\n\nAdditional unstructured note: No previous therapy listed."
+    },
+    {
+      "id": "synthetic-0031",
+      "true_label": "unclear",
+      "predicted_label": "unclear",
+      "confidence": 0.39321956038475037,
+      "recommended_future_route": "clinician_review",
+      "text": "Short message from referrer: Referral says 'urgent please' with no reason and no risk history included. pls call when possible. Texto copiado de email com erros."
+    }
+  ],
+  "incorrect": [
+    {
+      "id": "synthetic-0148",
+      "true_label": "unclear",
+      "predicted_label": "self_harm_or_suicidality",
+      "confidence": 0.24509160220623016,
+      "recommended_future_route": "clinician_review",
+      "text": "INTAKE SUMMARY\nMensagem diz que o cliente esta mal e a familia preocupada, seguranca nao avaliada.\nRisk field copied from source; spelling and detail may be incomplete.\n\nAdditional unstructured note: No previous therapy listed."
+    },
+    {
+      "id": "synthetic-0119",
+      "true_label": "self_harm_or_suicidality",
+      "predicted_label": "none",
+      "confidence": 0.3062070310115814,
+      "recommended_future_route": "clinician_review",
+      "text": "Copied notes:\n- concern: Encaminhamento refere pensamentos suicidas recentes e necessidade de apoio urgente .\n- insurer: private pay\n- admin note: Texto copiado de email com erros ."
+    },
+    {
+      "id": "synthetic-0046",
+      "true_label": "acute_crisis",
+      "predicted_label": "unclear",
+      "confidence": 0.27315396070480347,
+      "recommended_future_route": "clinician_review",
+      "text": "INTAKE SUMMARY\nPedido urgente porque o cliente esta a escalar e nao consegue acalmar.\nRisk field copied from source; spelling and detail may be incomplete."
+    },
+    {
+      "id": "synthetic-0199",
+      "true_label": "acute_crisis",
+      "predicted_label": "self_harm_or_suicidality",
+      "confidence": 0.28478071093559265,
+      "recommended_future_route": "clinician_review",
+      "text": "GP referral note - presenting issue: Encaminhamento diz que a pessoa anda confusa na rua e nao consegue cuidar de si. Please triage for appropriate pathway."
+    },
+    {
+      "id": "synthetic-0012",
+      "true_label": "safeguarding_or_abuse",
+      "predicted_label": "self_harm_or_suicidality",
+      "confidence": 0.22700445353984833,
+      "recommended_future_route": "clinician_review",
+      "text": "WEBFORM ENTRY\nReason for referral: Professor esta preocupado que uma crianca esteja insegura apos revelar abuso.\nLanguage: Portuguese. Contact details: phone missing."
+    },
+    {
+      "id": "synthetic-0280",
+      "true_label": "safeguarding_or_abuse",
+      "predicted_label": "acute_crisis",
+      "confidence": 0.25529929995536804,
+      "recommended_future_route": "clinician_review",
+      "text": "Short message from referrer: Teacher is concerned a child may be unsafe due to bruises and disclosure of abuse. pls call when possible. Referrer sent duplicate attachment."
+    },
+    {
+      "id": "synthetic-0254",
+      "true_label": "none",
+      "predicted_label": "unclear",
+      "confidence": 0.29925110936164856,
+      "recommended_future_route": "clinician_review",
+      "text": "WEBFORM ENTRY\nReason for referral: GP referral for low mood after a breakup; risk was assessed and denied.\nLanguage: English. Contact details: needs confirmation.\n\nAdditional unstructured note: Texto copiado de email com erros."
+    },
+    {
+      "id": "synthetic-0190",
+      "true_label": "acute_crisis",
+      "predicted_label": "self_harm_or_suicidality",
+      "confidence": 0.28478071093559265,
+      "recommended_future_route": "clinician_review",
+      "text": "GP referral note - presenting issue: Encaminhamento diz que a pessoa anda confusa na rua e nao consegue cuidar de si . Please triage for appropriate pathway ."
+    },
+    {
+      "id": "synthetic-0112",
+      "true_label": "safeguarding_or_abuse",
+      "predicted_label": "none",
+      "confidence": 0.27895548939704895,
+      "recommended_future_route": "clinician_review",
+      "text": "WEBFORM ENTRY\nReason for referral: Assistente social pede terapia mas sinaliza risco continuo no agregado familiar.\nLanguage: Portuguese. Contact details: email + phone."
+    },
+    {
+      "id": "synthetic-0299",
+      "true_label": "none",
+      "predicted_label": "unclear",
+      "confidence": 0.26584237813949585,
+      "recommended_future_route": "clinician_review",
+      "text": "WEBFORM ENTRY\nReason for referral: GP referral for low mood after a breakup; risk was assessed and denied .\nLanguage: English . Contact details: phone missing ."
+    },
+    {
+      "id": "synthetic-0212",
+      "true_label": "none",
+      "predicted_label": "acute_crisis",
+      "confidence": 0.2592308521270752,
+      "recommended_future_route": "clinician_review",
+      "text": "WEBFORM ENTRY\nReason for referral: Adult referral for work stress and mild anxiety, no safety concerns reported .\nLanguage: English . Contact details: contacto parcial .\n\nAdditional unstructured note: Patient prefers Portuguese."
+    },
+    {
+      "id": "synthetic-0109",
+      "true_label": "acute_crisis",
+      "predicted_label": "self_harm_or_suicidality",
+      "confidence": 0.2901591658592224,
+      "recommended_future_route": "clinician_review",
+      "text": "Short message from referrer: Encaminhamento diz que a pessoa anda confusa na rua e nao consegue cuidar de si. pls call when possible. DOB missing."
+    }
+  ],
+  "route_false_negatives": []
+}

@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+outputs/trainer_runs/
+models/*/checkpoint-*/
+models/*/*.safetensors
+models/*/*.bin
+models/*/*.pt
+models/*/*.pth

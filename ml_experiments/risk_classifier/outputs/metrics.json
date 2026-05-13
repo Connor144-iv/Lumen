@@ -1,0 +1,20 @@
+{
+  "total_rows": 60,
+  "confidence_threshold": 0.7,
+  "accuracy": 0.75,
+  "macro_precision": 0.7861036838978015,
+  "macro_recall": 0.75,
+  "macro_f1": 0.7460904885902913,
+  "risk_class_exact_recall": 0.75,
+  "risk_route_recall": 1.0,
+  "route_false_negative_count": 0,
+  "label_false_negative_count": 2,
+  "risk_support": 48,
+  "labels": [
+    "none",
+    "self_harm_or_suicidality",
+    "acute_crisis",
+    "safeguarding_or_abuse",
+    "unclear"
+  ]
+}

@@ -1,0 +1,8 @@
+# Isolated ML experiment dependencies.
+# Do not install these into the Lumen app runtime unless the classifier is integrated later.
+torch>=2.5
+transformers>=4.45
+accelerate>=0.34
+scikit-learn>=1.5
+numpy>=1.26
+

@@ -1,0 +1,6 @@
+true_label\predicted_label,none,self_harm_or_suicidality,acute_crisis,safeguarding_or_abuse,unclear
+none,9,0,1,0,2
+self_harm_or_suicidality,1,11,0,0,0
+acute_crisis,0,3,7,0,2
+safeguarding_or_abuse,1,1,1,7,2
+unclear,0,1,0,0,11

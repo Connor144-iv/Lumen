@@ -1,0 +1,31 @@
+{
+  "labels": [
+    "none",
+    "self_harm_or_suicidality",
+    "acute_crisis",
+    "safeguarding_or_abuse",
+    "unclear"
+  ],
+  "label2id": {
+    "none": 0,
+    "self_harm_or_suicidality": 1,
+    "acute_crisis": 2,
+    "safeguarding_or_abuse": 3,
+    "unclear": 4
+  },
+  "id2label": {
+    "0": "none",
+    "1": "self_harm_or_suicidality",
+    "2": "acute_crisis",
+    "3": "safeguarding_or_abuse",
+    "4": "unclear"
+  },
+  "risk_labels": [
+    "self_harm_or_suicidality",
+    "acute_crisis",
+    "safeguarding_or_abuse",
+    "unclear"
+  ],
+  "confidence_threshold": 0.7,
+  "future_route_rule": "Only label=none with confidence >= threshold may continue; all other results route to clinician_review."
+}

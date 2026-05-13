@@ -1,0 +1,991 @@
+id,language,source_style,label,text
+synthetic-0001,en,gp_letter,safeguarding_or_abuse,GP referral note - presenting issue: Parent reports elder abuse concerns and coercion around medication. Please triage for appropriate pathway.
+synthetic-0002,en,email,none,"Subject: new referral
+From: school counsellor
+
+GP referral for low mood after a breakup; risk was assessed and denied.
+Preferred modality: online. Availability: sexta de manha."
+synthetic-0003,pt,mixed_notes,none,"Copied notes:
+- concern: Cliente refere preocupacao geral e cansaco, mas diz sentir-se seguro em casa.
+- insurer: AdvanceCare
+- admin note: Texto copiado de email com erros."
+synthetic-0004,en,gp_letter,self_harm_or_suicidality,GP referral note - presenting issue: Client disclosed self-harm urges and cannot agree to stay safe. Please triage for appropriate pathway.
+synthetic-0005,en,intake_note,unclear,"INTAKE SUMMARY
+Referral text is fragmented: safe? not safe? client did not complete risk section.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0006,pt,webform,acute_crisis,"WEBFORM ENTRY
+Reason for referral: Encaminhamento diz que a pessoa anda confusa na rua e nao consegue cuidar de si.
+Language: Portuguese. Contact details: email + phone."
+synthetic-0007,pt,intake_note,safeguarding_or_abuse,"INTAKE SUMMARY
+Formulario indica possivel abuso sexual que exige revisao de salvaguarda .
+Risk field copied from source; spelling and detail may be incomplete ."
+synthetic-0008,en,sms,unclear,"Short message from referrer: Message says the client is struggling and family is worried, safety not assessed. pls call when possible. Patient prefers Portuguese.
+
+Additional unstructured note: Texto copiado de email com erros."
+synthetic-0009,pt,gp_letter,none,"GP referral note - presenting issue: Encaminhamento por luto recente, com suporte familiar e sem risco agudo. Please triage for appropriate pathway."
+synthetic-0010,pt,gp_letter,acute_crisis,"GP referral note - presenting issue: Nota do medico: deterioracao aguda, sem comer ha dois dias, possivel equipa de crise. Please triage for appropriate pathway."
+synthetic-0011,pt,intake_note,acute_crisis,"INTAKE SUMMARY
+Paciente esta em crise grave, desorientado e sem dormir ha varios dias.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0012,pt,webform,safeguarding_or_abuse,"WEBFORM ENTRY
+Reason for referral: Professor esta preocupado que uma crianca esteja insegura apos revelar abuso.
+Language: Portuguese. Contact details: phone missing."
+synthetic-0013,en,gp_letter,acute_crisis,"GP referral note - presenting issue: Patient is currently in severe crisis, disoriented, and has not slept for days. Please triage for appropriate pathway."
+synthetic-0014,pt,intake_note,acute_crisis,"INTAKE SUMMARY
+Nota do medico: deterioracao aguda, sem comer ha dois dias, possivel equipa de crise .
+Risk field copied from source; spelling and detail may be incomplete .
+
+Additional unstructured note: Referrer sent duplicate attachment."
+synthetic-0015,pt,sms,unclear,Short message from referrer: Texto fragmentado: seguro? nao seguro? secao de risco incompleta. pls call when possible. Patient prefers Portuguese.
+synthetic-0016,pt,email,safeguarding_or_abuse,"Subject: new referral
+From: GP
+
+Encaminhamento relata violencia domestica em casa e medo de regressar .
+Preferred modality: online . Availability: Tuesday morning ."
+synthetic-0017,pt,gp_letter,unclear,"GP referral note - presenting issue: Cliente nega perigo imediato mas diz que as coisas podem mudar rapidamente. Please triage for appropriate pathway.
+
+Additional unstructured note: Patient prefers Portuguese."
+synthetic-0018,pt,gp_letter,safeguarding_or_abuse,"GP referral note - presenting issue: Cliente diz que o parceiro controla telefone, dinheiro e fez ameacas . Please triage for appropriate pathway ."
+synthetic-0019,en,intake_note,self_harm_or_suicidality,"INTAKE SUMMARY
+Client disclosed self-harm urges and cannot agree to stay safe.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0020,pt,email,acute_crisis,"Subject: new referral
+From: school counsellor
+
+Familia refere vozes, agitacao intensa e necessidade de avaliacao no mesmo dia .
+Preferred modality: sem preferencia . Availability: after 17:00 ."
+synthetic-0021,en,sms,none,Short message from referrer: Client asks for CBT for panic before presentations and denies thoughts of self harm. pls call when possible. DOB missing.
+synthetic-0022,en,email,safeguarding_or_abuse,"Subject: new referral
+From: self referral
+
+Social worker asks for therapy but flags ongoing safety risk in the household.
+Preferred modality: in person. Availability: weekends only."
+synthetic-0023,pt,mixed_notes,self_harm_or_suicidality,"Copied notes:
+- concern: Formulario diz: penso em ferir-me quando a ansiedade aumenta.
+- insurer: AdvanceCare
+- admin note: DOB missing."
+synthetic-0024,pt,sms,self_harm_or_suicidality,Short message from referrer: Cliente partilhou impulsos de automutilacao e nao consegue garantir seguranca. pls call when possible. Referrer sent duplicate attachment.
+synthetic-0025,pt,gp_letter,self_harm_or_suicidality,GP referral note - presenting issue: Cliente partilhou impulsos de automutilacao e nao consegue garantir seguranca. Please triage for appropriate pathway.
+synthetic-0026,pt,webform,acute_crisis,"WEBFORM ENTRY
+Reason for referral: Chamada refere panico, gritos e possivel psicose apos parar medicacao .
+Language: Portuguese . Contact details: email present ."
+synthetic-0027,en,intake_note,none,"INTAKE SUMMARY
+Student wants help with sleep routine, exam stress, and motivation.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0028,en,webform,self_harm_or_suicidality,"WEBFORM ENTRY
+Reason for referral: Referral mentions recent thoughts of ending life and needing urgent support.
+Language: English. Contact details: contacto parcial."
+synthetic-0029,pt,mixed_notes,none,"Copied notes:
+- concern: Estudante quer apoio para organizacao, sono e ansiedade antes dos exames.
+- insurer: seguro por confirmar
+- admin note: Need admin cleanup before booking."
+synthetic-0030,en,webform,safeguarding_or_abuse,"WEBFORM ENTRY
+Reason for referral: Client says partner controls phone, money, and has threatened them .
+Language: English . Contact details: email + phone ."
+synthetic-0031,en,sms,unclear,Short message from referrer: Referral says 'urgent please' with no reason and no risk history included. pls call when possible. Texto copiado de email com erros.
+synthetic-0032,en,email,self_harm_or_suicidality,"Subject: new referral
+From: GP
+
+Caller reports suicidal thoughts, tearful, alone, and unsure they can wait.
+Preferred modality: in person. Availability: weekends only."
+synthetic-0033,pt,webform,self_harm_or_suicidality,"WEBFORM ENTRY
+Reason for referral: Familiar escreve que a pessoa tem dito que nao quer viver.
+Language: Portuguese. Contact details: needs confirmation.
+
+Additional unstructured note: Patient prefers Portuguese."
+synthetic-0034,pt,mixed_notes,safeguarding_or_abuse,"Copied notes:
+- concern: Familiar relata suspeita de abuso de pessoa idosa e pressao sobre medicacao.
+- insurer: insurance unclear
+- admin note: Need admin cleanup before booking.
+
+Additional unstructured note: Need admin cleanup before booking."
+synthetic-0035,pt,sms,acute_crisis,"Short message from referrer: Familia refere vozes, agitacao intensa e necessidade de avaliacao no mesmo dia. pls call when possible. Patient prefers Portuguese."
+synthetic-0036,en,mixed_notes,safeguarding_or_abuse,"Copied notes:
+- concern: Referral reports domestic violence at home and the client is afraid to return.
+- insurer: private pay
+- admin note: Referrer sent duplicate attachment."
+synthetic-0037,en,email,self_harm_or_suicidality,"Subject: new referral
+From: school counsellor
+
+Referral mentions recent thoughts of ending life and needing urgent support.
+Preferred modality: online se possivel. Availability: sexta de manha."
+synthetic-0038,pt,webform,unclear,"WEBFORM ENTRY
+Reason for referral: Formulario tem notas riscadas sobre crise, mas a versao final e pouco clara.
+Language: Portuguese. Contact details: email present."
+synthetic-0039,pt,gp_letter,self_harm_or_suicidality,GP referral note - presenting issue: Cliente partilhou impulsos de automutilacao e nao consegue garantir seguranca . Please triage for appropriate pathway .
+synthetic-0040,en,mixed_notes,acute_crisis,"Copied notes:
+- concern: Referral says the person is wandering outside confused and unable to care for self .
+- insurer: private pay
+- admin note: Referrer sent duplicate attachment ."
+synthetic-0041,en,webform,unclear,"WEBFORM ENTRY
+Reason for referral: Client denies immediate danger but also says things could change quickly.
+Language: English. Contact details: email present."
+synthetic-0042,pt,email,none,"Subject: new referral
+From: self referral
+
+Cliente refere preocupacao geral e cansaco, mas diz sentir-se seguro em casa.
+Preferred modality: hybrid. Availability: flexible.
+
+Additional unstructured note: Texto copiado de email com erros."
+synthetic-0043,en,mixed_notes,acute_crisis,"Copied notes:
+- concern: Patient is currently in severe crisis, disoriented, and has not slept for days.
+- insurer: private pay
+- admin note: DOB missing."
+synthetic-0044,pt,email,acute_crisis,"Subject: new referral
+From: school counsellor
+
+Chamada refere panico, gritos e possivel psicose apos parar medicacao.
+Preferred modality: in person. Availability: flexible."
+synthetic-0045,pt,mixed_notes,none,"Copied notes:
+- concern: Cliente refere preocupacao geral e cansaco, mas diz sentir-se seguro em casa.
+- insurer: AdvanceCare
+- admin note: Referrer sent duplicate attachment."
+synthetic-0046,pt,intake_note,acute_crisis,"INTAKE SUMMARY
+Pedido urgente porque o cliente esta a escalar e nao consegue acalmar.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0047,pt,mixed_notes,unclear,"Copied notes:
+- concern: Encaminhamento diz 'urgente por favor' sem motivo nem historico de risco.
+- insurer: seguro por confirmar
+- admin note: Need admin cleanup before booking."
+synthetic-0048,en,mixed_notes,unclear,"Copied notes:
+- concern: Intake has crossed-out notes about crisis but the final wording is unclear.
+- insurer: insurance unclear
+- admin note: No previous therapy listed.
+
+Additional unstructured note: Texto copiado de email com erros."
+synthetic-0049,en,email,acute_crisis,"Subject: new referral
+From: GP
+
+Emergency appointment requested because client is escalating and cannot calm down.
+Preferred modality: in person. Availability: sexta de manha."
+synthetic-0050,pt,email,unclear,"Subject: new referral
+From: family member
+
+Texto fragmentado: seguro? nao seguro? secao de risco incompleta.
+Preferred modality: in person. Availability: weekends only."
+synthetic-0051,en,intake_note,none,"INTAKE SUMMARY
+Student wants help with sleep routine, exam stress, and motivation .
+Risk field copied from source; spelling and detail may be incomplete ."
+synthetic-0052,pt,intake_note,none,"INTAKE SUMMARY
+Encaminhamento por luto recente, com suporte familiar e sem risco agudo.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0053,en,webform,safeguarding_or_abuse,"WEBFORM ENTRY
+Reason for referral: Intake notes possible sexual abuse disclosure requiring safeguarding review .
+Language: English . Contact details: email present ."
+synthetic-0054,pt,email,self_harm_or_suicidality,"Subject: new referral
+From: private clinic
+
+Formulario diz: penso em ferir-me quando a ansiedade aumenta.
+Preferred modality: sem preferencia. Availability: after 17:00."
+synthetic-0055,en,mixed_notes,none,"Copied notes:
+- concern: Parent requests support for adolescent social anxiety, stable at home and school .
+- insurer: Multicare
+- admin note: No previous therapy listed ."
+synthetic-0056,en,sms,acute_crisis,"Short message from referrer: Caller reports panic, shouting, and possible psychosis after stopping medication. pls call when possible. Need admin cleanup before booking."
+synthetic-0057,en,intake_note,none,"INTAKE SUMMARY
+Parent requests support for adolescent social anxiety, stable at home and school.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0058,pt,webform,unclear,"WEBFORM ENTRY
+Reason for referral: Formulario tem notas riscadas sobre crise, mas a versao final e pouco clara.
+Language: Portuguese. Contact details: email + phone."
+synthetic-0059,en,email,unclear,"Subject: new referral
+From: self referral
+
+Message says the client is struggling and family is worried, safety not assessed.
+Preferred modality: sem preferencia. Availability: flexible.
+
+Additional unstructured note: Patient prefers Portuguese."
+synthetic-0060,pt,mixed_notes,none,"Copied notes:
+- concern: Estudante quer apoio para organizacao, sono e ansiedade antes dos exames.
+- insurer: private pay
+- admin note: Need admin cleanup before booking."
+synthetic-0061,en,gp_letter,safeguarding_or_abuse,"GP referral note - presenting issue: Teacher is concerned a child may be unsafe due to bruises and disclosure of abuse. Please triage for appropriate pathway.
+
+Additional unstructured note: Referrer sent duplicate attachment."
+synthetic-0062,en,webform,unclear,"WEBFORM ENTRY
+Reason for referral: GP wrote 'risk maybe' but no details, patient unreachable for clarification.
+Language: English. Contact details: email + phone."
+synthetic-0063,en,intake_note,acute_crisis,"INTAKE SUMMARY
+Patient is currently in severe crisis, disoriented, and has not slept for days .
+Risk field copied from source; spelling and detail may be incomplete ."
+synthetic-0064,en,mixed_notes,acute_crisis,"Copied notes:
+- concern: Family says patient is hearing voices, highly agitated, and needs same-day review .
+- insurer: insurance unclear
+- admin note: DOB missing .
+
+Additional unstructured note: No previous therapy listed."
+synthetic-0065,en,email,acute_crisis,"Subject: new referral
+From: self referral
+
+Referral says the person is wandering outside confused and unable to care for self.
+Preferred modality: sem preferencia. Availability: sexta de manha."
+synthetic-0066,pt,intake_note,none,"INTAKE SUMMARY
+Pedido de terapia para ataques de panico em reunioes, risco avaliado como ausente.
+Risk field copied from source; spelling and detail may be incomplete.
+
+Additional unstructured note: No previous therapy listed."
+synthetic-0067,pt,gp_letter,self_harm_or_suicidality,"GP referral note - presenting issue: Chamada relata ideias suicidas, choro, isolamento e medo de esperar. Please triage for appropriate pathway."
+synthetic-0068,pt,webform,acute_crisis,"WEBFORM ENTRY
+Reason for referral: Paciente esta em crise grave, desorientado e sem dormir ha varios dias .
+Language: Portuguese . Contact details: email + phone ."
+synthetic-0069,pt,webform,self_harm_or_suicidality,"WEBFORM ENTRY
+Reason for referral: Paciente diz que nao se sente seguro e pode magoar-se hoje a noite .
+Language: Portuguese . Contact details: email + phone ."
+synthetic-0070,pt,intake_note,self_harm_or_suicidality,"INTAKE SUMMARY
+Chamada relata ideias suicidas, choro, isolamento e medo de esperar.
+Risk field copied from source; spelling and detail may be incomplete.
+
+Additional unstructured note: Referrer sent duplicate attachment."
+synthetic-0071,en,sms,none,Short message from referrer: Client asks for CBT for panic before presentations and denies thoughts of self harm. pls call when possible. DOB missing.
+synthetic-0072,en,webform,unclear,"WEBFORM ENTRY
+Reason for referral: GP wrote 'risk maybe' but no details, patient unreachable for clarification.
+Language: English. Contact details: needs confirmation."
+synthetic-0073,en,sms,self_harm_or_suicidality,Short message from referrer: Intake form says: I keep thinking about hurting myself when the anxiety spikes. pls call when possible. No previous therapy listed.
+synthetic-0074,en,email,self_harm_or_suicidality,"Subject: new referral
+From: self referral
+
+Caller reports suicidal thoughts, tearful, alone, and unsure they can wait.
+Preferred modality: online se possivel. Availability: flexible."
+synthetic-0075,en,mixed_notes,acute_crisis,"Copied notes:
+- concern: GP note: acute deterioration, no food for two days, crisis team may be needed.
+- insurer: private pay
+- admin note: Need admin cleanup before booking."
+synthetic-0076,pt,email,unclear,"Subject: new referral
+From: GP
+
+Encaminhamento diz 'urgente por favor' sem motivo nem historico de risco .
+Preferred modality: in person . Availability: weekends only ."
+synthetic-0077,en,sms,self_harm_or_suicidality,Short message from referrer: Intake form says: I keep thinking about hurting myself when the anxiety spikes. pls call when possible. Referrer sent duplicate attachment.
+synthetic-0078,en,email,self_harm_or_suicidality,"Subject: new referral
+From: social worker
+
+Patient says they do not feel safe and might hurt themselves tonight .
+Preferred modality: sem preferencia . Availability: Tuesday morning .
+
+Additional unstructured note: Texto copiado de email com erros."
+synthetic-0079,en,webform,self_harm_or_suicidality,"WEBFORM ENTRY
+Reason for referral: Email from family says the person has been saying they do not want to live.
+Language: English. Contact details: contacto parcial."
+synthetic-0080,en,webform,unclear,"WEBFORM ENTRY
+Reason for referral: Intake has crossed-out notes about crisis but the final wording is unclear.
+Language: English. Contact details: needs confirmation."
+synthetic-0081,pt,email,unclear,"Subject: new referral
+From: private clinic
+
+Mensagem diz que o cliente esta mal e a familia preocupada, seguranca nao avaliada.
+Preferred modality: in person. Availability: flexible."
+synthetic-0082,en,mixed_notes,self_harm_or_suicidality,"Copied notes:
+- concern: Client disclosed self-harm urges and cannot agree to stay safe.
+- insurer: seguro por confirmar
+- admin note: DOB missing."
+synthetic-0083,pt,email,unclear,"Subject: new referral
+From: family member
+
+Mensagem diz que o cliente esta mal e a familia preocupada, seguranca nao avaliada.
+Preferred modality: online se possivel. Availability: sexta de manha."
+synthetic-0084,en,gp_letter,unclear,GP referral note - presenting issue: Referral text is fragmented: safe? not safe? client did not complete risk section . Please triage for appropriate pathway .
+synthetic-0085,en,gp_letter,self_harm_or_suicidality,GP referral note - presenting issue: Patient says they do not feel safe and might hurt themselves tonight . Please triage for appropriate pathway .
+synthetic-0086,pt,mixed_notes,self_harm_or_suicidality,"Copied notes:
+- concern: Chamada relata ideias suicidas, choro, isolamento e medo de esperar.
+- insurer: AdvanceCare
+- admin note: Need admin cleanup before booking."
+synthetic-0087,en,email,none,"Subject: new referral
+From: social worker
+
+Referral notes grief after bereavement with good family support and no acute risk.
+Preferred modality: online se possivel. Availability: weekends only."
+synthetic-0088,pt,email,self_harm_or_suicidality,"Subject: new referral
+From: GP
+
+Familiar escreve que a pessoa tem dito que nao quer viver.
+Preferred modality: sem preferencia. Availability: Tuesday morning."
+synthetic-0089,pt,gp_letter,safeguarding_or_abuse,GP referral note - presenting issue: Assistente social pede terapia mas sinaliza risco continuo no agregado familiar. Please triage for appropriate pathway.
+synthetic-0090,pt,email,none,"Subject: new referral
+From: self referral
+
+Cliente refere preocupacao geral e cansaco, mas diz sentir-se seguro em casa.
+Preferred modality: online se possivel. Availability: after 17:00."
+synthetic-0091,en,webform,none,"WEBFORM ENTRY
+Reason for referral: Client asks for CBT for panic before presentations and denies thoughts of self harm .
+Language: English . Contact details: needs confirmation ."
+synthetic-0092,en,mixed_notes,none,"Copied notes:
+- concern: Adult referral for work stress and mild anxiety, no safety concerns reported .
+- insurer: insurance unclear
+- admin note: Need admin cleanup before booking ."
+synthetic-0093,pt,email,safeguarding_or_abuse,"Subject: new referral
+From: GP
+
+Professor esta preocupado que uma crianca esteja insegura apos revelar abuso.
+Preferred modality: hybrid. Availability: Tuesday morning."
+synthetic-0094,pt,webform,acute_crisis,"WEBFORM ENTRY
+Reason for referral: Encaminhamento diz que a pessoa anda confusa na rua e nao consegue cuidar de si.
+Language: Portuguese. Contact details: email present."
+synthetic-0095,pt,webform,unclear,"WEBFORM ENTRY
+Reason for referral: Medico escreveu 'talvez risco' mas sem detalhes e paciente incontactavel.
+Language: Portuguese. Contact details: email + phone.
+
+Additional unstructured note: No previous therapy listed."
+synthetic-0096,pt,intake_note,self_harm_or_suicidality,"INTAKE SUMMARY
+Familiar escreve que a pessoa tem dito que nao quer viver.
+Risk field copied from source; spelling and detail may be incomplete.
+
+Additional unstructured note: DOB missing."
+synthetic-0097,pt,gp_letter,unclear,GP referral note - presenting issue: Encaminhamento diz 'urgente por favor' sem motivo nem historico de risco. Please triage for appropriate pathway.
+synthetic-0098,pt,mixed_notes,safeguarding_or_abuse,"Copied notes:
+- concern: Professor esta preocupado que uma crianca esteja insegura apos revelar abuso.
+- insurer: Multicare
+- admin note: Referrer sent duplicate attachment."
+synthetic-0099,en,sms,acute_crisis,"Short message from referrer: Emergency appointment requested because client is escalating and cannot calm down. pls call when possible. Patient prefers Portuguese.
+
+Additional unstructured note: Need admin cleanup before booking."
+synthetic-0100,en,email,safeguarding_or_abuse,"Subject: new referral
+From: social worker
+
+Referral reports domestic violence at home and the client is afraid to return.
+Preferred modality: online. Availability: Tuesday morning."
+synthetic-0101,pt,gp_letter,self_harm_or_suicidality,"GP referral note - presenting issue: Chamada relata ideias suicidas, choro, isolamento e medo de esperar. Please triage for appropriate pathway.
+
+Additional unstructured note: Patient prefers Portuguese."
+synthetic-0102,pt,email,none,"Subject: new referral
+From: self referral
+
+Encaminhamento por luto recente, com suporte familiar e sem risco agudo.
+Preferred modality: online se possivel. Availability: sexta de manha."
+synthetic-0103,pt,intake_note,none,"INTAKE SUMMARY
+Encaminhamento para ansiedade no trabalho, sem preocupacoes de seguranca relatadas.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0104,pt,mixed_notes,safeguarding_or_abuse,"Copied notes:
+- concern: Encaminhamento relata violencia domestica em casa e medo de regressar .
+- insurer: AdvanceCare
+- admin note: Referrer sent duplicate attachment ."
+synthetic-0105,pt,intake_note,unclear,"INTAKE SUMMARY
+Medico escreveu 'talvez risco' mas sem detalhes e paciente incontactavel.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0106,pt,gp_letter,acute_crisis,GP referral note - presenting issue: Pedido urgente porque o cliente esta a escalar e nao consegue acalmar. Please triage for appropriate pathway.
+synthetic-0107,pt,mixed_notes,unclear,"Copied notes:
+- concern: Medico escreveu 'talvez risco' mas sem detalhes e paciente incontactavel .
+- insurer: Multicare
+- admin note: DOB missing ."
+synthetic-0108,pt,gp_letter,unclear,"GP referral note - presenting issue: Formulario tem notas riscadas sobre crise, mas a versao final e pouco clara . Please triage for appropriate pathway ."
+synthetic-0109,pt,sms,acute_crisis,Short message from referrer: Encaminhamento diz que a pessoa anda confusa na rua e nao consegue cuidar de si. pls call when possible. DOB missing.
+synthetic-0110,en,mixed_notes,acute_crisis,"Copied notes:
+- concern: Family says patient is hearing voices, highly agitated, and needs same-day review.
+- insurer: insurance unclear
+- admin note: Patient prefers Portuguese."
+synthetic-0111,pt,sms,acute_crisis,Short message from referrer: Pedido urgente porque o cliente esta a escalar e nao consegue acalmar. pls call when possible. Texto copiado de email com erros.
+synthetic-0112,pt,webform,safeguarding_or_abuse,"WEBFORM ENTRY
+Reason for referral: Assistente social pede terapia mas sinaliza risco continuo no agregado familiar.
+Language: Portuguese. Contact details: email + phone."
+synthetic-0113,en,email,self_harm_or_suicidality,"Subject: new referral
+From: school counsellor
+
+Intake form says: I keep thinking about hurting myself when the anxiety spikes.
+Preferred modality: sem preferencia. Availability: after 17:00."
+synthetic-0114,en,sms,none,"Short message from referrer: Student wants help with sleep routine, exam stress, and motivation. pls call when possible. Referrer sent duplicate attachment."
+synthetic-0115,en,intake_note,unclear,"INTAKE SUMMARY
+Message says the client is struggling and family is worried, safety not assessed.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0116,pt,sms,unclear,"Short message from referrer: Cliente nega perigo imediato mas diz que as coisas podem mudar rapidamente. pls call when possible. Need admin cleanup before booking.
+
+Additional unstructured note: DOB missing."
+synthetic-0117,en,sms,safeguarding_or_abuse,Short message from referrer: Social worker asks for therapy but flags ongoing safety risk in the household . pls call when possible . No previous therapy listed .
+synthetic-0118,pt,mixed_notes,safeguarding_or_abuse,"Copied notes:
+- concern: Familiar relata suspeita de abuso de pessoa idosa e pressao sobre medicacao.
+- insurer: Multicare
+- admin note: Texto copiado de email com erros."
+synthetic-0119,pt,mixed_notes,self_harm_or_suicidality,"Copied notes:
+- concern: Encaminhamento refere pensamentos suicidas recentes e necessidade de apoio urgente .
+- insurer: private pay
+- admin note: Texto copiado de email com erros ."
+synthetic-0120,pt,webform,safeguarding_or_abuse,"WEBFORM ENTRY
+Reason for referral: Formulario indica possivel abuso sexual que exige revisao de salvaguarda.
+Language: Portuguese. Contact details: email present.
+
+Additional unstructured note: DOB missing."
+synthetic-0121,en,intake_note,safeguarding_or_abuse,"INTAKE SUMMARY
+Client says partner controls phone, money, and has threatened them.
+Risk field copied from source; spelling and detail may be incomplete.
+
+Additional unstructured note: No previous therapy listed."
+synthetic-0122,en,mixed_notes,safeguarding_or_abuse,"Copied notes:
+- concern: Social worker asks for therapy but flags ongoing safety risk in the household.
+- insurer: seguro por confirmar
+- admin note: No previous therapy listed."
+synthetic-0123,en,email,self_harm_or_suicidality,"Subject: new referral
+From: school counsellor
+
+Caller reports suicidal thoughts, tearful, alone, and unsure they can wait.
+Preferred modality: hybrid. Availability: weekends only."
+synthetic-0124,pt,email,self_harm_or_suicidality,"Subject: new referral
+From: self referral
+
+Cliente partilhou impulsos de automutilacao e nao consegue garantir seguranca.
+Preferred modality: sem preferencia. Availability: after 17:00."
+synthetic-0125,en,gp_letter,unclear,"GP referral note - presenting issue: Intake has crossed-out notes about crisis but the final wording is unclear. Please triage for appropriate pathway.
+
+Additional unstructured note: No previous therapy listed."
+synthetic-0126,en,intake_note,safeguarding_or_abuse,"INTAKE SUMMARY
+Teacher is concerned a child may be unsafe due to bruises and disclosure of abuse.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0127,en,sms,none,Short message from referrer: Referral notes grief after bereavement with good family support and no acute risk. pls call when possible. Need admin cleanup before booking.
+synthetic-0128,pt,email,unclear,"Subject: new referral
+From: self referral
+
+Encaminhamento diz 'urgente por favor' sem motivo nem historico de risco.
+Preferred modality: online se possivel. Availability: Tuesday morning."
+synthetic-0129,pt,intake_note,acute_crisis,"INTAKE SUMMARY
+Nota do medico: deterioracao aguda, sem comer ha dois dias, possivel equipa de crise .
+Risk field copied from source; spelling and detail may be incomplete ."
+synthetic-0130,en,mixed_notes,acute_crisis,"Copied notes:
+- concern: Patient is currently in severe crisis, disoriented, and has not slept for days.
+- insurer: Multicare
+- admin note: Need admin cleanup before booking.
+
+Additional unstructured note: No previous therapy listed."
+synthetic-0131,pt,email,none,"Subject: new referral
+From: school counsellor
+
+Pessoa adulta procura apoio por stress e insonia, nega pensamentos de se magoar.
+Preferred modality: online se possivel. Availability: sexta de manha.
+
+Additional unstructured note: DOB missing."
+synthetic-0132,pt,mixed_notes,acute_crisis,"Copied notes:
+- concern: Paciente esta em crise grave, desorientado e sem dormir ha varios dias.
+- insurer: seguro por confirmar
+- admin note: Need admin cleanup before booking.
+
+Additional unstructured note: DOB missing."
+synthetic-0133,pt,gp_letter,none,"GP referral note - presenting issue: Encaminhamento por luto recente, com suporte familiar e sem risco agudo . Please triage for appropriate pathway ."
+synthetic-0134,en,webform,none,"WEBFORM ENTRY
+Reason for referral: Student wants help with sleep routine, exam stress, and motivation.
+Language: English. Contact details: email present."
+synthetic-0135,pt,sms,safeguarding_or_abuse,Short message from referrer: Professor esta preocupado que uma crianca esteja insegura apos revelar abuso. pls call when possible. Referrer sent duplicate attachment.
+synthetic-0136,pt,webform,none,"WEBFORM ENTRY
+Reason for referral: Pessoa adulta procura apoio por stress e insonia, nega pensamentos de se magoar.
+Language: Portuguese. Contact details: phone missing."
+synthetic-0137,en,intake_note,none,"INTAKE SUMMARY
+Parent requests support for adolescent social anxiety, stable at home and school.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0138,pt,mixed_notes,self_harm_or_suicidality,"Copied notes:
+- concern: Formulario diz: penso em ferir-me quando a ansiedade aumenta.
+- insurer: AdvanceCare
+- admin note: Need admin cleanup before booking."
+synthetic-0139,en,gp_letter,acute_crisis,"GP referral note - presenting issue: Family says patient is hearing voices, highly agitated, and needs same-day review. Please triage for appropriate pathway."
+synthetic-0140,en,intake_note,safeguarding_or_abuse,"INTAKE SUMMARY
+Social worker asks for therapy but flags ongoing safety risk in the household.
+Risk field copied from source; spelling and detail may be incomplete.
+
+Additional unstructured note: Texto copiado de email com erros."
+synthetic-0141,pt,mixed_notes,acute_crisis,"Copied notes:
+- concern: Chamada refere panico, gritos e possivel psicose apos parar medicacao.
+- insurer: seguro por confirmar
+- admin note: Need admin cleanup before booking.
+
+Additional unstructured note: Need admin cleanup before booking."
+synthetic-0142,en,mixed_notes,acute_crisis,"Copied notes:
+- concern: Emergency appointment requested because client is escalating and cannot calm down.
+- insurer: seguro por confirmar
+- admin note: Need admin cleanup before booking."
+synthetic-0143,pt,intake_note,none,"INTAKE SUMMARY
+Encaminhamento para ansiedade no trabalho, sem preocupacoes de seguranca relatadas.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0144,en,mixed_notes,acute_crisis,"Copied notes:
+- concern: Family says patient is hearing voices, highly agitated, and needs same-day review.
+- insurer: seguro por confirmar
+- admin note: Referrer sent duplicate attachment.
+
+Additional unstructured note: DOB missing."
+synthetic-0145,en,mixed_notes,acute_crisis,"Copied notes:
+- concern: Emergency appointment requested because client is escalating and cannot calm down.
+- insurer: AdvanceCare
+- admin note: Texto copiado de email com erros."
+synthetic-0146,pt,sms,safeguarding_or_abuse,"Short message from referrer: Assistente social pede terapia mas sinaliza risco continuo no agregado familiar . pls call when possible . Texto copiado de email com erros .
+
+Additional unstructured note: Patient prefers Portuguese."
+synthetic-0147,pt,intake_note,self_harm_or_suicidality,"INTAKE SUMMARY
+Formulario diz: penso em ferir-me quando a ansiedade aumenta.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0148,pt,intake_note,unclear,"INTAKE SUMMARY
+Mensagem diz que o cliente esta mal e a familia preocupada, seguranca nao avaliada.
+Risk field copied from source; spelling and detail may be incomplete.
+
+Additional unstructured note: No previous therapy listed."
+synthetic-0149,pt,webform,none,"WEBFORM ENTRY
+Reason for referral: Estudante quer apoio para organizacao, sono e ansiedade antes dos exames.
+Language: Portuguese. Contact details: needs confirmation."
+synthetic-0150,en,intake_note,unclear,"INTAKE SUMMARY
+Intake has crossed-out notes about crisis but the final wording is unclear .
+Risk field copied from source; spelling and detail may be incomplete .
+
+Additional unstructured note: Referrer sent duplicate attachment."
+synthetic-0151,pt,webform,none,"WEBFORM ENTRY
+Reason for referral: Encaminhamento para ansiedade no trabalho, sem preocupacoes de seguranca relatadas.
+Language: Portuguese. Contact details: contacto parcial."
+synthetic-0152,pt,mixed_notes,self_harm_or_suicidality,"Copied notes:
+- concern: Formulario diz: penso em ferir-me quando a ansiedade aumenta .
+- insurer: Multicare
+- admin note: Texto copiado de email com erros ."
+synthetic-0153,en,email,none,"Subject: new referral
+From: GP
+
+Parent requests support for adolescent social anxiety, stable at home and school.
+Preferred modality: hybrid. Availability: Tuesday morning."
+synthetic-0154,pt,email,acute_crisis,"Subject: new referral
+From: school counsellor
+
+Paciente esta em crise grave, desorientado e sem dormir ha varios dias.
+Preferred modality: in person. Availability: Tuesday morning."
+synthetic-0155,en,sms,self_harm_or_suicidality,Short message from referrer: Intake form says: I keep thinking about hurting myself when the anxiety spikes. pls call when possible. Patient prefers Portuguese.
+synthetic-0156,pt,email,acute_crisis,"Subject: new referral
+From: family member
+
+Nota do medico: deterioracao aguda, sem comer ha dois dias, possivel equipa de crise.
+Preferred modality: hybrid. Availability: Tuesday morning.
+
+Additional unstructured note: Patient prefers Portuguese."
+synthetic-0157,en,intake_note,safeguarding_or_abuse,"INTAKE SUMMARY
+Intake notes possible sexual abuse disclosure requiring safeguarding review.
+Risk field copied from source; spelling and detail may be incomplete.
+
+Additional unstructured note: Texto copiado de email com erros."
+synthetic-0158,en,sms,self_harm_or_suicidality,"Short message from referrer: Caller reports suicidal thoughts, tearful, alone, and unsure they can wait. pls call when possible. Need admin cleanup before booking."
+synthetic-0159,pt,email,safeguarding_or_abuse,"Subject: new referral
+From: social worker
+
+Cliente diz que o parceiro controla telefone, dinheiro e fez ameacas.
+Preferred modality: online. Availability: weekends only."
+synthetic-0160,pt,gp_letter,safeguarding_or_abuse,"GP referral note - presenting issue: Assistente social pede terapia mas sinaliza risco continuo no agregado familiar. Please triage for appropriate pathway.
+
+Additional unstructured note: DOB missing."
+synthetic-0161,pt,sms,safeguarding_or_abuse,"Short message from referrer: Cliente diz que o parceiro controla telefone, dinheiro e fez ameacas. pls call when possible. Need admin cleanup before booking.
+
+Additional unstructured note: Need admin cleanup before booking."
+synthetic-0162,pt,webform,acute_crisis,"WEBFORM ENTRY
+Reason for referral: Familia refere vozes, agitacao intensa e necessidade de avaliacao no mesmo dia.
+Language: Portuguese. Contact details: email present."
+synthetic-0163,pt,email,acute_crisis,"Subject: new referral
+From: private clinic
+
+Familia refere vozes, agitacao intensa e necessidade de avaliacao no mesmo dia.
+Preferred modality: sem preferencia. Availability: weekends only."
+synthetic-0164,en,sms,unclear,Short message from referrer: Referral says 'urgent please' with no reason and no risk history included. pls call when possible. Referrer sent duplicate attachment.
+synthetic-0165,en,gp_letter,self_harm_or_suicidality,"GP referral note - presenting issue: Client disclosed self-harm urges and cannot agree to stay safe. Please triage for appropriate pathway.
+
+Additional unstructured note: Need admin cleanup before booking."
+synthetic-0166,pt,mixed_notes,unclear,"Copied notes:
+- concern: Texto fragmentado: seguro? nao seguro? secao de risco incompleta.
+- insurer: AdvanceCare
+- admin note: Need admin cleanup before booking."
+synthetic-0167,pt,intake_note,unclear,"INTAKE SUMMARY
+Formulario tem notas riscadas sobre crise, mas a versao final e pouco clara.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0168,en,intake_note,self_harm_or_suicidality,"INTAKE SUMMARY
+Patient says they do not feel safe and might hurt themselves tonight.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0169,pt,email,unclear,"Subject: new referral
+From: social worker
+
+Formulario tem notas riscadas sobre crise, mas a versao final e pouco clara.
+Preferred modality: in person. Availability: Tuesday morning."
+synthetic-0170,en,mixed_notes,none,"Copied notes:
+- concern: Adult referral for work stress and mild anxiety, no safety concerns reported.
+- insurer: private pay
+- admin note: No previous therapy listed."
+synthetic-0171,en,mixed_notes,none,"Copied notes:
+- concern: Referral notes grief after bereavement with good family support and no acute risk .
+- insurer: insurance unclear
+- admin note: No previous therapy listed ."
+synthetic-0172,pt,sms,none,"Short message from referrer: Pedido de terapia para ataques de panico em reunioes, risco avaliado como ausente. pls call when possible. No previous therapy listed."
+synthetic-0173,pt,sms,safeguarding_or_abuse,Short message from referrer: Encaminhamento relata violencia domestica em casa e medo de regressar. pls call when possible. DOB missing.
+synthetic-0174,pt,intake_note,none,"INTAKE SUMMARY
+Encaminhamento para ansiedade no trabalho, sem preocupacoes de seguranca relatadas .
+Risk field copied from source; spelling and detail may be incomplete ."
+synthetic-0175,en,gp_letter,safeguarding_or_abuse,GP referral note - presenting issue: Referral reports domestic violence at home and the client is afraid to return . Please triage for appropriate pathway .
+synthetic-0176,pt,mixed_notes,unclear,"Copied notes:
+- concern: Encaminhamento diz 'urgente por favor' sem motivo nem historico de risco.
+- insurer: Multicare
+- admin note: Need admin cleanup before booking."
+synthetic-0177,pt,sms,self_harm_or_suicidality,"Short message from referrer: Familiar escreve que a pessoa tem dito que nao quer viver. pls call when possible. Referrer sent duplicate attachment.
+
+Additional unstructured note: Texto copiado de email com erros."
+synthetic-0178,pt,webform,unclear,"WEBFORM ENTRY
+Reason for referral: Medico escreveu 'talvez risco' mas sem detalhes e paciente incontactavel.
+Language: Portuguese. Contact details: email present."
+synthetic-0179,en,mixed_notes,self_harm_or_suicidality,"Copied notes:
+- concern: Client disclosed self-harm urges and cannot agree to stay safe.
+- insurer: seguro por confirmar
+- admin note: Need admin cleanup before booking.
+
+Additional unstructured note: DOB missing."
+synthetic-0180,pt,gp_letter,self_harm_or_suicidality,GP referral note - presenting issue: Encaminhamento refere pensamentos suicidas recentes e necessidade de apoio urgente. Please triage for appropriate pathway.
+synthetic-0181,en,webform,unclear,"WEBFORM ENTRY
+Reason for referral: Referral says 'urgent please' with no reason and no risk history included .
+Language: English . Contact details: email + phone ."
+synthetic-0182,en,email,acute_crisis,"Subject: new referral
+From: private clinic
+
+Caller reports panic, shouting, and possible psychosis after stopping medication .
+Preferred modality: online . Availability: Tuesday morning ."
+synthetic-0183,pt,email,self_harm_or_suicidality,"Subject: new referral
+From: school counsellor
+
+Cliente partilhou impulsos de automutilacao e nao consegue garantir seguranca.
+Preferred modality: sem preferencia. Availability: weekends only.
+
+Additional unstructured note: No previous therapy listed."
+synthetic-0184,en,email,none,"Subject: new referral
+From: self referral
+
+GP referral for low mood after a breakup; risk was assessed and denied .
+Preferred modality: in person . Availability: after 17:00 ."
+synthetic-0185,pt,mixed_notes,none,"Copied notes:
+- concern: Estudante quer apoio para organizacao, sono e ansiedade antes dos exames.
+- insurer: insurance unclear
+- admin note: Patient prefers Portuguese."
+synthetic-0186,en,email,none,"Subject: new referral
+From: school counsellor
+
+GP referral for low mood after a breakup; risk was assessed and denied.
+Preferred modality: hybrid. Availability: Tuesday morning.
+
+Additional unstructured note: Texto copiado de email com erros."
+synthetic-0187,pt,intake_note,safeguarding_or_abuse,"INTAKE SUMMARY
+Cliente diz que o parceiro controla telefone, dinheiro e fez ameacas.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0188,pt,mixed_notes,unclear,"Copied notes:
+- concern: Cliente nega perigo imediato mas diz que as coisas podem mudar rapidamente.
+- insurer: AdvanceCare
+- admin note: Need admin cleanup before booking."
+synthetic-0189,pt,mixed_notes,self_harm_or_suicidality,"Copied notes:
+- concern: Encaminhamento refere pensamentos suicidas recentes e necessidade de apoio urgente.
+- insurer: Multicare
+- admin note: Need admin cleanup before booking."
+synthetic-0190,pt,gp_letter,acute_crisis,GP referral note - presenting issue: Encaminhamento diz que a pessoa anda confusa na rua e nao consegue cuidar de si . Please triage for appropriate pathway .
+synthetic-0191,en,email,self_harm_or_suicidality,"Subject: new referral
+From: school counsellor
+
+Email from family says the person has been saying they do not want to live.
+Preferred modality: sem preferencia. Availability: flexible."
+synthetic-0192,en,mixed_notes,self_harm_or_suicidality,"Copied notes:
+- concern: Intake form says: I keep thinking about hurting myself when the anxiety spikes.
+- insurer: seguro por confirmar
+- admin note: Referrer sent duplicate attachment."
+synthetic-0193,en,gp_letter,safeguarding_or_abuse,"GP referral note - presenting issue: Client says partner controls phone, money, and has threatened them. Please triage for appropriate pathway."
+synthetic-0194,en,gp_letter,unclear,GP referral note - presenting issue: Client denies immediate danger but also says things could change quickly. Please triage for appropriate pathway.
+synthetic-0195,pt,webform,none,"WEBFORM ENTRY
+Reason for referral: Pessoa adulta procura apoio por stress e insonia, nega pensamentos de se magoar.
+Language: Portuguese. Contact details: contacto parcial."
+synthetic-0196,pt,email,none,"Subject: new referral
+From: private clinic
+
+Encaminhamento por luto recente, com suporte familiar e sem risco agudo.
+Preferred modality: hybrid. Availability: sexta de manha."
+synthetic-0197,pt,intake_note,self_harm_or_suicidality,"INTAKE SUMMARY
+Paciente diz que nao se sente seguro e pode magoar-se hoje a noite.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0198,en,intake_note,self_harm_or_suicidality,"INTAKE SUMMARY
+Email from family says the person has been saying they do not want to live.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0199,pt,gp_letter,acute_crisis,GP referral note - presenting issue: Encaminhamento diz que a pessoa anda confusa na rua e nao consegue cuidar de si. Please triage for appropriate pathway.
+synthetic-0200,pt,gp_letter,self_harm_or_suicidality,GP referral note - presenting issue: Paciente diz que nao se sente seguro e pode magoar-se hoje a noite . Please triage for appropriate pathway .
+synthetic-0201,en,mixed_notes,unclear,"Copied notes:
+- concern: Referral text is fragmented: safe? not safe? client did not complete risk section.
+- insurer: private pay
+- admin note: No previous therapy listed."
+synthetic-0202,en,sms,acute_crisis,"Short message from referrer: GP note: acute deterioration, no food for two days, crisis team may be needed . pls call when possible . Referrer sent duplicate attachment ."
+synthetic-0203,pt,email,unclear,"Subject: new referral
+From: private clinic
+
+Medico escreveu 'talvez risco' mas sem detalhes e paciente incontactavel.
+Preferred modality: in person. Availability: after 17:00."
+synthetic-0204,en,mixed_notes,acute_crisis,"Copied notes:
+- concern: Caller reports panic, shouting, and possible psychosis after stopping medication .
+- insurer: AdvanceCare
+- admin note: Need admin cleanup before booking ."
+synthetic-0205,pt,mixed_notes,none,"Copied notes:
+- concern: Estudante quer apoio para organizacao, sono e ansiedade antes dos exames.
+- insurer: seguro por confirmar
+- admin note: Texto copiado de email com erros."
+synthetic-0206,en,email,acute_crisis,"Subject: new referral
+From: social worker
+
+Referral says the person is wandering outside confused and unable to care for self.
+Preferred modality: sem preferencia. Availability: after 17:00."
+synthetic-0207,en,sms,unclear,"Short message from referrer: GP wrote 'risk maybe' but no details, patient unreachable for clarification. pls call when possible. Referrer sent duplicate attachment."
+synthetic-0208,pt,gp_letter,none,"GP referral note - presenting issue: Pedido de terapia para ataques de panico em reunioes, risco avaliado como ausente . Please triage for appropriate pathway ."
+synthetic-0209,en,mixed_notes,unclear,"Copied notes:
+- concern: GP wrote 'risk maybe' but no details, patient unreachable for clarification.
+- insurer: seguro por confirmar
+- admin note: DOB missing."
+synthetic-0210,pt,sms,unclear,"Short message from referrer: Mensagem diz que o cliente esta mal e a familia preocupada, seguranca nao avaliada. pls call when possible. DOB missing."
+synthetic-0211,pt,gp_letter,acute_crisis,GP referral note - presenting issue: Pedido urgente porque o cliente esta a escalar e nao consegue acalmar. Please triage for appropriate pathway.
+synthetic-0212,en,webform,none,"WEBFORM ENTRY
+Reason for referral: Adult referral for work stress and mild anxiety, no safety concerns reported .
+Language: English . Contact details: contacto parcial .
+
+Additional unstructured note: Patient prefers Portuguese."
+synthetic-0213,en,webform,safeguarding_or_abuse,"WEBFORM ENTRY
+Reason for referral: Referral reports domestic violence at home and the client is afraid to return.
+Language: English. Contact details: needs confirmation."
+synthetic-0214,en,webform,safeguarding_or_abuse,"WEBFORM ENTRY
+Reason for referral: Intake notes possible sexual abuse disclosure requiring safeguarding review .
+Language: English . Contact details: email present .
+
+Additional unstructured note: Patient prefers Portuguese."
+synthetic-0215,pt,sms,self_harm_or_suicidality,"Short message from referrer: Paciente diz que nao se sente seguro e pode magoar-se hoje a noite. pls call when possible. DOB missing.
+
+Additional unstructured note: Need admin cleanup before booking."
+synthetic-0216,en,mixed_notes,unclear,"Copied notes:
+- concern: Intake has crossed-out notes about crisis but the final wording is unclear.
+- insurer: insurance unclear
+- admin note: No previous therapy listed."
+synthetic-0217,pt,mixed_notes,unclear,"Copied notes:
+- concern: Mensagem diz que o cliente esta mal e a familia preocupada, seguranca nao avaliada.
+- insurer: insurance unclear
+- admin note: Need admin cleanup before booking."
+synthetic-0218,pt,gp_letter,safeguarding_or_abuse,GP referral note - presenting issue: Familiar relata suspeita de abuso de pessoa idosa e pressao sobre medicacao. Please triage for appropriate pathway.
+synthetic-0219,en,mixed_notes,self_harm_or_suicidality,"Copied notes:
+- concern: Referral mentions recent thoughts of ending life and needing urgent support .
+- insurer: private pay
+- admin note: Texto copiado de email com erros ."
+synthetic-0220,pt,webform,safeguarding_or_abuse,"WEBFORM ENTRY
+Reason for referral: Familiar relata suspeita de abuso de pessoa idosa e pressao sobre medicacao.
+Language: Portuguese. Contact details: email present."
+synthetic-0221,pt,gp_letter,unclear,GP referral note - presenting issue: Texto fragmentado: seguro? nao seguro? secao de risco incompleta. Please triage for appropriate pathway.
+synthetic-0222,en,gp_letter,safeguarding_or_abuse,GP referral note - presenting issue: Parent reports elder abuse concerns and coercion around medication . Please triage for appropriate pathway .
+synthetic-0223,pt,intake_note,none,"INTAKE SUMMARY
+Encaminhamento para ansiedade no trabalho, sem preocupacoes de seguranca relatadas.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0224,pt,email,unclear,"Subject: new referral
+From: private clinic
+
+Cliente nega perigo imediato mas diz que as coisas podem mudar rapidamente .
+Preferred modality: online se possivel . Availability: Tuesday morning ."
+synthetic-0225,en,sms,unclear,"Short message from referrer: Message says the client is struggling and family is worried, safety not assessed. pls call when possible. DOB missing."
+synthetic-0226,en,email,unclear,"Subject: new referral
+From: family member
+
+Referral text is fragmented: safe? not safe? client did not complete risk section.
+Preferred modality: online se possivel. Availability: flexible."
+synthetic-0227,en,gp_letter,unclear,GP referral note - presenting issue: Referral says 'urgent please' with no reason and no risk history included. Please triage for appropriate pathway.
+synthetic-0228,pt,intake_note,none,"INTAKE SUMMARY
+Pessoa adulta procura apoio por stress e insonia, nega pensamentos de se magoar.
+Risk field copied from source; spelling and detail may be incomplete.
+
+Additional unstructured note: Referrer sent duplicate attachment."
+synthetic-0229,en,mixed_notes,safeguarding_or_abuse,"Copied notes:
+- concern: Client says partner controls phone, money, and has threatened them.
+- insurer: Multicare
+- admin note: Texto copiado de email com erros.
+
+Additional unstructured note: Patient prefers Portuguese."
+synthetic-0230,pt,mixed_notes,safeguarding_or_abuse,"Copied notes:
+- concern: Formulario indica possivel abuso sexual que exige revisao de salvaguarda .
+- insurer: private pay
+- admin note: Texto copiado de email com erros .
+
+Additional unstructured note: DOB missing."
+synthetic-0231,en,sms,none,"Short message from referrer: Adult referral for work stress and mild anxiety, no safety concerns reported. pls call when possible. Patient prefers Portuguese."
+synthetic-0232,en,sms,none,"Short message from referrer: Adult referral for work stress and mild anxiety, no safety concerns reported. pls call when possible. Need admin cleanup before booking."
+synthetic-0233,pt,webform,self_harm_or_suicidality,"WEBFORM ENTRY
+Reason for referral: Encaminhamento refere pensamentos suicidas recentes e necessidade de apoio urgente.
+Language: Portuguese. Contact details: needs confirmation."
+synthetic-0234,en,email,acute_crisis,"Subject: new referral
+From: GP
+
+GP note: acute deterioration, no food for two days, crisis team may be needed.
+Preferred modality: online. Availability: weekends only.
+
+Additional unstructured note: Need admin cleanup before booking."
+synthetic-0235,en,intake_note,none,"INTAKE SUMMARY
+Referral notes grief after bereavement with good family support and no acute risk.
+Risk field copied from source; spelling and detail may be incomplete.
+
+Additional unstructured note: Need admin cleanup before booking."
+synthetic-0236,en,sms,unclear,"Short message from referrer: Client denies immediate danger but also says things could change quickly. pls call when possible. Referrer sent duplicate attachment.
+
+Additional unstructured note: Texto copiado de email com erros."
+synthetic-0237,pt,sms,safeguarding_or_abuse,"Short message from referrer: Formulario indica possivel abuso sexual que exige revisao de salvaguarda. pls call when possible. Referrer sent duplicate attachment.
+
+Additional unstructured note: Need admin cleanup before booking."
+synthetic-0238,pt,intake_note,self_harm_or_suicidality,"INTAKE SUMMARY
+Paciente diz que nao se sente seguro e pode magoar-se hoje a noite.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0239,en,webform,acute_crisis,"WEBFORM ENTRY
+Reason for referral: Emergency appointment requested because client is escalating and cannot calm down.
+Language: English. Contact details: email + phone."
+synthetic-0240,en,email,safeguarding_or_abuse,"Subject: new referral
+From: school counsellor
+
+Parent reports elder abuse concerns and coercion around medication .
+Preferred modality: online se possivel . Availability: sexta de manha ."
+synthetic-0241,en,sms,unclear,Short message from referrer: Client denies immediate danger but also says things could change quickly. pls call when possible. Need admin cleanup before booking.
+synthetic-0242,pt,intake_note,none,"INTAKE SUMMARY
+Pedido de terapia para ataques de panico em reunioes, risco avaliado como ausente.
+Risk field copied from source; spelling and detail may be incomplete.
+
+Additional unstructured note: Need admin cleanup before booking."
+synthetic-0243,en,email,acute_crisis,"Subject: new referral
+From: social worker
+
+GP note: acute deterioration, no food for two days, crisis team may be needed.
+Preferred modality: online. Availability: Tuesday morning."
+synthetic-0244,pt,intake_note,acute_crisis,"INTAKE SUMMARY
+Nota do medico: deterioracao aguda, sem comer ha dois dias, possivel equipa de crise.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0245,en,gp_letter,acute_crisis,"GP referral note - presenting issue: Patient is currently in severe crisis, disoriented, and has not slept for days. Please triage for appropriate pathway.
+
+Additional unstructured note: Patient prefers Portuguese."
+synthetic-0246,pt,email,safeguarding_or_abuse,"Subject: new referral
+From: social worker
+
+Familiar relata suspeita de abuso de pessoa idosa e pressao sobre medicacao.
+Preferred modality: online se possivel. Availability: Tuesday morning."
+synthetic-0247,en,gp_letter,safeguarding_or_abuse,GP referral note - presenting issue: Parent reports elder abuse concerns and coercion around medication . Please triage for appropriate pathway .
+synthetic-0248,en,gp_letter,acute_crisis,GP referral note - presenting issue: Referral says the person is wandering outside confused and unable to care for self . Please triage for appropriate pathway .
+synthetic-0249,en,webform,self_harm_or_suicidality,"WEBFORM ENTRY
+Reason for referral: Patient says they do not feel safe and might hurt themselves tonight.
+Language: English. Contact details: phone missing."
+synthetic-0250,pt,email,self_harm_or_suicidality,"Subject: new referral
+From: school counsellor
+
+Encaminhamento refere pensamentos suicidas recentes e necessidade de apoio urgente.
+Preferred modality: hybrid. Availability: after 17:00."
+synthetic-0251,en,webform,self_harm_or_suicidality,"WEBFORM ENTRY
+Reason for referral: Email from family says the person has been saying they do not want to live.
+Language: English. Contact details: phone missing."
+synthetic-0252,en,email,unclear,"Subject: new referral
+From: family member
+
+Referral text is fragmented: safe? not safe? client did not complete risk section.
+Preferred modality: in person. Availability: flexible."
+synthetic-0253,en,gp_letter,safeguarding_or_abuse,GP referral note - presenting issue: Teacher is concerned a child may be unsafe due to bruises and disclosure of abuse . Please triage for appropriate pathway .
+synthetic-0254,en,webform,none,"WEBFORM ENTRY
+Reason for referral: GP referral for low mood after a breakup; risk was assessed and denied.
+Language: English. Contact details: needs confirmation.
+
+Additional unstructured note: Texto copiado de email com erros."
+synthetic-0255,pt,intake_note,acute_crisis,"INTAKE SUMMARY
+Chamada refere panico, gritos e possivel psicose apos parar medicacao.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0256,en,sms,unclear,"Short message from referrer: Message says the client is struggling and family is worried, safety not assessed. pls call when possible. DOB missing."
+synthetic-0257,en,webform,acute_crisis,"WEBFORM ENTRY
+Reason for referral: GP note: acute deterioration, no food for two days, crisis team may be needed .
+Language: English . Contact details: email present ."
+synthetic-0258,en,webform,self_harm_or_suicidality,"WEBFORM ENTRY
+Reason for referral: Patient says they do not feel safe and might hurt themselves tonight.
+Language: English. Contact details: needs confirmation."
+synthetic-0259,en,email,none,"Subject: new referral
+From: self referral
+
+Client asks for CBT for panic before presentations and denies thoughts of self harm.
+Preferred modality: in person. Availability: flexible."
+synthetic-0260,en,mixed_notes,acute_crisis,"Copied notes:
+- concern: Referral says the person is wandering outside confused and unable to care for self.
+- insurer: AdvanceCare
+- admin note: Need admin cleanup before booking."
+synthetic-0261,pt,sms,acute_crisis,"Short message from referrer: Familia refere vozes, agitacao intensa e necessidade de avaliacao no mesmo dia . pls call when possible . Need admin cleanup before booking ."
+synthetic-0262,en,sms,safeguarding_or_abuse,Short message from referrer: Referral reports domestic violence at home and the client is afraid to return. pls call when possible. Patient prefers Portuguese.
+synthetic-0263,pt,mixed_notes,unclear,"Copied notes:
+- concern: Cliente nega perigo imediato mas diz que as coisas podem mudar rapidamente.
+- insurer: Multicare
+- admin note: DOB missing."
+synthetic-0264,pt,mixed_notes,unclear,"Copied notes:
+- concern: Texto fragmentado: seguro? nao seguro? secao de risco incompleta.
+- insurer: private pay
+- admin note: Patient prefers Portuguese."
+synthetic-0265,pt,gp_letter,safeguarding_or_abuse,GP referral note - presenting issue: Professor esta preocupado que uma crianca esteja insegura apos revelar abuso. Please triage for appropriate pathway.
+synthetic-0266,en,email,none,"Subject: new referral
+From: GP
+
+Client asks for CBT for panic before presentations and denies thoughts of self harm.
+Preferred modality: online se possivel. Availability: weekends only."
+synthetic-0267,en,sms,acute_crisis,"Short message from referrer: Caller reports panic, shouting, and possible psychosis after stopping medication. pls call when possible. Need admin cleanup before booking."
+synthetic-0268,pt,intake_note,self_harm_or_suicidality,"INTAKE SUMMARY
+Chamada relata ideias suicidas, choro, isolamento e medo de esperar .
+Risk field copied from source; spelling and detail may be incomplete ."
+synthetic-0269,pt,mixed_notes,acute_crisis,"Copied notes:
+- concern: Paciente esta em crise grave, desorientado e sem dormir ha varios dias.
+- insurer: seguro por confirmar
+- admin note: Need admin cleanup before booking."
+synthetic-0270,pt,webform,none,"WEBFORM ENTRY
+Reason for referral: Pessoa adulta procura apoio por stress e insonia, nega pensamentos de se magoar.
+Language: Portuguese. Contact details: contacto parcial."
+synthetic-0271,en,email,self_harm_or_suicidality,"Subject: new referral
+From: social worker
+
+Caller reports suicidal thoughts, tearful, alone, and unsure they can wait .
+Preferred modality: in person . Availability: flexible ."
+synthetic-0272,pt,sms,safeguarding_or_abuse,Short message from referrer: Formulario indica possivel abuso sexual que exige revisao de salvaguarda . pls call when possible . Patient prefers Portuguese .
+synthetic-0273,en,sms,self_harm_or_suicidality,Short message from referrer: Email from family says the person has been saying they do not want to live. pls call when possible. Texto copiado de email com erros.
+synthetic-0274,pt,intake_note,safeguarding_or_abuse,"INTAKE SUMMARY
+Encaminhamento relata violencia domestica em casa e medo de regressar.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0275,en,mixed_notes,none,"Copied notes:
+- concern: Parent requests support for adolescent social anxiety, stable at home and school .
+- insurer: AdvanceCare
+- admin note: Referrer sent duplicate attachment ."
+synthetic-0276,en,mixed_notes,acute_crisis,"Copied notes:
+- concern: Family says patient is hearing voices, highly agitated, and needs same-day review.
+- insurer: private pay
+- admin note: DOB missing."
+synthetic-0277,en,intake_note,safeguarding_or_abuse,"INTAKE SUMMARY
+Client says partner controls phone, money, and has threatened them.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0278,pt,mixed_notes,safeguarding_or_abuse,"Copied notes:
+- concern: Assistente social pede terapia mas sinaliza risco continuo no agregado familiar.
+- insurer: seguro por confirmar
+- admin note: Patient prefers Portuguese."
+synthetic-0279,en,gp_letter,unclear,"GP referral note - presenting issue: Referral says 'urgent please' with no reason and no risk history included. Please triage for appropriate pathway.
+
+Additional unstructured note: Patient prefers Portuguese."
+synthetic-0280,en,sms,safeguarding_or_abuse,Short message from referrer: Teacher is concerned a child may be unsafe due to bruises and disclosure of abuse. pls call when possible. Referrer sent duplicate attachment.
+synthetic-0281,en,sms,self_harm_or_suicidality,"Short message from referrer: Referral mentions recent thoughts of ending life and needing urgent support. pls call when possible. DOB missing.
+
+Additional unstructured note: Texto copiado de email com erros."
+synthetic-0282,en,webform,unclear,"WEBFORM ENTRY
+Reason for referral: GP wrote 'risk maybe' but no details, patient unreachable for clarification.
+Language: English. Contact details: email present."
+synthetic-0283,en,gp_letter,safeguarding_or_abuse,"GP referral note - presenting issue: Teacher is concerned a child may be unsafe due to bruises and disclosure of abuse. Please triage for appropriate pathway.
+
+Additional unstructured note: No previous therapy listed."
+synthetic-0284,pt,webform,acute_crisis,"WEBFORM ENTRY
+Reason for referral: Chamada refere panico, gritos e possivel psicose apos parar medicacao.
+Language: Portuguese. Contact details: contacto parcial.
+
+Additional unstructured note: Texto copiado de email com erros."
+synthetic-0285,en,gp_letter,self_harm_or_suicidality,GP referral note - presenting issue: Referral mentions recent thoughts of ending life and needing urgent support. Please triage for appropriate pathway.
+synthetic-0286,en,mixed_notes,safeguarding_or_abuse,"Copied notes:
+- concern: Parent reports elder abuse concerns and coercion around medication .
+- insurer: insurance unclear
+- admin note: Need admin cleanup before booking ."
+synthetic-0287,pt,sms,none,"Short message from referrer: Pedido de terapia para ataques de panico em reunioes, risco avaliado como ausente. pls call when possible. Texto copiado de email com erros."
+synthetic-0288,en,gp_letter,safeguarding_or_abuse,GP referral note - presenting issue: Social worker asks for therapy but flags ongoing safety risk in the household. Please triage for appropriate pathway.
+synthetic-0289,pt,email,acute_crisis,"Subject: new referral
+From: self referral
+
+Pedido urgente porque o cliente esta a escalar e nao consegue acalmar .
+Preferred modality: in person . Availability: Tuesday morning ."
+synthetic-0290,en,gp_letter,safeguarding_or_abuse,GP referral note - presenting issue: Intake notes possible sexual abuse disclosure requiring safeguarding review. Please triage for appropriate pathway.
+synthetic-0291,en,sms,acute_crisis,"Short message from referrer: Caller reports panic, shouting, and possible psychosis after stopping medication. pls call when possible. Texto copiado de email com erros."
+synthetic-0292,pt,sms,self_harm_or_suicidality,Short message from referrer: Familiar escreve que a pessoa tem dito que nao quer viver. pls call when possible. Patient prefers Portuguese.
+synthetic-0293,en,email,none,"Subject: new referral
+From: school counsellor
+
+Student wants help with sleep routine, exam stress, and motivation.
+Preferred modality: online. Availability: after 17:00."
+synthetic-0294,en,intake_note,unclear,"INTAKE SUMMARY
+Client denies immediate danger but also says things could change quickly.
+Risk field copied from source; spelling and detail may be incomplete."
+synthetic-0295,pt,gp_letter,safeguarding_or_abuse,GP referral note - presenting issue: Encaminhamento relata violencia domestica em casa e medo de regressar. Please triage for appropriate pathway.
+synthetic-0296,pt,gp_letter,none,"GP referral note - presenting issue: Cliente refere preocupacao geral e cansaco, mas diz sentir-se seguro em casa. Please triage for appropriate pathway."
+synthetic-0297,en,gp_letter,none,GP referral note - presenting issue: Referral notes grief after bereavement with good family support and no acute risk. Please triage for appropriate pathway.
+synthetic-0298,en,email,safeguarding_or_abuse,"Subject: new referral
+From: self referral
+
+Intake notes possible sexual abuse disclosure requiring safeguarding review.
+Preferred modality: hybrid. Availability: Tuesday morning."
+synthetic-0299,en,webform,none,"WEBFORM ENTRY
+Reason for referral: GP referral for low mood after a breakup; risk was assessed and denied .
+Language: English . Contact details: phone missing ."
+synthetic-0300,pt,gp_letter,safeguarding_or_abuse,"GP referral note - presenting issue: Cliente diz que o parceiro controla telefone, dinheiro e fez ameacas. Please triage for appropriate pathway."
