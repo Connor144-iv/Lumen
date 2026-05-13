@@ -89,6 +89,17 @@ def test_dev_identity_switcher_requires_explicit_local_opt_in() -> None:
     assert 'refreshProductButton.addEventListener("click", () => refreshWorkspaceForCurrentRole())' in app_js
 
 
+def test_visible_app_copy_uses_professional_labels() -> None:
+    source = INDEX_HTML.read_text() + APP_JS.read_text()
+
+    assert "Viewing as" in source
+    assert "Clinic administrator" in source
+    assert "Reset workflow state" in source
+    assert "Sync Gmail" in source
+    for label in ["Dev only user", "Demo admin", "Developer demo", "demo-only", "local demo workflow"]:
+        assert label not in source
+
+
 def test_workbench_does_not_render_patient_reply_simulation_controls() -> None:
     app_js = APP_JS.read_text()
 
@@ -133,6 +144,8 @@ def test_overview_system_and_workbench_trace_static_contracts() -> None:
     assert '<details class="advanced-trace">' not in index_html
     assert 'href="/workbench" data-nav>Open Workbench</a>' in index_html
     assert "Select a referral in Workbench to inspect persisted agent activity" in index_html
+    assert 'id="workbench-gmail-sync-button"' in index_html
+    assert "workbenchGmailSyncButton.addEventListener" in app_js
 
     assert 'operationSection("Advanced trace"' in app_js
     assert "renderWorkbenchAdvancedTrace" in app_js

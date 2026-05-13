@@ -47,15 +47,14 @@
           </div>
           <div class="topbar-actions">
             <label class="dev-user-switcher">
-              Dev only user
-              <select id="dev-user-select" aria-label="Dev only user identity">
-                <option value="">Default admin</option>
-                <option value="demo-admin">Demo admin</option>
+              Viewing as
+              <select id="dev-user-select" aria-label="Viewing as identity">
+                <option value="">Clinic administrator</option>
                 <option value="demo-clara-therapist-user">Clara therapist</option>
               </select>
             </label>
             <a class="button-link primary-action" href="/new-referral" data-nav data-admin-only hidden>New referral</a>
-            <button id="demo-reset-button" type="button" class="secondary compact" data-admin-only hidden>Reset Gmail demo</button>
+            <button id="demo-reset-button" type="button" class="secondary compact" data-admin-only hidden>Reset workflow state</button>
             <button id="refresh-product-button" type="button" class="secondary compact">Refresh data</button>
           </div>
         </header>
@@ -140,7 +139,7 @@
                     </label>
                     <label>
                       <input type="radio" name="workflow_type" value="session_completed" />
-                      Session report demo
+                      Session report
                     </label>
                   </fieldset>
 
@@ -319,6 +318,9 @@
                   <div>
                     <p class="eyebrow">Admin workflow</p>
                     <h2 id="referral-detail-title">Referral workbench</h2>
+                  </div>
+                  <div class="panel-actions">
+                    <button type="button" id="workbench-gmail-sync-button" class="secondary compact">Sync Gmail</button>
                   </div>
                 </div>
                 <details class="workbench-escalations" open>
@@ -626,7 +628,7 @@
               <section class="panel" aria-labelledby="workflow-trace-link-title">
                 <div class="panel-header">
                   <div>
-                    <p class="eyebrow">Developer demo</p>
+                    <p class="eyebrow">Workflow operations</p>
                     <h2 id="workflow-trace-link-title">Workflow trace</h2>
                   </div>
                   <a class="text-link" href="/workbench" data-nav>Open Workbench</a>
@@ -634,7 +636,7 @@
                 <div class="record-list">
                   <article class="record-item" data-status="configured">
                     <h4>Workbench advanced trace</h4>
-                    <span class="pill">demo-only</span>
+                    <span class="pill">operational</span>
                     <p>Select a referral in Workbench to inspect persisted agent activity, workflow events, outputs, and review gates.</p>
                   </article>
                 </div>
@@ -643,7 +645,7 @@
               <section class="panel" aria-labelledby="recent-workflows-title">
                 <div class="panel-header">
                   <div>
-                    <p class="eyebrow">Developer demo</p>
+                    <p class="eyebrow">Workflow operations</p>
                     <h2 id="recent-workflows-title">Recent workflow traces</h2>
                   </div>
                   <span class="panel-stat" id="metric-workflows">-</span>
@@ -654,7 +656,7 @@
               <section class="panel" aria-labelledby="clinical-tools-title">
                 <div class="panel-header">
                   <div>
-                    <p class="eyebrow">Developer demo</p>
+                    <p class="eyebrow">Clinical operations</p>
                     <h2 id="clinical-tools-title">Clinical tools</h2>
                   </div>
                   <a class="text-link" href="/clinical" data-nav>Open clinical workspace</a>
@@ -662,7 +664,7 @@
                 <div class="record-list">
                   <article class="record-item" data-status="configured">
                     <h4>Patient workspace + library</h4>
-                    <span class="pill">demo-only</span>
+                    <span class="pill">available</span>
                     <p>Session notes, report drafts, and retrieval sources live here. Kept out of the admin referral lane.</p>
                   </article>
                 </div>

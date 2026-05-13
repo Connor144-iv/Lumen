@@ -101,6 +101,7 @@ const integrationHealthList = document.querySelector("#integration-health-list")
 const googleWorkspaceList = document.querySelector("#google-workspace-list");
 const gmailInboxList = document.querySelector("#gmail-inbox-list");
 const gmailSyncButton = document.querySelector("#gmail-sync-button");
+const workbenchGmailSyncButton = document.querySelector("#workbench-gmail-sync-button");
 const gmailInboxRefreshButton = document.querySelector("#gmail-inbox-refresh");
 const securityPostureList = document.querySelector("#security-posture-list");
 const feedbackMetricsList = document.querySelector("#feedback-metrics-list");
@@ -389,6 +390,12 @@ referralImportForm.addEventListener("submit", async (event) => {
 
 if (gmailSyncButton) {
   gmailSyncButton.addEventListener("click", async () => {
+    await syncGmailInbox();
+  });
+}
+
+if (workbenchGmailSyncButton) {
+  workbenchGmailSyncButton.addEventListener("click", async () => {
     await syncGmailInbox();
   });
 }
@@ -803,7 +810,7 @@ function agentRegistryCard(agent) {
   const summaryBody = document.createElement("div");
   summaryBody.className = "agent-registry-summary";
   const message = document.createElement("p");
-  message.textContent = agent.model?.message || "Enabled for the local demo workflow.";
+  message.textContent = agent.model?.message || "Enabled for the local workflow.";
   summaryBody.append(
     heading(agent.name),
     message,
@@ -1961,7 +1968,27 @@ function renderPatientOverview(patient, sessions) {
     noteListBlock("Latest session", [lastSession?.title || "No sessions recorded."]),
   );
   item.appendChild(details);
-  patientSessionDetail.replaceChildren(item);
+  const prepBriefCards = (latestPatientDashboard?.prep_briefs || []).slice(0, 2).map(patientDashboardPrepBriefCard);
+  patientSessionDetail.replaceChildren(item, ...prepBriefCards);
+}
+
+function patientDashboardPrepBriefCard(brief) {
+  const item = recordItem({
+    title: "First-session prep brief",
+    status: brief.status || "ready",
+    body: brief.title || "Therapist handoff is ready.",
+    meta: [brief.created_at ? formatDate(brief.created_at) : null],
+  });
+  const detail = document.createElement("details");
+  detail.className = "handoff";
+  detail.open = true;
+  const summary = document.createElement("summary");
+  summary.textContent = brief.title || "Prep brief";
+  const pre = document.createElement("pre");
+  pre.textContent = brief.body || "No prep brief body recorded.";
+  detail.append(summary, pre);
+  item.appendChild(detail);
+  return item;
 }
 
 function renderProgressOverview(overview) {
@@ -3699,10 +3726,10 @@ async function resetCleanDemoPath() {
   const response = await fetch("/api/demo/clean-referral/reset", { method: "POST" });
   const body = await readResponseBody(response);
   if (!response.ok) {
-    window.alert(body.detail || "Could not reset the Gmail demo.");
+    window.alert(body.detail || "Could not reset the workflow state.");
     return;
   }
-  setStatus("completed", "Gmail demo reset. Admin inbox and Clara's local appointments were cleared.");
+  setStatus("completed", "Workflow state reset. Admin inbox and Clara's local appointments were cleared.");
   await refreshProductWorkspace();
   await loadGmailInbox();
 }
@@ -4562,8 +4589,8 @@ function renderAvailabilityGrid(container, blocks) {
   });
   container.appendChild(grid);
   container.appendChild(emptyState((blocks || []).length
-    ? "All times use the clinic timezone configured for this demo environment."
-    : "Default availability is used for this demo when no custom weekly blocks are set."));
+    ? "All times use the configured clinic timezone."
+    : "Default availability is used when no custom weekly blocks are set."));
 }
 
 function detailCard(title, children) {
@@ -4632,6 +4659,7 @@ async function loadGmailInbox() {
 
 async function syncGmailInbox() {
   if (gmailSyncButton) gmailSyncButton.disabled = true;
+  if (workbenchGmailSyncButton) workbenchGmailSyncButton.disabled = true;
   try {
     const response = await fetch("/api/integrations/gmail-sync", {
       method: "POST",
@@ -4654,11 +4682,15 @@ async function syncGmailInbox() {
       ? `Gmail sync finished. ${processed} processed, ${skipped} skipped, ${errors} errors. Checked ${unread} unread and ${recent} recent inbox messages.${firstError}`
       : "Gmail sync finished. No unread or recent inbox messages were found.";
     window.alert(message);
-    await Promise.all([loadGmailInbox(), loadReviewTasks(), loadReferrals()]);
+    await Promise.all([loadGmailInbox(), loadReviewTasks(), loadReferrals(), loadEscalations()]);
+    if (selectedReferralId && routeForPath(window.location.pathname).page === "workbench") {
+      await loadReferralDetail(selectedReferralId);
+    }
   } catch (error) {
     window.alert(`Gmail sync failed before the server responded: ${error?.message || error}`);
   } finally {
     if (gmailSyncButton) gmailSyncButton.disabled = false;
+    if (workbenchGmailSyncButton) workbenchGmailSyncButton.disabled = false;
   }
 }
 

@@ -19,9 +19,11 @@ DEMO_DIRECTOR_USER_ID = "demo-director"
 def seed_demo_data(session: Session) -> None:
     tenant = session.get(Tenant, DEMO_TENANT_ID)
     if tenant is None:
-        tenant = Tenant(id=DEMO_TENANT_ID, name="Demo Clinic", slug="demo-clinic")
+        tenant = Tenant(id=DEMO_TENANT_ID, name="Lumen Clinic", slug="demo-clinic")
         session.add(tenant)
         session.flush()
+    else:
+        tenant.name = "Lumen Clinic"
 
     for role in ("admin", "therapist", "clinic_director", "compliance_owner"):
         exists = session.scalar(select(Role).where(Role.tenant_id == DEMO_TENANT_ID, Role.name == role))
@@ -34,22 +36,32 @@ def seed_demo_data(session: Session) -> None:
             User(
                 id=DEMO_USER_ID,
                 tenant_id=DEMO_TENANT_ID,
-                email="admin@demo-clinic.local",
-                display_name="Demo Admin",
+                email="admin@lumen-clinic.local",
+                display_name="Clinic Administrator",
                 role="admin",
             )
         )
+    else:
+        user.tenant_id = DEMO_TENANT_ID
+        user.email = "admin@lumen-clinic.local"
+        user.display_name = "Clinic Administrator"
+        user.role = "admin"
     therapist_user = session.get(User, DEMO_THERAPIST_USER_ID)
     if therapist_user is None:
         session.add(
             User(
                 id=DEMO_THERAPIST_USER_ID,
                 tenant_id=DEMO_TENANT_ID,
-                email="therapist@demo-clinic.local",
-                display_name="Demo Therapist",
+                email="therapist@lumen-clinic.local",
+                display_name="Clinic Therapist",
                 role="therapist",
             )
         )
+    else:
+        therapist_user.tenant_id = DEMO_TENANT_ID
+        therapist_user.email = "therapist@lumen-clinic.local"
+        therapist_user.display_name = "Clinic Therapist"
+        therapist_user.role = "therapist"
     clara_user = session.get(User, DEMO_CLARA_THERAPIST_USER_ID)
     if clara_user is None:
         session.add(
@@ -57,7 +69,7 @@ def seed_demo_data(session: Session) -> None:
                 id=DEMO_CLARA_THERAPIST_USER_ID,
                 tenant_id=DEMO_TENANT_ID,
                 email=DEMO_CLARA_EMAIL,
-                display_name="Dr. Clara Demo",
+                display_name="Dr. Clara Santos",
                 role="therapist",
                 active=True,
             )
@@ -65,7 +77,7 @@ def seed_demo_data(session: Session) -> None:
     else:
         clara_user.tenant_id = DEMO_TENANT_ID
         clara_user.email = DEMO_CLARA_EMAIL
-        clara_user.display_name = "Dr. Clara Demo"
+        clara_user.display_name = "Dr. Clara Santos"
         clara_user.role = "therapist"
         clara_user.active = True
     session.flush()
@@ -75,11 +87,16 @@ def seed_demo_data(session: Session) -> None:
             User(
                 id=DEMO_DIRECTOR_USER_ID,
                 tenant_id=DEMO_TENANT_ID,
-                email="director@demo-clinic.local",
-                display_name="Demo Director",
+                email="director@lumen-clinic.local",
+                display_name="Clinical Director",
                 role="clinic_director",
             )
         )
+    else:
+        director_user.tenant_id = DEMO_TENANT_ID
+        director_user.email = "director@lumen-clinic.local"
+        director_user.display_name = "Clinical Director"
+        director_user.role = "clinic_director"
 
     patient = session.get(Patient, "demo-patient-001")
     if patient is None:
@@ -88,7 +105,7 @@ def seed_demo_data(session: Session) -> None:
                 id="demo-patient-001",
                 tenant_id=DEMO_TENANT_ID,
                 display_name="Demo Patient",
-                contact_email="demo.patient@example.com",
+                contact_email="patient@example.com",
                 language="Portuguese",
             )
         )
@@ -192,7 +209,7 @@ def seed_demo_data(session: Session) -> None:
                 id="demo-therapist-001",
                 tenant_id=DEMO_TENANT_ID,
                 name="Dr. Sofia Almeida",
-                email="sofia.almeida@demo-clinic.local",
+                email="sofia.almeida@lumen-clinic.local",
                 specialties=["anxiety", "adjustment", "work stress"],
                 age_groups=["adult", "older_adult"],
                 languages=["Portuguese", "English"],
@@ -208,7 +225,7 @@ def seed_demo_data(session: Session) -> None:
                 id="demo-therapist-002",
                 tenant_id=DEMO_TENANT_ID,
                 name="Miguel Costa",
-                email="miguel.costa@demo-clinic.local",
+                email="miguel.costa@lumen-clinic.local",
                 specialties=["adolescent mental health", "family transitions", "school stress"],
                 age_groups=["adolescent", "adult"],
                 languages=["Portuguese", "Spanish"],
@@ -224,7 +241,7 @@ def seed_demo_data(session: Session) -> None:
                 id="demo-therapist-003",
                 tenant_id=DEMO_TENANT_ID,
                 name="Ines Martins",
-                email="ines.martins@demo-clinic.local",
+                email="ines.martins@lumen-clinic.local",
                 specialties=["trauma-informed care", "acute stress", "risk review"],
                 age_groups=["adult"],
                 languages=["Portuguese", "English"],

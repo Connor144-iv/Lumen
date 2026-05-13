@@ -24,8 +24,9 @@ from .models import (
     Patient,
     Referral,
     Therapist,
+    TherapistPrepBrief,
 )
-from .repositories import iso_or_none, json_safe, list_patients_for_therapist, utc_now
+from .repositories import iso_or_none, json_safe, list_patients_for_therapist, prep_brief_to_dict, utc_now
 
 NOTE_VERSION = "sessionNoteV0.2"
 DEFAULT_HF_BASE_URL = "https://router.huggingface.co/v1"
@@ -196,12 +197,24 @@ def documentation_patient_dashboard_for_therapist(
         patient_id=patient.id,
         fallback_items=session_items,
     )
+    prep_briefs = list(
+        session.scalars(
+            select(TherapistPrepBrief)
+            .where(
+                TherapistPrepBrief.tenant_id == patient.tenant_id,
+                TherapistPrepBrief.patient_id == patient.id,
+                (TherapistPrepBrief.therapist_id == therapist_id) | (TherapistPrepBrief.therapist_id.is_(None)),
+            )
+            .order_by(TherapistPrepBrief.created_at.desc())
+        )
+    )
     return {
         "patient": {
             **_patient_to_dashboard_dict(patient),
             "patient_key": patient.id,
             "patient_label": patient.display_name or patient.id,
         },
+        "prep_briefs": [prep_brief_to_dict(brief) for brief in prep_briefs],
         "sessions": session_items,
         "progress_overview": progress_overview,
     }

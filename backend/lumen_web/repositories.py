@@ -2223,7 +2223,7 @@ def _ensure_clara_demo_therapist(session: Session, tenant_id: str) -> Therapist:
         session.add(therapist)
     therapist.tenant_id = tenant_id
     therapist.active = True
-    therapist.name = "Dr. Clara Demo"
+    therapist.name = "Dr. Clara Santos"
     therapist.email = DEMO_CLARA_EMAIL
     therapist.specialties = ["anxiety", "work stress", "adjustment"]
     therapist.age_groups = ["adult"]
@@ -2401,7 +2401,7 @@ def _ensure_demo_stage_therapists(session: Session, tenant_id: str) -> dict[str,
         {
             "id": "demo-therapist-001",
             "name": "Dr. Sofia Almeida",
-            "email": "sofia.almeida@demo-clinic.local",
+            "email": "sofia.almeida@lumen-clinic.local",
             "specialties": ["anxiety", "adjustment", "work stress"],
             "age_groups": ["adult", "older_adult"],
             "languages": ["Portuguese", "English"],
@@ -2416,7 +2416,7 @@ def _ensure_demo_stage_therapists(session: Session, tenant_id: str) -> dict[str,
         {
             "id": "demo-therapist-002",
             "name": "Miguel Costa",
-            "email": "miguel.costa@demo-clinic.local",
+            "email": "miguel.costa@lumen-clinic.local",
             "specialties": ["adolescent mental health", "family transitions", "school stress"],
             "age_groups": ["adolescent", "adult"],
             "languages": ["Portuguese", "Spanish"],
@@ -3031,7 +3031,7 @@ def _clear_clara_demo_local_calendar(session: Session, therapist: Therapist) -> 
             continue
         before = review_task_to_dict(task)
         task.status = "superseded"
-        task.rejection_reason = "Dr. Clara Demo's local calendar was reset for Gmail-route testing."
+        task.rejection_reason = "Dr. Clara Santos's local calendar was reset for workflow testing."
         task.reviewed_at = utc_now()
         task.updated_at = utc_now()
         superseded_tasks += 1
@@ -6004,7 +6004,7 @@ def draft_intake_packet(
             f"Hello {referral.patient_name or patient.display_name or 'there'},",
             "",
             "Before your first session, please complete the attached intake files and reply to this same email thread with the completed files attached.",
-            "For this demo, you can attach the mock intake files directly as TXT, PDF, DOCX, CSV, XLSX, or JSON files.",
+            "You can attach the intake files directly as TXT, PDF, DOCX, CSV, XLSX, or JSON files.",
             "",
             "Attached blank files:",
             *(attachment_lines or ["- Clinic staff will provide any required blank files separately."]),
@@ -8680,33 +8680,100 @@ def generate_prep_brief(session: Session, referral_id: str, therapist_id: str | 
     appointments = list(
         session.scalars(select(Appointment).where(Appointment.referral_id == referral.id).order_by(Appointment.starts_at))
     )
+    consents = []
+    documents: list[Document] = []
+    if referral.patient_id:
+        consents = list(
+            session.scalars(
+                select(ConsentRecord).where(
+                    ConsentRecord.tenant_id == referral.tenant_id,
+                    ConsentRecord.patient_id == referral.patient_id,
+                )
+            )
+        )
+        source_document_ids = {
+            source_id
+            for source_id in [
+                *(item.source_document_id for item in items if _intake_done(item.status)),
+                *(consent.source_document_id for consent in consents if _intake_done(consent.status)),
+            ]
+            if source_id
+        }
+        documents = [
+            document
+            for document in session.scalars(
+                select(Document)
+                .where(Document.tenant_id == referral.tenant_id, Document.patient_id == referral.patient_id)
+                .order_by(Document.created_at.desc())
+            )
+            if document.id in source_document_ids or (document.metadata_json or {}).get("referral_id") == referral.id
+        ]
     missing_items = [item.label for item in items if not _intake_done(item.status)]
     completed_items = [item.label for item in items if _intake_done(item.status)]
+    missing_fields = [str(field).replace("_", " ") for field in referral.missing_fields or []]
+    confirmed_appointment = next((appointment for appointment in appointments if appointment.status == "confirmed"), None)
+    intake_status = _intake_status(items, consents)
+    readiness_blockers = _pre_prep_readiness_blockers(session, referral)
+    appointment_summary = (
+        f"{iso_or_none(confirmed_appointment.starts_at)} to {iso_or_none(confirmed_appointment.ends_at)}"
+        if confirmed_appointment and confirmed_appointment.starts_at
+        else "No confirmed appointment recorded."
+    )
+    document_titles = [document.title for document in documents[:6]]
+    raw_summary = " ".join((referral.raw_text or "").strip().split())
+    if len(raw_summary) > 420:
+        raw_summary = f"{raw_summary[:417]}..."
+    questionnaire_scores = [
+        f"{response.questionnaire_name}: {response.score_summary.get('total_score', 0)}"
+        for response in responses
+    ]
+    open_items = [
+        *missing_fields,
+        *missing_items,
+        *readiness_blockers,
+    ]
+    if not open_items:
+        open_items = ["No open readiness blockers recorded."]
     lines = [
         f"# Therapist Prep Brief: {referral.patient_name or patient.display_name or 'Referral'}",
         "",
-        f"- Referral status: {referral.status}",
-        f"- Presenting source: {referral.source_channel}",
-        f"- Contact: {referral.contact_email or 'missing'} / {referral.contact_phone or 'missing'}",
-        f"- Insurance: {referral.insurer or 'missing'}",
-        f"- Language/modality: {referral.language_preference or 'unknown'} / {referral.modality_preference or 'unknown'}",
-        f"- Risk: {referral.risk_category or 'pending'} ({referral.urgency or 'pending'})",
-        f"- Completed intake: {', '.join(completed_items) if completed_items else 'none yet'}",
-        f"- Missing intake: {', '.join(missing_items) if missing_items else 'none recorded'}",
+        "## Patient Snapshot",
+        f"- Patient: {referral.patient_name or patient.display_name or patient.id}",
+        f"- Contact: {referral.contact_email or patient.contact_email or 'not recorded'} / {referral.contact_phone or patient.contact_phone or 'not recorded'}",
+        f"- Date of birth: {referral.date_of_birth or patient.date_of_birth or 'not recorded'}",
+        f"- Source: {referral.source_channel or 'not recorded'}; referrer: {referral.referring_entity or 'not recorded'}",
+        f"- Insurance: {referral.insurer or 'not recorded'}",
+        f"- Language and modality: {referral.language_preference or patient.language or 'not recorded'} / {referral.modality_preference or 'not recorded'}",
+        "",
+        "## Appointment And Readiness",
+        f"- Confirmed appointment: {appointment_summary}",
+        f"- Current workflow status: {referral.status}",
+        f"- Intake status: {intake_status.replace('_', ' ')}",
+        "",
+        "## Risk And Safety",
+        f"- Risk category: {referral.risk_category or 'pending'}",
+        f"- Urgency: {referral.urgency or 'pending'}",
+        f"- Elevated risk signal: {'yes' if referral.risk_present else 'no'}",
+        "",
+        "## Intake And Documents",
+        f"- Completed or waived: {', '.join(completed_items) if completed_items else 'none recorded'}",
+        f"- Outstanding: {', '.join(missing_items) if missing_items else 'none recorded'}",
+        f"- Patient files reviewed: {', '.join(document_titles) if document_titles else 'none recorded'}",
+        "",
+        "## Questionnaire Scores",
+        f"- {', '.join(questionnaire_scores) if questionnaire_scores else 'No questionnaire scores recorded.'}",
+        "",
+        "## First-session Focus",
+        "- Confirm the presenting concern, goals, and practical barriers in the patient's own words.",
+        "- Review the completed intake and clarify any missing or ambiguous history.",
+        "- Recheck current risk, protective factors, and support plan at the start of session.",
+        "- Agree initial treatment priorities and the next administrative or clinical step.",
+        "",
+        "## Open Items",
+        *[f"- {item}" for item in open_items],
     ]
-    if responses:
-        score_bits = [
-            f"{response.questionnaire_name}: {response.score_summary.get('total_score', 0)}"
-            for response in responses
-        ]
-        lines.append(f"- Questionnaire scores: {', '.join(score_bits)}")
-    if appointments:
-        slot_bits = [
-            f"{iso_or_none(item.starts_at)} ({item.status})"
-            for item in appointments[:3]
-        ]
-        lines.append(f"- Proposed slots: {', '.join(slot_bits)}")
-    lines.extend(["", "## Source Referral", "", referral.raw_text.strip()])
+    if raw_summary:
+        lines.extend(["", "## Referral Note", raw_summary])
     brief = TherapistPrepBrief(
         tenant_id=referral.tenant_id,
         patient_id=patient.id,
@@ -8720,6 +8787,8 @@ def generate_prep_brief(session: Session, referral_id: str, therapist_id: str | 
             "missing_intake_count": len(missing_items),
             "questionnaire_count": len(responses),
             "appointment_count": len(appointments),
+            "document_count": len(documents),
+            "intake_status": intake_status,
         },
     )
     session.add(brief)

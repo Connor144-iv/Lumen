@@ -279,6 +279,8 @@ def test_phase4_matching_and_phase5_intake_services() -> None:
 
         brief = session.query(TherapistPrepBrief).filter_by(referral_id=referral.id).one()
         assert "Therapist Prep Brief" in brief.body
+        assert "First-session Focus" in brief.body
+        assert "Risk And Safety" in brief.body
         assert referral.status == "first_session_ready"
         tracker = list_intake_tracker(session, tenant_id=tenant.id)
         assert any(row["referral"]["id"] == referral.id for row in tracker)
@@ -306,6 +308,7 @@ def test_prep_brief_does_not_advance_without_appointment_and_intake() -> None:
         brief = generate_prep_brief(session, referral.id)
 
         assert "Therapist Prep Brief" in brief["body"]
+        assert "Open Items" in brief["body"]
         assert referral.status == "ready_for_matching"
     finally:
         session.rollback()

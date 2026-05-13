@@ -6,6 +6,9 @@
 __pycache__/
 *.pyc
 
+# Pitch Development
+**/pitch/
+
 # Local virtual environments
 .venv/
 venv/

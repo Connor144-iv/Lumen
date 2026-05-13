@@ -17,6 +17,7 @@ from app import (
     DocumentationTextRequest,
     documentation_patients,
     documentation_note_reviewed_update,
+    documentation_patient_dashboard,
     documentation_session_note_generate,
     documentation_session_create,
     documentation_session_delete,
@@ -35,7 +36,15 @@ from backend.lumen_web.documentation import (
     _normalize_generated_session_note,
 )
 from backend.lumen_web.db import Base, SessionLocal, engine
-from backend.lumen_web.models import Appointment, DocumentationProgressOverview, DocumentationSession, DocumentationSessionNote, DocumentationSessionText, Patient
+from backend.lumen_web.models import (
+    Appointment,
+    DocumentationProgressOverview,
+    DocumentationSession,
+    DocumentationSessionNote,
+    DocumentationSessionText,
+    Patient,
+    TherapistPrepBrief,
+)
 from backend.lumen_web.repositories import DEMO_CLEAN_THERAPIST_ID, reset_clean_demo_referral
 from backend.lumen_web.seed import DEMO_CLARA_THERAPIST_USER_ID, DEMO_TENANT_ID, DEMO_USER_ID
 
@@ -59,6 +68,7 @@ def _prepare_documentation_demo() -> None:
         session.execute(delete(DocumentationSessionText))
         session.execute(delete(DocumentationProgressOverview))
         session.execute(delete(DocumentationSession))
+        session.execute(delete(TherapistPrepBrief))
         reset_clean_demo_referral(session)
         patient = session.get(Patient, DOC_PATIENT_ID)
         if patient is None:
@@ -237,8 +247,53 @@ def test_clara_can_create_documentation_session_for_assigned_patient() -> None:
     assert doc_session["patient_id"] == DOC_PATIENT_ID
     assert doc_session["therapist_id"] == "demo-clean-therapist-001"
     assert doc_session["patient_label_snapshot"] == "Documentation Test Patient"
-    assert doc_session["therapist_label_snapshot"] == "Dr. Clara Demo"
+    assert doc_session["therapist_label_snapshot"] == "Dr. Clara Santos"
     assert [item["id"] for item in sessions] == [doc_session["id"]]
+
+
+def test_clara_patient_dashboard_includes_prep_briefs_for_assigned_patient() -> None:
+    _prepare_documentation_demo()
+
+    session = SessionLocal()
+    try:
+        session.add_all(
+            [
+                TherapistPrepBrief(
+                    tenant_id=DEMO_TENANT_ID,
+                    patient_id=DOC_PATIENT_ID,
+                    therapist_id=DEMO_CLEAN_THERAPIST_ID,
+                    title="First-session handoff",
+                    body="# Therapist Prep Brief\n\nAssigned brief",
+                    source_summary={},
+                ),
+                TherapistPrepBrief(
+                    tenant_id=DEMO_TENANT_ID,
+                    patient_id=DOC_PATIENT_ID,
+                    therapist_id=None,
+                    title="Shared handoff",
+                    body="# Therapist Prep Brief\n\nShared brief",
+                    source_summary={},
+                ),
+                TherapistPrepBrief(
+                    tenant_id=DEMO_TENANT_ID,
+                    patient_id=DOC_PATIENT_ID,
+                    therapist_id="demo-therapist-001",
+                    title="Other therapist handoff",
+                    body="# Therapist Prep Brief\n\nOther brief",
+                    source_summary={},
+                ),
+            ]
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    dashboard = _call(documentation_patient_dashboard(DOC_PATIENT_ID, _request_for_user(DEMO_CLARA_THERAPIST_USER_ID)))
+
+    titles = [brief["title"] for brief in dashboard["prep_briefs"]]
+    assert "First-session handoff" in titles
+    assert "Shared handoff" in titles
+    assert "Other therapist handoff" not in titles
 
 
 def test_clara_cannot_create_documentation_session_for_unassigned_patient() -> None:

@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 import app as app_module
 from backend.lumen_web import google_workspace
@@ -1760,6 +1760,7 @@ def test_send_approval_route_does_not_submit_resume_workflow(monkeypatch) -> Non
     Base.metadata.create_all(bind=engine)
     monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "false")
     submitted = []
+    tenant_id = _id("tenant")
 
     def fake_submit(request):
         submitted.append(request)
@@ -1769,13 +1770,13 @@ def test_send_approval_route_does_not_submit_resume_workflow(monkeypatch) -> Non
 
     session = SessionLocal()
     try:
-        tenant = Tenant(id=_id("tenant"), name="No Resume Send Test", slug=_id("no-resume-send"))
+        tenant = Tenant(id=tenant_id, name="Route Approval Test", slug=_id("route-approval"))
         referral = Referral(
             tenant_id=tenant.id,
             source_channel="email",
-            raw_text="Canonical email referral.",
+            raw_text="Route approval email referral.",
             status="awaiting_patient_contact",
-            patient_name="No Resume Patient",
+            patient_name="Route Approval Patient",
             contact_email="lumenpatientdemo@gmail.com",
         )
         run = WorkflowRun(
@@ -1848,8 +1849,17 @@ def test_send_approval_route_does_not_submit_resume_workflow(monkeypatch) -> Non
         assert refreshed_draft.status == "approved_pending_send"
         assert refreshed_draft.body == "Approved body"
         assert refreshed_task.status == "approved"
+        assert session.scalar(select(Referral).where(Referral.patient_name == "No Resume Patient")) is None
     finally:
         session.rollback()
+        session.execute(delete(AuditLog).where(AuditLog.tenant_id == tenant_id))
+        session.execute(delete(HumanReviewTask).where(HumanReviewTask.tenant_id == tenant_id))
+        session.execute(delete(CommunicationDraft).where(CommunicationDraft.tenant_id == tenant_id))
+        session.execute(delete(WorkflowEvent).where(WorkflowEvent.tenant_id == tenant_id))
+        session.execute(delete(WorkflowRun).where(WorkflowRun.tenant_id == tenant_id))
+        session.execute(delete(Referral).where(Referral.tenant_id == tenant_id))
+        session.execute(delete(Tenant).where(Tenant.id == tenant_id))
+        session.commit()
         session.close()
 
 
@@ -2288,7 +2298,7 @@ def test_demo_clara_confirmation_invites_clara_and_stays_visible_locally(monkeyp
     session = SessionLocal()
     try:
         payload = reset_clean_demo_referral(session)
-        therapist = session.scalar(select(Therapist).where(Therapist.name == "Dr. Clara Demo"))
+        therapist = session.scalar(select(Therapist).where(Therapist.name == "Dr. Clara Santos"))
         assert therapist.email == "clara.demo1234@gmail.com"
         patient = Patient(
             tenant_id=payload["therapist"]["tenant_id"],
