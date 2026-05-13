@@ -364,14 +364,15 @@ def test_reply_like_gmail_without_thread_can_match_sent_draft_by_sender() -> Non
 
 def test_gmail_sync_rejects_wrong_authorized_mailbox(monkeypatch) -> None:
     monkeypatch.setenv("LUMEN_GOOGLE_WORKSPACE_ENABLED", "true")
-    monkeypatch.setattr(google_workspace, "gmail_profile_email", lambda: "clara.demo1234@gmail.com")
+    monkeypatch.setenv("LUMEN_GOOGLE_EXPECTED_GMAIL_ACCOUNT", "clinic-admin@example.test")
+    monkeypatch.setattr(google_workspace, "gmail_profile_email", lambda: "wrong-admin@example.test")
 
     client = TestClient(app_module.app)
     response = client.post("/api/integrations/gmail-sync", json={"max_results": 5})
 
     assert response.status_code == 400
     detail = response.json()["detail"]
-    assert "clara.demo1234@gmail.com" in detail
+    assert "wrong-admin@example.test" in detail
     assert "clinic-admin@example.test" in detail
     assert "google_workspace_auth.py" in detail
 

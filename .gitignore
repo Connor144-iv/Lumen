@@ -1,6 +1,16 @@
 # Created by venv; see https://docs.python.org/3/library/venv.html
 *.log
+.env
+.env.*
+!.env.example
 **/secret/
+**/*credentials*.json
+**/*token*.json
+**/*client_secret*.json
+*.pem
+*.key
+*.p12
+*.pfx
 /.venv/Scripts/run_lumen_local.ps1
 # Python bytecode
 __pycache__/
@@ -13,5 +23,9 @@ __pycache__/
 .venv/
 venv/
 
-# Local dev database
+# Local data and uploads
 lumen_dev.db
+*.db
+*.sqlite
+*.sqlite3
+storage/uploads/

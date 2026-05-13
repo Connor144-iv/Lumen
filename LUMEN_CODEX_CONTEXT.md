@@ -252,7 +252,7 @@ The previous placeholder-only Google integration guidance is superseded. This ph
 
 Current Google setup:
 
-- Shared clinic/staff Google account: `clinic-admin@example.test`.
+- Shared clinic/staff Google account: configure with `LUMEN_GOOGLE_EXPECTED_GMAIL_ACCOUNT`.
 - Fake demo patient account: `lumenpatientdemo@gmail.com`.
 - Gmail capability: `users.messages.send` with `gmail.send`.
 - Calendar capabilities: `freeBusy.query`, `events.insert`, and event update through the enabled Calendar event scope.

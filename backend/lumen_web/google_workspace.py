@@ -55,7 +55,7 @@ def settings() -> GoogleWorkspaceSettings:
         token_path=Path(os.getenv("LUMEN_GOOGLE_TOKEN_PATH") or SECRET_DIR / TOKEN_FILE_NAME),
         calendar_id=os.getenv("LUMEN_GOOGLE_CALENDAR_ID", "primary").strip() or "primary",
         timezone=os.getenv("LUMEN_GOOGLE_TIMEZONE", "Europe/Lisbon").strip() or "Europe/Lisbon",
-        expected_gmail_account=(os.getenv("LUMEN_GOOGLE_EXPECTED_GMAIL_ACCOUNT", "clinic-admin@example.test").strip() or None),
+        expected_gmail_account=(os.getenv("LUMEN_GOOGLE_EXPECTED_GMAIL_ACCOUNT", "").strip() or None),
     )
 
 
